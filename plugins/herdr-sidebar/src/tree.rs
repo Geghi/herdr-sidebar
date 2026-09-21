@@ -144,6 +144,68 @@ impl Tree {
             }
         }
     }
+
+    /// The `f` filter's rows: every FILE the predicate keeps — given its
+    /// absolute path, its `/`-separated path relative to the root, and its
+    /// name — with the folder tree on the way kept so matches stay in context.
+    /// Folders with no kept file below them are dropped, and the walk ignores
+    /// the expanded set while filtering (ancestors render open).
+    pub fn filtered_rows(&mut self, keep: &mut dyn FnMut(&Path, &str, &str) -> bool) -> Vec<Row> {
+        let mut out = Vec::new();
+        let root = self.root.clone();
+        self.walk_filtered(&root, 0, "", keep, &mut out);
+        out
+    }
+
+    /// Returns true when the subtree contains a kept file. A folder row is
+    /// pushed before descending so render order stays depth-first, and popped
+    /// back off when nothing below it matched.
+    fn walk_filtered(
+        &mut self,
+        dir: &Path,
+        depth: usize,
+        rel: &str,
+        keep: &mut dyn FnMut(&Path, &str, &str) -> bool,
+        out: &mut Vec<Row>,
+    ) -> bool {
+        let show_hidden = self.show_hidden;
+        let mut any = false;
+        for entry in self.children(dir) {
+            if !visible(&entry.name, show_hidden) {
+                continue;
+            }
+            let path = dir.join(&entry.name);
+            let child_rel = if rel.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{rel}/{}", entry.name)
+            };
+            if entry.is_dir {
+                out.push(Row {
+                    name: entry.name.clone(),
+                    is_dir: true,
+                    depth,
+                    expanded: true,
+                    path: path.clone(),
+                });
+                if self.walk_filtered(&path, depth + 1, &child_rel, keep, out) {
+                    any = true;
+                } else {
+                    out.pop();
+                }
+            } else if keep(&path, &child_rel, &entry.name) {
+                out.push(Row {
+                    name: entry.name,
+                    is_dir: false,
+                    depth,
+                    expanded: false,
+                    path,
+                });
+                any = true;
+            }
+        }
+        any
+    }
 }
 
 /// VS Code Explorer order: directories first, then files, each case-insensitive.
@@ -290,6 +352,61 @@ mod tests {
         assert_eq!(tree.rows().len(), 1, "cached listing must not re-read disk");
         tree.refresh();
         assert_eq!(tree.rows().len(), 2);
+    }
+
+    #[test]
+    fn filter_keeps_ancestors_and_drops_barren_folders() {
+        let tmp = TempDir::new("filter");
+        tmp.mkdir("src/bin");
+        tmp.mkdir("docs");
+        tmp.mkdir(".git");
+        tmp.touch("src/main.rs");
+        tmp.touch("src/bin/tool.rs");
+        tmp.touch("docs/readme.md");
+        tmp.touch("Cargo.toml");
+        tmp.touch(".git/hidden.rs");
+        let mut tree = Tree::new(tmp.0.clone());
+        assert_eq!(
+            names(&tree.filtered_rows(&mut |_path, _rel, name| name.contains("rs"))),
+            vec![
+                ("src".into(), 0),
+                ("bin".into(), 1),
+                ("tool.rs".into(), 2),
+                ("main.rs".into(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_matches_names_case_insensitively() {
+        let tmp = TempDir::new("filter-case");
+        tmp.mkdir("Src");
+        tmp.touch("Src/Main.RS");
+        let mut tree = Tree::new(tmp.0.clone());
+        let mut fold = |_path: &Path, _rel: &str, name: &str| name.to_lowercase().contains("main");
+        assert_eq!(
+            names(&tree.filtered_rows(&mut fold)),
+            vec![("Src".into(), 0), ("Main.RS".into(), 1)]
+        );
+        assert!(
+            tree.filtered_rows(&mut |_path, _rel, _name| false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn filter_predicate_sees_relative_paths() {
+        let tmp = TempDir::new("filter-rel");
+        tmp.mkdir("a/b");
+        tmp.touch("a/b/c.rs");
+        let mut tree = Tree::new(tmp.0.clone());
+        let mut seen = Vec::new();
+        tree.filtered_rows(&mut |_path, rel, _name| {
+            seen.push(rel.to_string());
+            true
+        });
+        // Only files reach the predicate; folders are structure.
+        assert_eq!(seen, vec!["a/b/c.rs"]);
     }
 
     #[test]

@@ -807,7 +807,56 @@ fn restore_current_control(control: &Path, current: &Option<Request>) {
 /// `git show` with stat + patch, colored — what a click on a commit, stash,
 /// tag, or branch line renders. Immutable content: no refresh loop needed.
 fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
-    let mut args: Vec<String> = vec![
+    // One file inside a commit (a GRAPH expansion's row, FILE HISTORY) is a
+    // DIFF, so it renders through the same VS Code renderer the Changes
+    // section uses instead of git's own colored `show` output. `--first-parent`
+    // is what makes a MERGE show what it brought in, against its first parent.
+    if let Some(p) = path {
+        let rel = p.replace('/', std::path::MAIN_SEPARATOR_STR);
+        let output = std::process::Command::new("git")
+            .args([
+                "show",
+                "--first-parent",
+                "--format=",
+                "--patch",
+                "--no-ext-diff",
+                spec,
+                "--",
+                &rel,
+            ])
+            .current_dir(root)
+            .output();
+        let lines = match output {
+            Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
+            Ok(out) => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if text.trim().is_empty() {
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    if err.trim().is_empty() {
+                        vec![Line::raw("(no changes)")]
+                    } else {
+                        vec![Line::raw(format!("({})", err.trim()))]
+                    }
+                } else {
+                    crate::diffview::render(p, &text)
+                }
+            }
+        };
+        return Doc {
+            name: p.rsplit('/').next().unwrap_or(p).to_string(),
+            context: format!("{} at {spec}", root.join(&rel).display()),
+            lines,
+            numbered: false,
+            media: None,
+            scroll: 0,
+            wrap: true,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+        };
+    }
+    let args: Vec<String> = vec![
         "-c".into(),
         "color.ui=always".into(),
         "show".into(),
@@ -815,12 +864,9 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         "--stat".into(),
         "--patch".into(),
         "--no-ext-diff".into(),
+        "--first-parent".into(),
         spec.to_string(),
     ];
-    if let Some(p) = path {
-        args.push("--".into());
-        args.push(p.replace('/', std::path::MAIN_SEPARATOR_STR));
-    }
     let output = std::process::Command::new("git")
         .args(&args)
         .current_dir(root)
@@ -2993,6 +3039,81 @@ fn side_neighbor(layout_json: &str, pane_id: &str, on_the_left: bool) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_inside_a_commit_renders_as_a_diff_not_a_show() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-viewer-commit-file-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t.dev",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "first",
+        ]);
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.email=t@t.dev",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "second",
+        ]);
+
+        let text = |doc: &Doc| -> String {
+            doc.lines
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // A file inside a commit is a DIFF: the Changes section's renderer, not
+        // git's own colored `show` output with its commit header.
+        let doc = load_show(&root, "HEAD", Some("a.txt"));
+        assert_eq!(doc.name, "a.txt");
+        assert!(!doc.numbered, "a diff carries its own gutters");
+        let body = text(&doc);
+        assert!(body.contains("two"), "the added line shows: {body}");
+        assert!(
+            !body.contains("Author:"),
+            "no commit header on a file diff: {body}"
+        );
+        // A root commit has no first parent to diff against; it still renders.
+        let root_doc = load_show(&root, "HEAD~1", Some("a.txt"));
+        assert!(
+            text(&root_doc).contains("one"),
+            "the root commit shows the file as added"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     fn doc_of(lines: Vec<Line<'static>>, numbered: bool) -> Doc {
         Doc {

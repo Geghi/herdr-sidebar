@@ -9,6 +9,7 @@
 //! When herdr-aa-filetree is also installed, the panel can merge with it into
 //! a single "Sidebar" pane with an activity-bar view switcher (see sidebar.rs).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 
@@ -26,6 +27,7 @@ use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
 use herdr_sidebar::git::{FileEntry, Git, Status};
+use herdr_sidebar::graph::{self as commit_graph, GraphCommit};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
 use herdr_sidebar::state::{self as sidebar, View};
@@ -33,8 +35,8 @@ use herdr_sidebar::suggest;
 use herdr_sidebar::ui::{
     TitleAction, activity_button_style, activity_icons, branch_icon, chrome_button_style,
     draw_activity_caps, draw_scrollbar, gear_icon, hits, hits_activity_button,
-    hits_collapse_button, hover_style, icon_style as ui_icon_style, keep_visible_scroll, palette,
-    selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
+    hits_collapse_button, hover_style, icon_style as ui_icon_style, is_light, keep_visible_scroll,
+    palette, selection_style, set_color_theme, sibling_panes_of, sparkle_icon, status_color,
     title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
     wrap_footer_message, wrap_hints,
 };
@@ -127,6 +129,10 @@ struct DrawerPanel {
     lines: Vec<String>,
     /// What each line points at, parallel to `lines`.
     refs: Vec<DrawerRef>,
+    /// Lane cells per line for the GRAPH drawer, parallel to `lines` (empty
+    /// for every other drawer). The glyphs are drawn as colored spans, so the
+    /// line text carries only the commit's own text.
+    graph: Vec<commit_graph::GraphRow>,
 }
 
 /// What a drawer line points at, for clicks and context menus.
@@ -282,6 +288,11 @@ struct Repo {
     collapsed: bool,
     staged_collapsed: bool,
     changes_collapsed: bool,
+    /// Folders collapsed in the Staged section's tree view, by repo-relative
+    /// `/`-separated directory path.
+    staged_tree_collapsed: BTreeSet<String>,
+    /// Folders collapsed in the Changes section's tree view.
+    changes_tree_collapsed: BTreeSet<String>,
     message: Vec<char>,
     cursor: usize,
 }
@@ -295,6 +306,8 @@ impl Repo {
             collapsed: false,
             staged_collapsed: false,
             changes_collapsed: false,
+            staged_tree_collapsed: BTreeSet::new(),
+            changes_tree_collapsed: BTreeSet::new(),
             message: Vec::new(),
             cursor: 0,
         }
@@ -328,8 +341,26 @@ enum Row {
     ChangesHeader(usize),
     Staged(usize, usize),
     Unstaged(usize, usize),
+    /// A folder row of the tree view: (repo, index into [`App::tree_nodes`]).
+    StagedFolder(usize, usize),
+    ChangesFolder(usize, usize),
     DrawerHeader(Drawer),
     DrawerLine(Drawer, usize),
+    /// A changed file of the GRAPH commit expanded inline (index into
+    /// [`App::commit_files`]).
+    CommitFile(usize),
+}
+
+/// One folder row of the tree view (VS Code's "View as Tree"), rebuilt with
+/// `rows` and referenced by the folder [`Row`] variants.
+#[derive(Clone)]
+struct TreeNode {
+    /// Repo-relative `/`-separated directory path — the collapse key.
+    path: String,
+    /// The display label; single-child folder chains are compacted (`a/b/c`).
+    label: String,
+    depth: usize,
+    expanded: bool,
 }
 
 impl Row {
@@ -342,8 +373,10 @@ impl Row {
             | Row::StagedHeader(r)
             | Row::ChangesHeader(r)
             | Row::Staged(r, _)
-            | Row::Unstaged(r, _) => Some(r),
-            Row::DrawerHeader(_) | Row::DrawerLine(..) => None,
+            | Row::Unstaged(r, _)
+            | Row::StagedFolder(r, _)
+            | Row::ChangesFolder(r, _) => Some(r),
+            Row::DrawerHeader(_) | Row::DrawerLine(..) | Row::CommitFile(_) => None,
         }
     }
 
@@ -362,6 +395,12 @@ enum MenuTarget {
         entry: FileEntry,
         staged: bool,
     },
+    /// A folder row of the tree view: the folder's repo-relative path is the
+    /// whole target (no diff, no per-file status).
+    Folder {
+        repo: usize,
+        path: String,
+    },
     Drawer {
         kind: Drawer,
         index: usize,
@@ -374,6 +413,7 @@ enum MenuAction {
     OpenDiff,
     StageOrUnstage,
     Discard,
+    AddToGitignore,
     CopyPath,
     CopyRelativePath,
     OpenExternal,
@@ -440,7 +480,7 @@ impl FileHoverAction {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuEntry {
     Action(MenuAction, &'static str),
     Separator,
@@ -494,6 +534,7 @@ enum Setting {
     GitDecorations,
     GitFooter,
     Hotkeys,
+    TreeView,
     Folder,
 }
 
@@ -660,6 +701,13 @@ pub struct App {
     drawers: [DrawerPanel; 8],
     /// The file the FILE HISTORY drawer follows: the last selected file row.
     history_target: Option<String>,
+    /// The GRAPH commit whose changed files are expanded inline, by hash —
+    /// one at a time, so the graph stays readable. The files live in
+    /// [`App::commit_files`]; a hash that leaves the window simply stops
+    /// matching a line and the expansion disappears with it.
+    expanded_commit: Option<String>,
+    /// The expanded commit's changed files, loaded when it expands.
+    commit_files: Vec<FileEntry>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
     /// Pending ✧ commit-message generation, polled from tick().
@@ -707,6 +755,11 @@ pub struct App {
     /// newer draft it never observed.
     persisted_draft_roots: std::collections::BTreeSet<String>,
     pending_unified_width: Option<(u16, std::time::Instant)>,
+    /// Per-row tree indentation, aligned with `rows` (all zeros in list mode).
+    row_depth: Vec<usize>,
+    /// Folder rows for the tree view, referenced by [`Row::StagedFolder`] /
+    /// [`Row::ChangesFolder`]; rebuilt with `rows`.
+    tree_nodes: Vec<TreeNode>,
 }
 
 const MY_VIEW: View = View::SourceControl;
@@ -783,6 +836,8 @@ impl App {
             theme,
             drawers,
             history_target,
+            expanded_commit: None,
+            commit_files: Vec::new(),
             flash: None,
             suggesting: None,
             syncing: None,
@@ -807,6 +862,8 @@ impl App {
             cwd_follower,
             persisted_draft_roots,
             pending_unified_width: None,
+            row_depth: Vec::new(),
+            tree_nodes: Vec::new(),
         };
         app.apply_identity();
         app.refresh();
@@ -996,6 +1053,11 @@ impl App {
         self.sidebar_state.dock_right = shared.dock_right;
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
+        // `t` in another pane (or the ⚙ row) flips the tree view everywhere.
+        if shared.scm_tree != self.sidebar_state.scm_tree {
+            self.sidebar_state.scm_tree = shared.scm_tree;
+            self.rebuild();
+        }
         if shared.color_theme != self.sidebar_state.color_theme {
             self.sidebar_state.color_theme = shared.color_theme;
             set_color_theme(shared.color_theme);
@@ -1109,25 +1171,41 @@ impl App {
             if !self.drawers[kind.index()].expanded {
                 continue;
             }
-            let lines = match kind {
-                Drawer::Graph => git.graph(DRAWER_LIMIT),
-                Drawer::Commits => git.commits(DRAWER_LIMIT),
-                Drawer::FileHistory => match &self.history_target {
-                    Some(path) => git.file_history(path, DRAWER_LIMIT),
-                    None => Ok(vec!["(select a file above)".to_string()]),
+            // GRAPH splits its result: the lane layout is drawn as colored
+            // spans, so the line text carries only the commit's own text.
+            let (lines, graph) = match kind {
+                Drawer::Graph => match git.graph(DRAWER_LIMIT) {
+                    Ok(entries) => {
+                        let commits: Vec<GraphCommit> =
+                            entries.iter().map(|entry| entry.commit.clone()).collect();
+                        (
+                            Ok(entries.into_iter().map(|entry| entry.text).collect()),
+                            commit_graph::layout(&commits),
+                        )
+                    }
+                    Err(e) => (Err(e), Vec::new()),
                 },
-                Drawer::Branches => git.branches(),
-                Drawer::Worktrees => git.worktrees(),
-                Drawer::Remotes => git.remotes(),
-                Drawer::Stashes => git.stashes(),
-                Drawer::Tags => git.tags(),
+                Drawer::Commits => (git.commits(DRAWER_LIMIT), Vec::new()),
+                Drawer::FileHistory => (
+                    match &self.history_target {
+                        Some(path) => git.file_history(path, DRAWER_LIMIT),
+                        None => Ok(vec!["(select a file above)".to_string()]),
+                    },
+                    Vec::new(),
+                ),
+                Drawer::Branches => (git.branches(), Vec::new()),
+                Drawer::Worktrees => (git.worktrees(), Vec::new()),
+                Drawer::Remotes => (git.remotes(), Vec::new()),
+                Drawer::Stashes => (git.stashes(), Vec::new()),
+                Drawer::Tags => (git.tags(), Vec::new()),
             };
-            self.drawers[kind.index()].lines = match lines {
+            let panel = &mut self.drawers[kind.index()];
+            panel.graph = graph;
+            panel.lines = match lines {
                 Ok(lines) if lines.is_empty() => vec!["(none)".to_string()],
                 Ok(lines) => lines,
                 Err(e) => vec![format!("({e})")],
             };
-            let panel = &mut self.drawers[kind.index()];
             panel.refs = panel
                 .lines
                 .iter()
@@ -1151,39 +1229,116 @@ impl App {
 
     fn rebuild(&mut self) {
         self.rows.clear();
+        self.row_depth.clear();
+        self.tree_nodes.clear();
         let multi = self.repos.len() > 1;
+        let tree = self.sidebar_state.scm_tree;
         for (r, repo) in self.repos.iter().enumerate() {
             if multi {
                 self.rows.push(Row::RepoHeader(r));
+                self.row_depth.push(0);
                 if repo.collapsed {
                     continue;
                 }
                 // VS Code gives every repo its own message box and Commit
                 // button, inline in the list.
                 self.rows.push(Row::Message(r));
+                self.row_depth.push(0);
                 self.rows.push(Row::Commit(r));
+                self.row_depth.push(0);
             }
             // Like VS Code, the Staged section only exists while something is staged.
             if !repo.status.staged.is_empty() {
                 self.rows.push(Row::StagedHeader(r));
+                self.row_depth.push(0);
                 if !repo.staged_collapsed {
-                    for i in 0..repo.status.staged.len() {
-                        self.rows.push(Row::Staged(r, i));
+                    if tree {
+                        for node in
+                            changes_tree_rows(&repo.status.staged, &repo.staged_tree_collapsed)
+                        {
+                            match node {
+                                ChangeTreeRow::Folder {
+                                    path,
+                                    label,
+                                    depth,
+                                    expanded,
+                                } => {
+                                    self.rows.push(Row::StagedFolder(r, self.tree_nodes.len()));
+                                    self.row_depth.push(depth);
+                                    self.tree_nodes.push(TreeNode {
+                                        path,
+                                        label,
+                                        depth,
+                                        expanded,
+                                    });
+                                }
+                                ChangeTreeRow::File { index, depth } => {
+                                    self.rows.push(Row::Staged(r, index));
+                                    self.row_depth.push(depth);
+                                }
+                            }
+                        }
+                    } else {
+                        for i in 0..repo.status.staged.len() {
+                            self.rows.push(Row::Staged(r, i));
+                            self.row_depth.push(0);
+                        }
                     }
                 }
             }
             self.rows.push(Row::ChangesHeader(r));
+            self.row_depth.push(0);
             if !repo.changes_collapsed {
-                for i in 0..repo.status.unstaged.len() {
-                    self.rows.push(Row::Unstaged(r, i));
+                if tree {
+                    for node in
+                        changes_tree_rows(&repo.status.unstaged, &repo.changes_tree_collapsed)
+                    {
+                        match node {
+                            ChangeTreeRow::Folder {
+                                path,
+                                label,
+                                depth,
+                                expanded,
+                            } => {
+                                self.rows.push(Row::ChangesFolder(r, self.tree_nodes.len()));
+                                self.row_depth.push(depth);
+                                self.tree_nodes.push(TreeNode {
+                                    path,
+                                    label,
+                                    depth,
+                                    expanded,
+                                });
+                            }
+                            ChangeTreeRow::File { index, depth } => {
+                                self.rows.push(Row::Unstaged(r, index));
+                                self.row_depth.push(depth);
+                            }
+                        }
+                    }
+                } else {
+                    for i in 0..repo.status.unstaged.len() {
+                        self.rows.push(Row::Unstaged(r, i));
+                        self.row_depth.push(0);
+                    }
                 }
             }
         }
         for kind in Drawer::ALL {
             self.rows.push(Row::DrawerHeader(kind));
+            self.row_depth.push(0);
             if self.drawers[kind.index()].expanded {
                 for i in 0..self.drawers[kind.index()].lines.len() {
                     self.rows.push(Row::DrawerLine(kind, i));
+                    self.row_depth.push(0);
+                    // A GRAPH commit expands its changed files INLINE: they
+                    // push the rest of the graph down instead of opening a
+                    // second pane.
+                    if self.graph_line_expanded(kind, i) {
+                        for f in 0..self.commit_files.len() {
+                            self.rows.push(Row::CommitFile(f));
+                            self.row_depth.push(0);
+                        }
+                    }
                 }
             }
         }
@@ -1408,6 +1563,9 @@ impl App {
             KeyCode::Char('S') => self.sync_changes(),
             KeyCode::Char('o') => self.open_selected_diff(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
+            KeyCode::Char('t') => self.toggle_tree_view(),
+            KeyCode::Left | KeyCode::Char('h') => self.list_left(),
+            KeyCode::Right | KeyCode::Char('l') => self.list_right(),
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
@@ -1561,6 +1719,15 @@ impl App {
                         }
                     }
                 }
+                // Folder rows fold/unfold like the section headers.
+                Row::StagedFolder(r, node) => {
+                    self.focus = Focus::List;
+                    self.toggle_tree_folder(r, node, true);
+                }
+                Row::ChangesFolder(r, node) => {
+                    self.focus = Focus::List;
+                    self.toggle_tree_folder(r, node, false);
+                }
                 // The inline widgets: click focuses/acts without selecting.
                 Row::Message(r) => {
                     self.active = r;
@@ -1640,7 +1807,16 @@ impl App {
                     if double && self.pin_if_open(index) {
                         // pinned the first click's show/diff tab
                     } else {
-                        self.open_drawer_ref(kind, i);
+                        self.activate_drawer_line(kind, i);
+                    }
+                }
+                Row::CommitFile(f) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if double && self.pin_if_open(index) {
+                        // pinned the first click's diff tab
+                    } else {
+                        self.open_commit_file(f);
                     }
                 }
             }
@@ -1665,6 +1841,20 @@ impl App {
         let (repo, entry, staged) = match self.rows[index] {
             Row::Staged(r, i) => (r, self.repos[r].status.staged.get(i), true),
             Row::Unstaged(r, i) => (r, self.repos[r].status.unstaged.get(i), false),
+            // Tree-view folder rows carry their own path-level menu, so a
+            // folder can be ignored or revealed as a whole.
+            Row::StagedFolder(r, node) | Row::ChangesFolder(r, node) => {
+                let path = self.tree_nodes[node].path.clone();
+                self.overlay = Some(Overlay::Menu {
+                    x,
+                    y,
+                    target: MenuTarget::Folder { repo: r, path },
+                    entries: folder_menu_entries(),
+                    selected: 0,
+                    rect: Rect::default(),
+                });
+                return;
+            }
             Row::DrawerLine(kind, i) => {
                 self.open_drawer_menu(x, y, kind, i);
                 return;
@@ -1672,32 +1862,7 @@ impl App {
             _ => return, // section headers have no menu
         };
         let Some(entry) = entry.cloned() else { return };
-        let mut entries = vec![MenuEntry::Action(MenuAction::OpenDiff, "Open Diff")];
-        // A deleted file has nothing left on disk to hand to the shell.
-        if entry.letter != 'D' {
-            entries.push(MenuEntry::Action(
-                MenuAction::OpenExternal,
-                "Open with Default App",
-            ));
-        }
-        entries.push(MenuEntry::Action(
-            MenuAction::StageOrUnstage,
-            if staged {
-                "Unstage Changes"
-            } else {
-                "Stage Changes"
-            },
-        ));
-        if !staged {
-            entries.push(MenuEntry::Action(MenuAction::Discard, "Discard Changes…"));
-        }
-        entries.extend([
-            MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
-            MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
-            MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
-        ]);
+        let entries = file_menu_entries(entry.letter, staged);
         self.overlay = Some(Overlay::Menu {
             x,
             y,
@@ -2146,6 +2311,17 @@ impl App {
                 true,
             ),
             (
+                Setting::TreeView,
+                "View as tree",
+                if self.sidebar_state.scm_tree {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
                 Setting::Folder,
                 "Change folder…",
                 self.cwd
@@ -2218,10 +2394,134 @@ impl App {
                     state.show_git_footer = !state.show_git_footer;
                 });
             }
+            Setting::TreeView => self.toggle_tree_view(),
             Setting::Folder => {
                 self.overlay = None;
                 self.change_folder_dialog();
             }
+        }
+    }
+
+    /// `t`: flip between the flat list and VS Code's tree view (persisted, so
+    /// every pane and restart sees the same mode).
+    fn toggle_tree_view(&mut self) {
+        self.sidebar_state = sidebar::update_state(|state| state.scm_tree = !state.scm_tree);
+        self.rebuild();
+    }
+
+    /// Fold/unfold a tree folder, keeping the selection on its row.
+    fn toggle_tree_folder(&mut self, repo: usize, node: usize, staged: bool) {
+        let Some(folder) = self.tree_nodes.get(node) else {
+            return;
+        };
+        let path = folder.path.clone();
+        {
+            let collapsed = if staged {
+                &mut self.repos[repo].staged_tree_collapsed
+            } else {
+                &mut self.repos[repo].changes_tree_collapsed
+            };
+            if !collapsed.remove(&path) {
+                collapsed.insert(path.clone());
+            }
+        }
+        self.rebuild();
+        let found = self.rows.iter().position(|row| match row {
+            Row::StagedFolder(r, node) if staged => {
+                *r == repo && self.tree_nodes.get(*node).is_some_and(|n| n.path == path)
+            }
+            Row::ChangesFolder(r, node) if !staged => {
+                *r == repo && self.tree_nodes.get(*node).is_some_and(|n| n.path == path)
+            }
+            _ => false,
+        });
+        if let Some(index) = found {
+            self.select(index);
+        }
+    }
+
+    /// The nearest row above `index` with a shallower depth — a file's (or a
+    /// collapsed folder's) parent row.
+    fn parent_row(&self, index: usize) -> Option<usize> {
+        let depth = *self.row_depth.get(index)?;
+        (0..index)
+            .rev()
+            .find(|&i| self.row_depth.get(i).is_some_and(|row| *row < depth))
+    }
+
+    /// Left/h in tree mode: collapse the selected folder, else step out to the
+    /// parent row. A no-op in list mode.
+    /// Left/h: close the commit expanded under the cursor first, then fall
+    /// back to the tree's fold / step-out behaviour.
+    fn list_left(&mut self) {
+        if let Some(&Row::DrawerLine(Drawer::Graph, i)) =
+            self.selected.and_then(|s| self.rows.get(s))
+            && self.graph_line_expanded(Drawer::Graph, i)
+        {
+            self.collapse_commit();
+            return;
+        }
+        self.tree_left();
+    }
+
+    /// Right/l: open the selected GRAPH commit's files inline; every other row
+    /// keeps the tree's unfold behaviour.
+    fn list_right(&mut self) {
+        if let Some(&Row::DrawerLine(Drawer::Graph, i)) =
+            self.selected.and_then(|s| self.rows.get(s))
+        {
+            self.toggle_commit_expansion(i);
+            return;
+        }
+        self.tree_right();
+    }
+
+    fn tree_left(&mut self) {
+        if !self.sidebar_state.scm_tree {
+            return;
+        }
+        let Some(index) = self.selected else {
+            return;
+        };
+        if let Some(&Row::StagedFolder(r, node)) = self.rows.get(index)
+            && self.tree_nodes.get(node).is_some_and(|n| n.expanded)
+        {
+            self.toggle_tree_folder(r, node, true);
+            return;
+        }
+        if let Some(&Row::ChangesFolder(r, node)) = self.rows.get(index)
+            && self.tree_nodes.get(node).is_some_and(|n| n.expanded)
+        {
+            self.toggle_tree_folder(r, node, false);
+            return;
+        }
+        if let Some(parent) = self.parent_row(index) {
+            self.select(parent);
+        }
+    }
+
+    /// Right/l in tree mode: expand the selected folder. A no-op in list mode.
+    fn tree_right(&mut self) {
+        if !self.sidebar_state.scm_tree {
+            return;
+        }
+        let Some(index) = self.selected else {
+            return;
+        };
+        match self.rows.get(index) {
+            Some(Row::StagedFolder(r, node)) => {
+                let (r, node) = (*r, *node);
+                if self.tree_nodes.get(node).is_some_and(|n| !n.expanded) {
+                    self.toggle_tree_folder(r, node, true);
+                }
+            }
+            Some(Row::ChangesFolder(r, node)) => {
+                let (r, node) = (*r, *node);
+                if self.tree_nodes.get(node).is_some_and(|n| !n.expanded) {
+                    self.toggle_tree_folder(r, node, false);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2376,6 +2676,7 @@ impl App {
                 entry,
                 staged,
             } => self.file_menu_action(action, repo, entry, staged),
+            MenuTarget::Folder { repo, path } => self.folder_menu_action(action, repo, path),
             MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
         }
     }
@@ -2387,7 +2688,9 @@ impl App {
         entry: FileEntry,
         staged: bool,
     ) {
-        let repo_root = self.repos.get(repo).map(|r| r.git.root().to_path_buf());
+        if self.path_menu_action(action, repo, &entry.path) {
+            return;
+        }
         match action {
             MenuAction::StageOrUnstage => {
                 let result = match self.repos.get(repo) {
@@ -2402,8 +2705,63 @@ impl App {
             }
             MenuAction::OpenDiff => self.open_diff(repo, &entry, staged),
             MenuAction::Discard => self.overlay = Some(Overlay::ConfirmDiscard { repo, entry }),
-            MenuAction::CopyPath | MenuAction::CopyRelativePath => {
+            MenuAction::AddToGitignore => self.ignore_path(repo, &entry.path, false),
+            MenuAction::OpenExternal => {
                 let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+                let path = self
+                    .repos
+                    .get(repo)
+                    .map(|r| r.git.root().to_path_buf())
+                    .unwrap_or_else(|| self.cwd.clone())
+                    .join(&rel);
+                self.flash = Some(match open_external(&path) {
+                    Ok(()) => (format!("opened: {rel}"), false),
+                    Err(err) => (format!("open failed: {err}"), true),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// A tree-view FOLDER row: only the path-level actions (ignore, copy,
+    /// reveal) exist, because the folder has no diff and no status of its own.
+    fn folder_menu_action(&mut self, action: MenuAction, repo: usize, path: String) {
+        if self.path_menu_action(action, repo, &path) {
+            return;
+        }
+        if action == MenuAction::AddToGitignore {
+            self.ignore_path(repo, &path, true);
+        }
+    }
+
+    /// Add `path` to the repository's `.gitignore`; `folder` writes the
+    /// directory-only rule (`dir/`) and ignores the whole subtree.
+    fn ignore_path(&mut self, repo: usize, path: &str, folder: bool) {
+        let pattern = if folder {
+            format!("{path}/")
+        } else {
+            path.to_string()
+        };
+        let result = self
+            .repos
+            .get(repo)
+            .ok_or_else(|| "repository is gone".to_string())
+            .and_then(|r| r.git.add_to_gitignore(&pattern));
+        self.flash = Some(match result {
+            Ok(pattern) => (format!("ignored: {pattern}"), false),
+            Err(e) => (e, true),
+        });
+        self.refresh();
+    }
+
+    /// Copy Path / Copy Relative Path / Reveal, shared by the file and folder
+    /// menus. `path` is repo-relative and `/`-separated. Returns whether the
+    /// action was one of them.
+    fn path_menu_action(&mut self, action: MenuAction, repo: usize, path: &str) -> bool {
+        let repo_root = self.repos.get(repo).map(|r| r.git.root().to_path_buf());
+        match action {
+            MenuAction::CopyPath | MenuAction::CopyRelativePath => {
+                let rel = path.replace('/', std::path::MAIN_SEPARATOR_STR);
                 let text = if action == MenuAction::CopyPath {
                     repo_root
                         .unwrap_or_else(|| self.cwd.clone())
@@ -2417,21 +2775,15 @@ impl App {
                     Ok(()) => (format!("copied: {text}"), false),
                     Err(err) => (format!("copy failed: {err}"), true),
                 });
+                true
             }
             MenuAction::Reveal => {
-                let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
+                let rel = path.replace('/', std::path::MAIN_SEPARATOR_STR);
                 let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(rel);
                 reveal(&path, false);
+                true
             }
-            MenuAction::OpenExternal => {
-                let rel = entry.path.replace('/', std::path::MAIN_SEPARATOR_STR);
-                let path = repo_root.unwrap_or_else(|| self.cwd.clone()).join(&rel);
-                self.flash = Some(match open_external(&path) {
-                    Ok(()) => (format!("opened: {rel}"), false),
-                    Err(err) => (format!("open failed: {err}"), true),
-                });
-            }
-            _ => {}
+            _ => false,
         }
     }
 
@@ -2555,9 +2907,98 @@ impl App {
         self.refresh();
     }
 
+    /// Click/⏎ on a drawer line: a GRAPH commit expands its changed files
+    /// inline, everything else shows the commit / stash / tag / branch tip in
+    /// the preview pane (scrollable colored `git show`).
+    fn activate_drawer_line(&mut self, kind: Drawer, index: usize) {
+        if kind == Drawer::Graph {
+            self.toggle_commit_expansion(index);
+        } else {
+            self.open_drawer_ref(kind, index);
+        }
+    }
+
+    /// Whether GRAPH line `index` is the commit expanded inline right now.
+    fn graph_line_expanded(&self, kind: Drawer, index: usize) -> bool {
+        kind == Drawer::Graph
+            && self.expanded_commit.is_some()
+            && matches!(
+                self.drawers[kind.index()].refs.get(index),
+                Some(DrawerRef::Commit(hash)) if Some(hash) == self.expanded_commit.as_ref()
+            )
+    }
+
+    /// Open or close the changed-file list of GRAPH line `index` under that
+    /// very line. One commit at a time: the graph stays readable, and the
+    /// files are re-read only when a different commit is opened.
+    fn toggle_commit_expansion(&mut self, index: usize) {
+        let Some(DrawerRef::Commit(hash)) =
+            self.drawers[Drawer::Graph.index()].refs.get(index).cloned()
+        else {
+            return;
+        };
+        if self.expanded_commit.as_deref() == Some(hash.as_str()) {
+            self.collapse_commit();
+            return;
+        }
+        let files = match self.active_repo() {
+            Some(repo) => repo.git.commit_files(&hash),
+            None => return,
+        };
+        match files {
+            Ok(files) => {
+                self.expanded_commit = Some(hash);
+                self.commit_files = files;
+                self.rebuild();
+                self.snap = true;
+            }
+            Err(e) => self.flash = Some((e, true)),
+        }
+    }
+
+    /// Close the inline commit expansion, if one is open.
+    fn collapse_commit(&mut self) {
+        if self.expanded_commit.is_none() {
+            return;
+        }
+        self.expanded_commit = None;
+        self.commit_files.clear();
+        self.rebuild();
+    }
+
+    /// Click/⏎ on an expanded commit's file: that file's diff in THAT commit.
+    fn open_commit_file(&mut self, index: usize) {
+        let (Some(hash), Some(entry)) = (
+            self.expanded_commit.clone(),
+            self.commit_files.get(index).cloned(),
+        ) else {
+            return;
+        };
+        self.show_in_preview(&hash, Some(&entry.path));
+    }
+
     /// Click/⏎ on a drawer line: show the commit / stash / tag / branch tip
     /// in the preview pane (scrollable colored `git show`).
     fn open_drawer_ref(&mut self, kind: Drawer, index: usize) {
+        let Some(spec) = (match self.drawers[kind.index()].refs.get(index) {
+            Some(DrawerRef::Commit(h)) => Some(h.clone()),
+            Some(DrawerRef::Stash(n)) => Some(format!("stash@{{{n}}}")),
+            Some(DrawerRef::Branch { name, .. }) => Some(name.clone()),
+            Some(DrawerRef::Tag(t)) => Some(t.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let path = (kind == Drawer::FileHistory)
+            .then(|| self.history_target.clone())
+            .flatten();
+        self.show_in_preview(&spec, path.as_deref());
+    }
+
+    /// Show `git show <spec> [-- <path>]` in the preview pane beside the
+    /// sidebar. `path` narrows the show to one file — how an expanded commit's
+    /// file opens its own diff.
+    fn show_in_preview(&mut self, spec: &str, path: Option<&str>) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.flash = Some(("preview needs a herdr pane".into(), true));
             return;
@@ -2565,19 +3006,8 @@ impl App {
         let Some(repo) = self.repos.get(self.active) else {
             return;
         };
-        let spec = match self.drawers[kind.index()].refs.get(index) {
-            Some(DrawerRef::Commit(h)) => h.clone(),
-            Some(DrawerRef::Stash(n)) => format!("stash@{{{n}}}"),
-            Some(DrawerRef::Branch { name, .. }) => name.clone(),
-            Some(DrawerRef::Tag(t)) => t.clone(),
-            _ => return,
-        };
-        let path = (kind == Drawer::FileHistory)
-            .then(|| self.history_target.clone())
-            .flatten();
-        let payload = herdr_sidebar::viewer::show_request(repo.git.root(), &spec, path.as_deref());
-        let doc_key =
-            herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), &spec, path.as_deref());
+        let payload = herdr_sidebar::viewer::show_request(repo.git.root(), spec, path);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_show(repo.git.root(), spec, path);
         match herdr_sidebar::viewer::open_in_pane(&pane_id, repo.git.root(), &doc_key, &payload) {
             Ok(target) => {
                 self.last_preview = Some((doc_key, target));
@@ -2665,6 +3095,16 @@ impl App {
                     path.as_deref(),
                 ))
             }
+            Row::CommitFile(f) => {
+                let repo = self.repos.get(self.active)?;
+                let entry = self.commit_files.get(*f)?;
+                let hash = self.expanded_commit.as_deref()?;
+                Some(herdr_sidebar::viewer::doc_key_for_show(
+                    repo.git.root(),
+                    hash,
+                    Some(&entry.path),
+                ))
+            }
             _ => None,
         }
     }
@@ -2714,7 +3154,16 @@ impl App {
                     .get(*i)
                     .map(|entry| format!("unstaged:{}:{}", repo.git.root().display(), entry.path))
             }),
+            Row::StagedFolder(r, node) => self.tree_node_id(*r, *node, "staged-dir"),
+            Row::ChangesFolder(r, node) => self.tree_node_id(*r, *node, "changes-dir"),
             Row::DrawerHeader(kind) => Some(format!("drawer-h:{}", kind.title())),
+            Row::CommitFile(f) => self.commit_files.get(*f).map(|entry| {
+                format!(
+                    "commit-file:{}:{}",
+                    self.expanded_commit.as_deref().unwrap_or(""),
+                    entry.path
+                )
+            }),
             Row::DrawerLine(kind, i) => self.drawers[kind.index()]
                 .refs
                 .get(*i)
@@ -2727,6 +3176,13 @@ impl App {
     /// Inverse of [`row_stable_id`]: the row whose id matches, if any.
     fn find_row_by_stable_id(&self, id: &str) -> Option<usize> {
         (0..self.rows.len()).find(|&i| self.row_stable_id(i).as_deref() == Some(id))
+    }
+
+    /// A tree folder row's stable id: repo root + folder path under `tag`.
+    fn tree_node_id(&self, repo: usize, node: usize, tag: &str) -> Option<String> {
+        let root = self.repos.get(repo)?.git.root().display().to_string();
+        let path = &self.tree_nodes.get(node)?.path;
+        Some(format!("{tag}:{root}:{path}"))
     }
 
     /// A snapshot of the view state worth mirroring into a new tab.
@@ -3006,7 +3462,8 @@ impl App {
         match row {
             // Widget rows aren't keyboard-selectable; nothing to activate.
             Row::Message(_) | Row::Commit(_) => {}
-            Row::DrawerLine(kind, i) => self.open_drawer_ref(kind, i),
+            Row::DrawerLine(kind, i) => self.activate_drawer_line(kind, i),
+            Row::CommitFile(f) => self.open_commit_file(f),
             Row::RepoHeader(r) => {
                 self.repos[r].collapsed = !self.repos[r].collapsed;
                 self.rebuild();
@@ -3026,6 +3483,8 @@ impl App {
             }
             Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
             Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
+            Row::StagedFolder(r, node) => self.toggle_tree_folder(r, node, true),
+            Row::ChangesFolder(r, node) => self.toggle_tree_folder(r, node, false),
         }
         self.persist_scm();
     }
@@ -3721,8 +4180,8 @@ impl App {
             .enumerate()
             .skip(self.scroll)
             .take(visible)
-            .map(|(i, row)| {
-                let row_hovered = hovered == Some(i);
+            .map(|(row_index, row)| {
+                let row_hovered = hovered == Some(row_index);
                 let item = match *row {
                     Row::RepoHeader(r) => {
                         let branch_hovered = row_hovered
@@ -3788,8 +4247,16 @@ impl App {
                         item
                     }
                     Row::DrawerLine(kind, i) => {
-                        drawer_line(kind, &self.drawers[kind.index()].lines[i])
+                        let panel = &self.drawers[kind.index()];
+                        let expanded = self.graph_line_expanded(kind, i);
+                        drawer_line(kind, &panel.lines[i], panel.graph.get(i), expanded)
                     }
+                    // An expanded commit's files read like the tree's file rows
+                    // one level down, so the panel has a single file anatomy.
+                    Row::CommitFile(f) => match self.commit_files.get(f) {
+                        Some(entry) => file_item(entry, width, theme, false, false, None, Some(0)),
+                        None => ListItem::new(Line::default()),
+                    },
                     Row::Staged(r, i) => {
                         let hovered_action = row_hovered
                             .then(|| {
@@ -3804,6 +4271,9 @@ impl App {
                             true,
                             row_hovered,
                             hovered_action,
+                            self.sidebar_state
+                                .scm_tree
+                                .then(|| self.row_depth[row_index]),
                         )
                     }
                     Row::Unstaged(r, i) => {
@@ -3820,17 +4290,24 @@ impl App {
                             false,
                             row_hovered,
                             hovered_action,
+                            self.sidebar_state
+                                .scm_tree
+                                .then(|| self.row_depth[row_index]),
                         )
                     }
+                    Row::StagedFolder(_, node) => folder_item(&self.tree_nodes[node], width, theme),
+                    Row::ChangesFolder(_, node) => {
+                        folder_item(&self.tree_nodes[node], width, theme)
+                    }
                 };
-                if selected == Some(i) {
+                if selected == Some(row_index) {
                     let style = if list_focused {
                         selection_style(true)
                     } else {
                         selection_style(false)
                     };
                     item.style(style)
-                } else if hovered == Some(i) {
+                } else if hovered == Some(row_index) {
                     item.style(hover_style())
                 } else {
                     item
@@ -4038,6 +4515,53 @@ impl App {
             popup,
         );
     }
+}
+
+/// The context-menu entries for a changed FILE row. `letter` is the git
+/// status letter, `staged` the section the row sits in.
+fn file_menu_entries(letter: char, staged: bool) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Action(MenuAction::OpenDiff, "Open Diff")];
+    // A deleted file has nothing left on disk to hand to the shell.
+    if letter != 'D' {
+        entries.push(MenuEntry::Action(
+            MenuAction::OpenExternal,
+            "Open with Default App",
+        ));
+    }
+    entries.push(MenuEntry::Action(
+        MenuAction::StageOrUnstage,
+        if staged {
+            "Unstage Changes"
+        } else {
+            "Stage Changes"
+        },
+    ));
+    if !staged {
+        entries.push(MenuEntry::Action(MenuAction::Discard, "Discard Changes…"));
+    }
+    entries.extend([
+        MenuEntry::Action(MenuAction::AddToGitignore, "Add to .gitignore"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
+        MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+    ]);
+    entries
+}
+
+/// The context-menu entries for a FOLDER row of the tree view. The folder is
+/// the unit, so only path-level actions apply — staging and discarding a
+/// whole subtree stay on the Changes header.
+fn folder_menu_entries() -> Vec<MenuEntry> {
+    vec![
+        MenuEntry::Action(MenuAction::AddToGitignore, "Add to .gitignore"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
+        MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+    ]
 }
 
 /// Next selectable (non-separator) menu index in `direction`, staying put at
@@ -4458,14 +4982,228 @@ fn file_history_header(collapsed: bool, file: &str) -> ListItem<'static> {
 
 /// One content line inside an expanded drawer. Branch lines highlight the
 /// current branch (git's `%(HEAD)` renders it as `* name`).
-fn drawer_line(kind: Drawer, text: &str) -> ListItem<'static> {
+/// One drawer line. A GRAPH line draws its lane glyphs first, each lane in its
+/// own color, then the commit's text; every other drawer keeps the plain
+/// three-space indent.
+fn drawer_line(
+    kind: Drawer,
+    text: &str,
+    graph_row: Option<&commit_graph::GraphRow>,
+    expanded: bool,
+) -> ListItem<'static> {
+    ListItem::new(Line::from(drawer_line_spans(
+        kind, text, graph_row, expanded,
+    )))
+}
+
+/// The spans of one drawer line: a GRAPH line leads with its lane glyphs, each
+/// lane in its own color, then the commit's text; every other drawer keeps the
+/// plain three-space indent.
+fn drawer_line_spans(
+    kind: Drawer,
+    text: &str,
+    graph_row: Option<&commit_graph::GraphRow>,
+    expanded: bool,
+) -> Vec<Span<'static>> {
     let style = match kind {
         Drawer::Branches if text.starts_with('*') => {
             Style::default().fg(palette().untracked).bold()
         }
         _ => Style::default(),
     };
-    ListItem::new(Line::from(Span::styled(format!("   {text}"), style)))
+    let Some(row) = graph_row else {
+        return vec![Span::styled(format!("   {text}"), style)];
+    };
+    // The chevron takes the column LEFT of the first lane, so a commit reads as
+    // expandable without shifting the graph or costing any width.
+    let mut spans: Vec<Span> = vec![Span::styled(
+        if expanded { "▾" } else { "▸" },
+        Style::default().dim(),
+    )];
+    for cell in &row.cells {
+        // The commit dot is the landmark; the rails around it stay quiet so
+        // they read as structure rather than as content.
+        let lane = Style::default().fg(lane_color(cell.color));
+        let lane = if cell.glyph == "●" {
+            lane.bold()
+        } else {
+            lane.dim()
+        };
+        spans.push(Span::styled(cell.glyph, lane));
+    }
+    spans.push(Span::raw(" "));
+    match text.split_once(' ') {
+        Some((hash, rest)) => {
+            spans.push(Span::styled(hash.to_string(), Style::default().dim()));
+            spans.push(Span::styled(format!(" {rest}"), style));
+        }
+        None => spans.push(Span::styled(text.to_string(), style)),
+    }
+    spans
+}
+
+/// The eight graph lane hues. Yellow is the one hue that dies on white, so the
+/// light palette swaps it out; every other slot is shared.
+fn lane_color(lane: u8) -> Color {
+    const DARK: [Color; 8] = [
+        Color::Blue,
+        Color::Green,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Yellow,
+        Color::Red,
+        Color::LightBlue,
+        Color::LightMagenta,
+    ];
+    const LIGHT: [Color; 8] = [
+        Color::Blue,
+        Color::Green,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Red,
+        Color::LightBlue,
+        Color::LightGreen,
+        Color::LightMagenta,
+    ];
+    let lanes = if is_light() { LIGHT } else { DARK };
+    lanes[(lane as usize) % lanes.len()]
+}
+
+/// One row of a changed-files section's tree.
+#[derive(Debug)]
+enum ChangeTreeRow {
+    /// A folder: its repo-relative path (the collapse key), the display label
+    /// (single-child chains compacted: `a/b/c`) and its indent depth.
+    Folder {
+        path: String,
+        label: String,
+        depth: usize,
+        expanded: bool,
+    },
+    /// A change, by index into the section's `FileEntry` list.
+    File { index: usize, depth: usize },
+}
+
+#[derive(Default)]
+struct ChangeDir {
+    dirs: Vec<(String, ChangeDir)>,
+    files: Vec<usize>,
+}
+
+/// Group a section's changes into VS Code's tree view: folders first (case-
+/// insensitive), single-child folder chains compacted into one row, files
+/// nested under their folders. A collapsed folder keeps its row and drops its
+/// contents.
+fn changes_tree_rows(entries: &[FileEntry], collapsed: &BTreeSet<String>) -> Vec<ChangeTreeRow> {
+    let mut root = ChangeDir::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let parts: Vec<&str> = entry.path.split('/').collect();
+        let (dirs, _name) = parts.split_at(parts.len().saturating_sub(1));
+        let mut node = &mut root;
+        for dir in dirs {
+            let position = match node.dirs.iter().position(|(name, _)| name == dir) {
+                Some(position) => position,
+                None => {
+                    node.dirs.push(((*dir).to_string(), ChangeDir::default()));
+                    node.dirs.len() - 1
+                }
+            };
+            node = &mut node.dirs[position].1;
+        }
+        node.files.push(index);
+    }
+    let mut out = Vec::new();
+    walk_change_dir(&mut root, "", 0, collapsed, entries, &mut out);
+    out
+}
+
+fn walk_change_dir(
+    node: &mut ChangeDir,
+    path: &str,
+    depth: usize,
+    collapsed: &BTreeSet<String>,
+    entries: &[FileEntry],
+    out: &mut Vec<ChangeTreeRow>,
+) {
+    sort_change_dirs(&mut node.dirs);
+    node.files.sort_by(|a, b| {
+        change_file_name(entries, *a)
+            .cmp(&change_file_name(entries, *b))
+            .then_with(|| a.cmp(b))
+    });
+    for (name, mut child) in node.dirs.drain(..) {
+        let mut label = name;
+        let mut full = join_change_dir(path, &label);
+        // Compact a folder that holds no changes and exactly one subfolder.
+        while child.files.is_empty() && child.dirs.len() == 1 {
+            sort_change_dirs(&mut child.dirs);
+            let Some((next_name, next)) = child.dirs.drain(..).next() else {
+                break;
+            };
+            label.push('/');
+            label.push_str(&next_name);
+            full = join_change_dir(path, &label);
+            child = next;
+        }
+        let open = !collapsed.contains(&full);
+        out.push(ChangeTreeRow::Folder {
+            path: full.clone(),
+            label,
+            depth,
+            expanded: open,
+        });
+        if open {
+            walk_change_dir(&mut child, &full, depth + 1, collapsed, entries, out);
+        }
+    }
+    for index in node.files.drain(..) {
+        out.push(ChangeTreeRow::File { index, depth });
+    }
+}
+
+fn sort_change_dirs(dirs: &mut [(String, ChangeDir)]) {
+    dirs.sort_by(|a, b| {
+        a.0.to_lowercase()
+            .cmp(&b.0.to_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+fn change_file_name(entries: &[FileEntry], index: usize) -> String {
+    entries
+        .get(index)
+        .and_then(|entry| entry.path.rsplit('/').next())
+        .unwrap_or_default()
+        .to_lowercase()
+}
+
+fn join_change_dir(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// A folder row of the tree view: indent, disclosure chevron, folder icon,
+/// and the (possibly compacted) label — VS Code's Source Control tree.
+fn folder_item(node: &TreeNode, width: usize, theme: IconTheme) -> ListItem<'static> {
+    let arrow = if node.expanded { "▾" } else { "▸" };
+    let folder_icon = icon(theme, &node.label, true, node.expanded);
+    let icon_style = ui_icon_style(folder_icon.rgb);
+    let indent = 3 + node.depth * 2;
+    let mut spans = vec![
+        Span::raw(" ".repeat(indent)),
+        Span::styled(format!("{arrow} "), Style::default().dim()),
+        Span::styled(format!("{} ", folder_icon.glyph), icon_style),
+    ];
+    let used: usize = spans.iter().map(Span::width).sum();
+    let avail = width.saturating_sub(used);
+    spans.push(Span::styled(
+        truncate_to(node.label.clone(), avail),
+        Style::default(),
+    ));
+    ListItem::new(Line::from(spans))
 }
 
 /// A file row: icon, name colored by status, dimmed parent directory, and a
@@ -4477,6 +5215,9 @@ fn file_item(
     staged: bool,
     hovered: bool,
     hovered_action: Option<FileHoverAction>,
+    // `Some(depth)` renders a tree row (indented, no dir column); `None`
+    // keeps the flat list's anatomy.
+    tree_depth: Option<usize>,
 ) -> ListItem<'static> {
     let (dir, name) = match entry.path.rsplit_once('/') {
         Some((dir, name)) => (Some(dir), name),
@@ -4485,8 +5226,12 @@ fn file_item(
     let color = status_color(entry.letter);
     let file_icon = icon(theme, name, false, false);
     let icon_style = ui_icon_style(file_icon.rgb);
+    let indent = match tree_depth {
+        Some(depth) => 3 + depth * 2 + 2,
+        None => 3,
+    };
     let mut spans = vec![
-        Span::raw("   "),
+        Span::raw(" ".repeat(indent)),
         Span::styled(format!("{} ", file_icon.glyph), icon_style),
     ];
     let actions = file_hover_actions(staged);
@@ -4497,7 +5242,7 @@ fn file_item(
     let content_width = width.saturating_sub(prefix_width + tail);
     let visible_name = truncate_to(name.to_string(), content_width);
     spans.push(Span::styled(visible_name, Style::default().fg(color)));
-    if let Some(dir) = dir {
+    if let Some(dir) = dir.filter(|_| tree_depth.is_none()) {
         let sep = std::path::MAIN_SEPARATOR.to_string();
         let used: usize = spans.iter().map(Span::width).sum();
         let avail = width.saturating_sub(used + tail);
@@ -4546,6 +5291,78 @@ fn pane_focused_in(pane_list_json: &str, pane_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn change(path: &str) -> FileEntry {
+        FileEntry {
+            path: path.into(),
+            orig: None,
+            letter: 'M',
+        }
+    }
+
+    /// `(row label, depth)` pairs: folder labels, file paths.
+    fn tree_shape(rows: &[ChangeTreeRow], entries: &[FileEntry]) -> Vec<(String, usize)> {
+        rows.iter()
+            .map(|row| match row {
+                ChangeTreeRow::Folder { label, depth, .. } => (label.clone(), *depth),
+                ChangeTreeRow::File { index, depth } => (entries[*index].path.clone(), *depth),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn changes_tree_groups_files_under_their_folders() {
+        let entries = [
+            change("src/main.rs"),
+            change("src/bin/tool.rs"),
+            change("README.md"),
+        ];
+        let rows = changes_tree_rows(&entries, &BTreeSet::new());
+        assert_eq!(
+            tree_shape(&rows, &entries),
+            vec![
+                ("src".to_string(), 0),
+                ("bin".to_string(), 1),
+                ("src/bin/tool.rs".to_string(), 2),
+                ("src/main.rs".to_string(), 1),
+                ("README.md".to_string(), 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn changes_tree_compacts_single_child_chains() {
+        let entries = [change("a/b/c/file.rs")];
+        let rows = changes_tree_rows(&entries, &BTreeSet::new());
+        assert_eq!(
+            tree_shape(&rows, &entries),
+            vec![("a/b/c".to_string(), 0), ("a/b/c/file.rs".to_string(), 1)]
+        );
+        match &rows[0] {
+            ChangeTreeRow::Folder { path, .. } => assert_eq!(path, "a/b/c"),
+            other => panic!("expected a folder, got {other:?}"),
+        }
+        // The compacted path is the collapse key.
+        let collapsed: BTreeSet<String> = ["a/b/c".to_string()].into_iter().collect();
+        assert_eq!(changes_tree_rows(&entries, &collapsed).len(), 1);
+    }
+
+    #[test]
+    fn changes_tree_collapsed_folder_hides_its_contents() {
+        let entries = [change("src/main.rs"), change("src/bin/tool.rs")];
+        let collapsed: BTreeSet<String> = ["src".to_string()].into_iter().collect();
+        let rows = changes_tree_rows(&entries, &collapsed);
+        assert_eq!(rows.len(), 1);
+        match &rows[0] {
+            ChangeTreeRow::Folder {
+                label, expanded, ..
+            } => {
+                assert_eq!(label, "src");
+                assert!(!expanded);
+            }
+            other => panic!("expected the collapsed folder, got {other:?}"),
+        }
+    }
 
     #[test]
     fn clean_diverged_repo_uses_sync_as_the_primary_action() {
@@ -4796,6 +5613,85 @@ mod tests {
         assert_eq!(step_menu(&entries, 0, -1), 0);
         assert_eq!(step_menu(&entries, 0, 1), 2, "skips the separator");
         assert_eq!(step_menu(&entries, 2, 1), 2);
+    }
+
+    #[test]
+    fn file_menu_offers_add_to_gitignore_in_both_sections() {
+        let ignore = MenuEntry::Action(MenuAction::AddToGitignore, "Add to .gitignore");
+        let unstaged = file_menu_entries('M', false);
+        assert!(unstaged.contains(&ignore));
+        assert!(unstaged.contains(&MenuEntry::Action(MenuAction::Discard, "Discard Changes…")));
+        let staged = file_menu_entries('M', true);
+        assert!(staged.contains(&ignore));
+        assert!(
+            !staged.contains(&MenuEntry::Action(MenuAction::Discard, "Discard Changes…")),
+            "a staged file cannot be discarded"
+        );
+    }
+
+    #[test]
+    fn folder_menu_is_path_level_only() {
+        let entries = folder_menu_entries();
+        assert!(entries.contains(&MenuEntry::Action(
+            MenuAction::AddToGitignore,
+            "Add to .gitignore"
+        )));
+        assert!(entries.contains(&MenuEntry::Action(MenuAction::CopyPath, "Copy Path")));
+        assert!(entries.contains(&MenuEntry::Action(
+            MenuAction::Reveal,
+            "Reveal in File Explorer"
+        )));
+        assert!(
+            !entries.iter().any(|entry| matches!(
+                entry,
+                MenuEntry::Action(
+                    MenuAction::OpenDiff
+                        | MenuAction::StageOrUnstage
+                        | MenuAction::Discard
+                        | MenuAction::OpenExternal,
+                    _
+                )
+            )),
+            "a folder has no diff and no file-level actions"
+        );
+    }
+
+    #[test]
+    fn graph_drawer_lines_lead_with_colored_lanes() {
+        let commits = [
+            GraphCommit {
+                hash: "m".into(),
+                parents: vec!["a".into(), "b".into()],
+            },
+            GraphCommit {
+                hash: "a".into(),
+                parents: vec![],
+            },
+            GraphCommit {
+                hash: "b".into(),
+                parents: vec![],
+            },
+        ];
+        let rows = commit_graph::layout(&commits);
+        let spans = drawer_line_spans(Drawer::Graph, "m (main) merge", Some(&rows[0]), false);
+        assert_eq!(
+            spans[0].content, "▸",
+            "the chevron sits left of the first lane"
+        );
+        assert_eq!(spans[1].content, "●");
+        assert_eq!(spans[1].style.fg, Some(lane_color(0)));
+        assert_eq!(spans[2].content, "╮");
+        assert_eq!(spans[2].style.fg, Some(lane_color(1)));
+        assert_eq!(spans[3].content, " ");
+        assert_eq!(spans[4].content, "m", "the hash is its own dim span");
+        assert!(spans[4].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(spans[5].content, " (main) merge");
+        let expanded = drawer_line_spans(Drawer::Graph, "m (main) merge", Some(&rows[0]), true);
+        assert_eq!(expanded[0].content, "▾");
+        // Every other drawer keeps the plain indent and no lane spans.
+        let plain = drawer_line_spans(Drawer::Commits, "abc subject", None, false);
+        assert_eq!(plain.len(), 1);
+        assert_eq!(plain[0].content, "   abc subject");
     }
 
     #[test]

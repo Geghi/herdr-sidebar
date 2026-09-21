@@ -309,6 +309,9 @@ pub struct State {
     /// Replace mouse-click previews with the configured terminal editor.
     /// Keyboard Enter always retains the built-in preview path.
     pub custom_editor_on_click: bool,
+    /// Group the Source Control changes into a collapsible folder tree (VS
+    /// Code's "View as Tree") instead of the flat file list.
+    pub scm_tree: bool,
 }
 
 impl Default for State {
@@ -331,6 +334,7 @@ impl Default for State {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
+            scm_tree: false,
         }
     }
 }
@@ -496,7 +500,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"scm_tree\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -508,6 +512,7 @@ fn write_state(path: &Path, state: State) {
         state.focus_on_open,
         state.follow_cwd,
         state.git_deco,
+        state.scm_tree,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
@@ -924,6 +929,10 @@ pub fn parse_state(json: &str) -> State {
             .get("git_deco")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.git_deco),
+        scm_tree: value
+            .get("scm_tree")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.scm_tree),
         dock_right: value
             .get("dock_right")
             .and_then(|v| v.as_bool())
@@ -1087,8 +1096,9 @@ mod tests {
             sidebar_width: 44,
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
+            scm_tree: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"scm_tree\":true,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
@@ -1124,6 +1134,8 @@ mod tests {
         assert!(parse_state("{\"merged\":true}").follow_cwd);
         assert!(parse_state("{\"merged\":true}").git_deco);
         assert!(parse_state("{\"merged\":true}").show_git_footer);
+        // Files written before the tree view existed keep the flat list.
+        assert!(!parse_state("{\"merged\":true}").scm_tree);
         // Files written before the dock setting existed stay left-docked.
         assert!(!parse_state("{\"merged\":true}").dock_right);
         assert_eq!(parse_state("{\"merged\":true}").sidebar_width, 32);

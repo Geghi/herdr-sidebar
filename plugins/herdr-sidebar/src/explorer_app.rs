@@ -43,6 +43,8 @@ const MY_VIEW: View = View::Explorer;
 /// that.
 const DECO_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
 const TREE_SYNC_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+/// Rows the `f` filter form occupies above the tree.
+const FILTER_FORM_HEIGHT: u16 = 3;
 
 struct RepoDecorationRefresh {
     root: PathBuf,
@@ -227,11 +229,25 @@ enum Overlay {
     },
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SearchOptions {
     match_case: bool,
     whole_word: bool,
     regex: bool,
+    /// Respect `.gitignore` / global git excludes while walking (VS Code's
+    /// "Use Exclude Settings and Ignore Files", on by default).
+    follow_gitignore: bool,
+}
+
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            match_case: false,
+            whole_word: false,
+            regex: false,
+            follow_gitignore: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -316,6 +332,11 @@ pub struct App {
     scroll: usize,
     /// Bring the selection into view on the next draw (keyboard nav only).
     snap: bool,
+    /// The `f` tree filter's form; `Some` while it is open (all-empty fields
+    /// still show the ordinary expanded tree).
+    filter: Option<FilterState>,
+    /// The filter form's click zones and chip rects from the last draw.
+    filter_zones: FilterZones,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
@@ -422,6 +443,74 @@ impl Default for ActivityZones {
     }
 }
 
+/// The `f` filter's form: a file-name query plus the Search view's path-glob
+/// and gitignore controls, all applied to the tree walk.
+#[derive(Default)]
+struct FilterState {
+    query: String,
+    include: String,
+    exclude: String,
+    focus: FilterFocus,
+    options: FilterOptions,
+    /// Compile error (a bad `.*` pattern), rendered in place of the results.
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FilterOptions {
+    match_case: bool,
+    regex: bool,
+    /// Hide rows the Explorer decorates `I` (gitignored), on by default.
+    follow_gitignore: bool,
+}
+
+impl Default for FilterOptions {
+    fn default() -> Self {
+        Self {
+            match_case: false,
+            regex: false,
+            follow_gitignore: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum FilterFocus {
+    #[default]
+    Query,
+    Include,
+    Exclude,
+}
+
+impl FilterFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Query => Self::Include,
+            Self::Include => Self::Exclude,
+            Self::Exclude => Self::Query,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::Query => Self::Exclude,
+            Self::Include => Self::Query,
+            Self::Exclude => Self::Include,
+        }
+    }
+}
+
+/// The filter form's click zones and chip rects from the last draw.
+#[derive(Clone, Copy, Default)]
+struct FilterZones {
+    query: Rect,
+    include: Rect,
+    exclude: Rect,
+    match_case: Rect,
+    regex: Rect,
+    gitignore: Rect,
+}
+
 #[derive(Clone, Copy, Default)]
 struct SearchZones {
     query: Rect,
@@ -431,6 +520,7 @@ struct SearchZones {
     match_case: Rect,
     whole_word: Rect,
     regex: Rect,
+    gitignore: Rect,
     refresh: Rect,
     clear: Rect,
     details: Rect,
@@ -474,6 +564,8 @@ impl App {
             selected: restored_selection,
             scroll: 0,
             snap: restored_selection.is_some(),
+            filter: None,
+            filter_zones: FilterZones::default(),
             theme,
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
@@ -581,6 +673,10 @@ impl App {
     }
 
     fn sync_shared_tree(&mut self) {
+        // A sibling's shared state must not clobber the filtered view.
+        if self.filter.is_some() {
+            return;
+        }
         if self.last_tree_sync.elapsed() < TREE_SYNC_EVERY {
             return;
         }
@@ -1104,6 +1200,60 @@ impl App {
             self.overlay_key(key);
             return None;
         }
+        if self.filter.is_some() {
+            // Alt chords toggle the chips wherever focus is (the Search view's
+            // Alt+letter map); AltGr is CONTROL|ALT and stays text.
+            if key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && let KeyCode::Char(c) = key.code
+                && matches!(c, 'c' | 'C' | 'r' | 'R' | 'g' | 'G')
+            {
+                self.toggle_filter_option(c);
+                self.rebuild();
+                return None;
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.filter = None;
+                    self.rebuild();
+                    return None;
+                }
+                KeyCode::Tab => {
+                    if let Some(state) = self.filter.as_mut() {
+                        state.focus = state.focus.next();
+                    }
+                    return None;
+                }
+                KeyCode::BackTab => {
+                    if let Some(state) = self.filter.as_mut() {
+                        state.focus = state.focus.prev();
+                    }
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    if let Some(field) = self.filter_field_mut() {
+                        field.pop();
+                    }
+                    self.rebuild();
+                    return None;
+                }
+                // AltGr arrives as CONTROL|ALT (same guard as QuickOpen): only
+                // a CONTROL-without-ALT chord stays a shortcut.
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(field) = self.filter_field_mut() {
+                        field.push(c);
+                    }
+                    self.rebuild();
+                    return None;
+                }
+                // Navigation, Enter, and everything else fall through to the
+                // tree's own handling below.
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Char('q') => return Some(Exit::Quit),
             // Esc never quits the sidebar — it closes the preview instead.
@@ -1129,6 +1279,8 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
+            KeyCode::Char('f') => self.open_filter(),
+            KeyCode::Char('o') => self.open_selected_external(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
@@ -1212,6 +1364,9 @@ impl App {
                 if hits_collapse_button(mouse.column, mouse.row, self.last_width, self.last_height)
                 {
                     self.hide();
+                    return None;
+                }
+                if self.filter_click(mouse.column, mouse.row) {
                     return None;
                 }
                 let Some(index) = self.row_at(mouse.row) else {
@@ -1322,6 +1477,24 @@ impl App {
             .map(|row| (row.path.clone(), row.is_dir));
         let (x, y) = self.selection_anchor();
         self.show_menu(x, y, target);
+    }
+
+    /// `o`: hand the selected row to the OS shell association (xdg-open /
+    /// `open` / explorer.exe) — the keyboard twin of the menu's "Open with
+    /// Default App", but wider: on a folder the association opens the file
+    /// manager inside it.
+    fn open_selected_external(&mut self) {
+        let Some(path) = external_open_path(self.selected_row()) else {
+            return;
+        };
+        let name = path
+            .file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy();
+        self.notice = Some(match actions::open_external(&path) {
+            Ok(()) => format!("opened: {name}"),
+            Err(err) => format!("open failed: {err}"),
+        });
     }
 
     /// Where a keyboard-opened popup anchors: just under the selected row when
@@ -1516,6 +1689,10 @@ impl App {
                         }
                         KeyCode::Char('r' | 'R') => {
                             options.regex = !options.regex;
+                            true
+                        }
+                        KeyCode::Char('g' | 'G') => {
+                            options.follow_gitignore = !options.follow_gitignore;
                             true
                         }
                         _ => false,
@@ -1932,6 +2109,77 @@ impl App {
         });
     }
 
+    /// `f`: open the filter form above the tree — the name query plus the
+    /// Search view's include/exclude path globs and `Aa`/`.*`/`gi` chips.
+    /// Typing narrows the tree to the files that survive, with their ancestor
+    /// folders kept (see [`Tree::filtered_rows`]); Esc closes it and restores
+    /// the ordinary expanded tree.
+    fn open_filter(&mut self) {
+        if self.filter.is_none() {
+            self.filter = Some(FilterState::default());
+        }
+    }
+
+    /// The focused filter field, for text edits.
+    fn filter_field_mut(&mut self) -> Option<&mut String> {
+        let state = self.filter.as_mut()?;
+        Some(match state.focus {
+            FilterFocus::Query => &mut state.query,
+            FilterFocus::Include => &mut state.include,
+            FilterFocus::Exclude => &mut state.exclude,
+        })
+    }
+
+    /// `Alt+C` / `Alt+R` / `Alt+G` toggle the filter's chips.
+    fn toggle_filter_option(&mut self, key: char) {
+        if let Some(state) = self.filter.as_mut() {
+            match key.to_ascii_lowercase() {
+                'c' => state.options.match_case = !state.options.match_case,
+                'r' => state.options.regex = !state.options.regex,
+                _ => state.options.follow_gitignore = !state.options.follow_gitignore,
+            }
+        }
+    }
+
+    /// A left click landed on the filter form: focus the field or toggle the
+    /// chip under the cursor. Returns true when the click was consumed.
+    fn filter_click(&mut self, column: u16, row: u16) -> bool {
+        if self.filter.is_none() {
+            return false;
+        }
+        let zones = self.filter_zones;
+        let focus = if hits(zones.query, column, row) {
+            Some(FilterFocus::Query)
+        } else if hits(zones.include, column, row) {
+            Some(FilterFocus::Include)
+        } else if hits(zones.exclude, column, row) {
+            Some(FilterFocus::Exclude)
+        } else {
+            None
+        };
+        if let Some(focus) = focus {
+            if let Some(state) = self.filter.as_mut() {
+                state.focus = focus;
+            }
+            return true;
+        }
+        let chip = if hits(zones.match_case, column, row) {
+            Some('c')
+        } else if hits(zones.regex, column, row) {
+            Some('r')
+        } else if hits(zones.gitignore, column, row) {
+            Some('g')
+        } else {
+            None
+        };
+        if let Some(chip) = chip {
+            self.toggle_filter_option(chip);
+            self.rebuild();
+            return true;
+        }
+        false
+    }
+
     fn collect_quick_index(&mut self) {
         let result = self
             .quick_index_rx
@@ -1995,7 +2243,7 @@ impl App {
                 let worker_root = root.clone();
                 std::thread::spawn(move || {
                     let (files, truncated) =
-                        collect_quick_files(&worker_root, show_hidden, QUICK_OPEN_FILE_LIMIT);
+                        collect_quick_files(&worker_root, show_hidden, true, QUICK_OPEN_FILE_LIMIT);
                     let _ = tx.send(QuickIndex {
                         root: worker_root,
                         show_hidden,
@@ -2173,6 +2421,13 @@ impl App {
                 if hits(zones.regex, mouse.column, mouse.row) =>
             {
                 options.regex = !options.regex;
+                dirty = true;
+                Cmd::Nothing
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if hits(zones.gitignore, mouse.column, mouse.row) =>
+            {
+                options.follow_gitignore = !options.follow_gitignore;
                 dirty = true;
                 Cmd::Nothing
             }
@@ -2995,6 +3250,11 @@ impl App {
     /// Publish this root's tree shape and selection. Other same-root sidebars
     /// adopt it during their next idle tick.
     fn persist_tree(&self) {
+        // Filter edits are pane-local: a filtered cursor must not move a
+        // sibling sidebar's selection, and expansion is untouched anyway.
+        if self.filter.is_some() {
+            return;
+        }
         sidebar::save_tree_state(
             &self.tree.root_path(),
             &sidebar::TreeState {
@@ -3086,16 +3346,65 @@ impl App {
         self.rebuild();
     }
 
+    /// The filter narrows the tree once ANY field has text — an empty form
+    /// keeps the ordinary expanded view.
+    fn filter_active(&self) -> bool {
+        self.filter.as_ref().is_some_and(|state| {
+            !state.query.is_empty() || !state.include.is_empty() || !state.exclude.is_empty()
+        })
+    }
+
     /// Recompute visible rows, keeping the selection on the same path when it
-    /// still exists (else the nearest valid index).
+    /// still exists (else the nearest valid index). With an active filter the
+    /// rows come from [`Tree::filtered_rows`] instead of the expanded tree,
+    /// and a vanished selection lands on the first match so Enter stays useful.
     fn rebuild(&mut self) {
         self.hovered = None;
-        rebuild_tree_rows(
-            &mut self.tree,
-            &mut self.rows,
-            &mut self.selected,
-            &mut self.scroll,
-        );
+        if self.filter_active() {
+            let compiled = self.filter.as_ref().map(FilterMatcher::compile);
+            let (matcher, error) = match compiled {
+                Some(Ok(matcher)) => (Some(matcher), None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
+            };
+            if let Some(state) = self.filter.as_mut() {
+                state.error = error;
+            }
+            let hide_ignored = self
+                .filter
+                .as_ref()
+                .is_some_and(|state| state.options.follow_gitignore);
+            self.rows = match matcher {
+                Some(matcher) => {
+                    let deco = &self.deco;
+                    self.tree.filtered_rows(&mut |path, rel, name| {
+                        matcher.keeps(rel, name)
+                            && !(hide_ignored && deco.letter(path, false) == Some('I'))
+                    })
+                }
+                None => Vec::new(),
+            };
+            let selected_path = self
+                .selected
+                .and_then(|index| self.rows.get(index))
+                .map(|row| row.path.clone());
+            self.selected = selected_path
+                .as_ref()
+                .and_then(|path| self.rows.iter().position(|row| row.path == *path))
+                .or_else(|| (!self.rows.is_empty()).then_some(0));
+            self.scroll = 0;
+            self.snap = self.selected.is_some();
+        } else {
+            if let Some(state) = self.filter.as_mut() {
+                state.error = None;
+            }
+            rebuild_tree_rows(
+                &mut self.tree,
+                &mut self.rows,
+                &mut self.selected,
+                &mut self.scroll,
+            );
+        }
         self.persist_tree();
     }
 
@@ -3121,7 +3430,6 @@ impl App {
             Constraint::Length(footer_height),
         ])
         .areas(frame.area());
-        self.page = body.height.saturating_sub(1).max(1) as usize;
 
         if self.merged() {
             self.draw_activity_bar(frame, activity);
@@ -3158,8 +3466,32 @@ impl App {
         }
         self.draw_header(frame, header);
 
+        // The filter form owns the body's first rows; the tree keeps the rest.
+        // Mouse row mapping follows from the same geometry.
+        let body = if self.filter.is_some() {
+            let [filter_form, tree] =
+                Layout::vertical([Constraint::Length(FILTER_FORM_HEIGHT), Constraint::Min(0)])
+                    .areas(body);
+            self.draw_filter_form(frame, filter_form);
+            tree
+        } else {
+            body
+        };
+        self.page = body.height.saturating_sub(1).max(1) as usize;
+
         if self.rows.is_empty() {
-            frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
+            let message = if let Some(error) = self
+                .filter
+                .as_ref()
+                .and_then(|state| state.error.as_deref())
+            {
+                format!("  {error}")
+            } else if self.filter_active() {
+                "  (no matches)".into()
+            } else {
+                "  (empty)".into()
+            };
+            frame.render_widget(Paragraph::new(message.dim().italic()), body);
         } else {
             let h = (body.height as usize).max(1);
             self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
@@ -3312,6 +3644,140 @@ impl App {
             Some(Overlay::QuickOpen { .. }) => self.draw_quick_open(frame),
             _ => {}
         }
+    }
+
+    /// The filter form above the tree: `filter:` (the name query), then
+    /// `include:` / `exclude:` path globs, with the `Aa` / `.*` / `gi` chips
+    /// right-aligned on the first row when they fit. The focused row is bold
+    /// and carries the caret; an empty unfocused row shows its placeholder.
+    fn draw_filter_form(&mut self, frame: &mut Frame, area: Rect) {
+        let (focus, options, query, include, exclude) = {
+            let Some(state) = self.filter.as_ref() else {
+                return;
+            };
+            (
+                state.focus,
+                state.options,
+                state.query.clone(),
+                state.include.clone(),
+                state.exclude.clone(),
+            )
+        };
+        let [query_row, include_row, exclude_row] =
+            Layout::vertical([Constraint::Length(1); 3]).areas(area);
+        let chips = [
+            ("Aa ", options.match_case),
+            (".* ", options.regex),
+            ("gi ", options.follow_gitignore),
+        ];
+        let chips_width = chips
+            .iter()
+            .map(|(label, _)| label.len() as u16)
+            .sum::<u16>();
+        let show_chips = query_row.width >= chips_width.saturating_add(12);
+        let query_width = if show_chips {
+            query_row.width.saturating_sub(chips_width)
+        } else {
+            query_row.width
+        };
+        self.filter_zones = FilterZones::default();
+        self.filter_zones.query = Rect::new(query_row.x, query_row.y, query_width, 1);
+        self.filter_input_row(
+            frame,
+            self.filter_zones.query,
+            "filter: ",
+            "name",
+            &query,
+            focus == FilterFocus::Query,
+        );
+        self.filter_zones.include = include_row;
+        self.filter_input_row(
+            frame,
+            include_row,
+            "include: ",
+            "files to include",
+            &include,
+            focus == FilterFocus::Include,
+        );
+        self.filter_zones.exclude = exclude_row;
+        self.filter_input_row(
+            frame,
+            exclude_row,
+            "exclude: ",
+            "files to exclude",
+            &exclude,
+            focus == FilterFocus::Exclude,
+        );
+        if !show_chips {
+            return;
+        }
+        let option_style = |active: bool| {
+            if active {
+                selection_style(true)
+            } else {
+                Style::default().dim()
+            }
+        };
+        let spans: Vec<Span> = chips
+            .iter()
+            .map(|(label, active)| Span::styled(*label, option_style(*active)))
+            .collect();
+        let chips_area = Rect::new(
+            query_row.x.saturating_add(query_width),
+            query_row.y,
+            chips_width,
+            1,
+        );
+        let mut cursor = chips_area.x;
+        let mut bounds = Vec::new();
+        for span in &spans {
+            let width = span.width() as u16;
+            bounds.push(Rect::new(cursor, chips_area.y, width, 1));
+            cursor = cursor.saturating_add(width);
+        }
+        self.filter_zones.match_case = bounds[0];
+        self.filter_zones.regex = bounds[1];
+        self.filter_zones.gitignore = bounds[2];
+        frame.render_widget(Paragraph::new(Line::from(spans)), chips_area);
+    }
+
+    /// One row of the filter form: the label, the TAIL of the value (so the
+    /// caret stays visible), and a caret on the focused row.
+    fn filter_input_row(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        label: &'static str,
+        placeholder: &'static str,
+        value: &str,
+        focused: bool,
+    ) {
+        let label_style = if focused {
+            Style::default().bold()
+        } else {
+            Style::default().dim()
+        };
+        let avail = usize::from(area.width)
+            .saturating_sub(label.len() + 1)
+            .max(1);
+        let mut spans = vec![Span::styled(label, label_style)];
+        if value.is_empty() {
+            if focused {
+                spans.push(Span::styled("█", Style::default().dim()));
+            } else {
+                spans.push(Span::styled(
+                    truncate_to(placeholder.to_string(), avail),
+                    Style::default().dim(),
+                ));
+            }
+        } else {
+            let caret = usize::from(focused);
+            spans.push(Span::raw(input_tail(value, avail.saturating_sub(caret))));
+            if focused {
+                spans.push(Span::styled("█", Style::default().dim()));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
     /// The workspace-name header (the root folder's name, uppercase like VS
@@ -3763,7 +4229,7 @@ impl App {
             area.width.saturating_sub(3),
             3,
         );
-        let option_width = query_box.width.min(9);
+        let option_width = query_box.width.min(12);
         let option_x = query_box.x
             + query_box
                 .width
@@ -3805,6 +4271,7 @@ impl App {
             Span::styled("Aa ", option_style(options.match_case)),
             Span::styled("ab ", option_style(options.whole_word)),
             Span::styled(".* ", option_style(options.regex)),
+            Span::styled("gi ", option_style(options.follow_gitignore)),
         ];
         let mut option_cursor = options_area.x;
         let mut option_bounds = Vec::new();
@@ -3816,6 +4283,7 @@ impl App {
         self.search_zones.match_case = option_bounds[0];
         self.search_zones.whole_word = option_bounds[1];
         self.search_zones.regex = option_bounds[2];
+        self.search_zones.gitignore = option_bounds[3];
         frame.render_widget(
             Paragraph::new(Line::from(option_spans.to_vec())),
             options_area,
@@ -4147,7 +4615,12 @@ const CONTENT_SEARCH_MATCH_LIMIT: usize = 1_000;
 const CONTENT_SEARCH_FILE_LIMIT: usize = 20_000;
 const CONTENT_SEARCH_MAX_BYTES: u64 = 1024 * 1024;
 
-fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<QuickFile>, bool) {
+fn collect_quick_files(
+    root: &Path,
+    show_hidden: bool,
+    follow_gitignore: bool,
+    limit: usize,
+) -> (Vec<QuickFile>, bool) {
     let mut files = Vec::new();
     let mut truncated = false;
     let mut builder = ignore::WalkBuilder::new(root);
@@ -4155,6 +4628,14 @@ fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<Qui
         .hidden(!show_hidden)
         .follow_links(false)
         .require_git(false)
+        // "Follow .gitignore" off searches git-ignored files too: dropping
+        // every ignore source keeps `target/`-style trees in the walk (the
+        // caller's file limit still bounds it).
+        .git_ignore(follow_gitignore)
+        .git_global(follow_gitignore)
+        .git_exclude(follow_gitignore)
+        .ignore(follow_gitignore)
+        .parents(follow_gitignore)
         .filter_entry(|entry| entry.file_name() != ".git");
     for entry in builder.build().flatten() {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -4210,8 +4691,12 @@ fn collect_content_hits(
     };
     let includes = build_search_globs(include, "include")?;
     let excludes = build_search_globs(exclude, "exclude")?;
-    let (files, file_limit_reached) =
-        collect_quick_files(root, show_hidden, CONTENT_SEARCH_FILE_LIMIT);
+    let (files, file_limit_reached) = collect_quick_files(
+        root,
+        show_hidden,
+        options.follow_gitignore,
+        CONTENT_SEARCH_FILE_LIMIT,
+    );
     let mut hits = Vec::new();
     for file in files {
         if includes
@@ -4297,6 +4782,66 @@ fn build_search_globs(raw: &str, label: &str) -> Result<Option<GlobSet>, String>
         .build()
         .map(Some)
         .map_err(|error| format!("Invalid {label} pattern: {error}"))
+}
+
+/// Compiled per-file matcher for the `f` filter: the name query (literal, or a
+/// `.*` regex, case-folded unless `Aa`) plus the Search view's include/exclude
+/// glob sets over `/`-separated paths relative to the tree root.
+struct FilterMatcher {
+    pattern: Option<Regex>,
+    needle: Option<String>,
+    includes: Option<GlobSet>,
+    excludes: Option<GlobSet>,
+}
+
+impl FilterMatcher {
+    fn compile(state: &FilterState) -> Result<Self, String> {
+        let query = state.query.as_str();
+        let pattern = if state.options.regex && !query.is_empty() {
+            Some(
+                RegexBuilder::new(query)
+                    .case_insensitive(!state.options.match_case)
+                    .build()
+                    .map_err(|error| format!("Invalid regular expression: {error}"))?,
+            )
+        } else {
+            None
+        };
+        let needle = if pattern.is_none() && !query.is_empty() {
+            Some(if state.options.match_case {
+                query.to_string()
+            } else {
+                query.to_lowercase()
+            })
+        } else {
+            None
+        };
+        Ok(Self {
+            pattern,
+            needle,
+            includes: build_search_globs(&state.include, "include")?,
+            excludes: build_search_globs(&state.exclude, "exclude")?,
+        })
+    }
+
+    /// Whether a file survives: the name query, then the include globs (it
+    /// must match one), then the exclude globs (it must match none).
+    fn keeps(&self, rel: &str, name: &str) -> bool {
+        let named = match (&self.pattern, &self.needle) {
+            (Some(pattern), _) => pattern.is_match(name),
+            (None, Some(needle)) => name.to_lowercase().contains(needle),
+            (None, None) => true,
+        };
+        named
+            && !self
+                .includes
+                .as_ref()
+                .is_some_and(|patterns| !patterns.is_match(rel))
+            && !self
+                .excludes
+                .as_ref()
+                .is_some_and(|patterns| patterns.is_match(rel))
+    }
 }
 
 #[cfg(test)]
@@ -4642,6 +5187,14 @@ fn create_target_dir(selected: Option<&Row>, root: PathBuf) -> PathBuf {
     }
 }
 
+/// `o`'s target: the selected row's path, file or folder — the OS
+/// association for a directory is the file manager, so it opens INSIDE the
+/// folder; deliberately wider than the menu's files-only "Open with Default
+/// App" entry.
+fn external_open_path(selected: Option<&Row>) -> Option<PathBuf> {
+    selected.map(|row| row.path.clone())
+}
+
 /// True when a click at pane-local `column` lands on a row's disclosure
 /// chevron (the two cells right after the depth indent).
 fn hits_chevron(column: u16, depth: usize) -> bool {
@@ -4889,6 +5442,19 @@ mod tests {
     }
 
     #[test]
+    fn open_external_key_targets_files_and_folders() {
+        let file = file_row("app.rs");
+        assert_eq!(external_open_path(Some(&file)), Some(file.path.clone()));
+        let dir = dir_row("src");
+        assert_eq!(
+            external_open_path(Some(&dir)),
+            Some(dir.path.clone()),
+            "a folder opens the file manager inside it"
+        );
+        assert_eq!(external_open_path(None), None, "no selection");
+    }
+
+    #[test]
     fn focused_pane_detection_is_scoped_to_our_pane_id() {
         let panes = r#"{"result":{"panes":[
             {"pane_id":"w1:p1","focused":false},
@@ -5058,7 +5624,7 @@ mod tests {
         std::fs::write(root.join("target/generated.rs"), "").unwrap();
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
 
-        let (hidden_off, truncated) = collect_quick_files(&root, false, 20);
+        let (hidden_off, truncated) = collect_quick_files(&root, false, true, 20);
         assert!(!truncated);
         assert_eq!(
             hidden_off
@@ -5067,7 +5633,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["src/main.rs"]
         );
-        let (hidden_on, _) = collect_quick_files(&root, true, 20);
+        let (hidden_on, _) = collect_quick_files(&root, true, true, 20);
         assert_eq!(
             hidden_on
                 .iter()
@@ -5112,6 +5678,27 @@ mod tests {
                 .unwrap();
         assert_eq!(with_hidden.len(), 3);
         assert!(with_hidden.iter().any(|hit| hit.label == ".secret"));
+
+        // "Follow .gitignore" off: the git-ignored target file is searched too.
+        let (unignored, _) = collect_content_hits(
+            &root,
+            false,
+            "needle",
+            "",
+            "",
+            SearchOptions {
+                follow_gitignore: false,
+                ..SearchOptions::default()
+            },
+            20,
+        )
+        .unwrap();
+        assert_eq!(unignored.len(), 3);
+        assert!(
+            unignored
+                .iter()
+                .any(|hit| hit.label == "target/generated.rs")
+        );
 
         let (included, _) = collect_content_hits(
             &root,
@@ -5194,6 +5781,97 @@ mod tests {
             .unwrap();
         assert!(directories.is_match("web/node_modules/pkg/index.js"));
         assert!(directories.is_match("node_modules/pkg/index.js"));
+        // The comma-separated form the UI advertises: folders, globs, dot-dirs.
+        let mixed = build_search_globs(" tests/ , *.md, .cache ", "exclude")
+            .unwrap()
+            .unwrap();
+        assert!(mixed.is_match("repo/tests/unit/one.rs"));
+        assert!(mixed.is_match("README.md"));
+        assert!(mixed.is_match("deep/.cache/blob"));
+        assert!(!mixed.is_match("src/main.rs"));
+    }
+
+    fn filter_state(
+        query: &str,
+        include: &str,
+        exclude: &str,
+        options: FilterOptions,
+    ) -> FilterState {
+        FilterState {
+            query: query.into(),
+            include: include.into(),
+            exclude: exclude.into(),
+            focus: FilterFocus::default(),
+            options,
+            error: None,
+        }
+    }
+
+    fn filter_matcher(
+        query: &str,
+        include: &str,
+        exclude: &str,
+        options: FilterOptions,
+    ) -> FilterMatcher {
+        FilterMatcher::compile(&filter_state(query, include, exclude, options)).unwrap()
+    }
+
+    #[test]
+    fn filter_matcher_combines_name_path_and_case_rules() {
+        let named = filter_matcher("main", "", "", FilterOptions::default());
+        assert!(named.keeps("src/main.rs", "main.rs"));
+        assert!(!named.keeps("src/lib.rs", "lib.rs"));
+        // Case-insensitive unless `Aa` is on.
+        assert!(
+            filter_matcher("MAIN", "", "", FilterOptions::default())
+                .keeps("src/main.rs", "main.rs")
+        );
+        assert!(
+            !filter_matcher(
+                "MAIN",
+                "",
+                "",
+                FilterOptions {
+                    match_case: true,
+                    ..FilterOptions::default()
+                },
+            )
+            .keeps("src/main.rs", "main.rs")
+        );
+        // Include narrows to its globs; exclude drops them again.
+        assert!(
+            filter_matcher("main", "src/**", "", FilterOptions::default())
+                .keeps("src/main.rs", "main.rs")
+        );
+        assert!(
+            !filter_matcher("main", "src/**", "", FilterOptions::default())
+                .keeps("vendor/main.rs", "main.rs")
+        );
+        assert!(
+            !filter_matcher("main", "", "tests/", FilterOptions::default())
+                .keeps("tests/main.rs", "main.rs")
+        );
+        // An empty query with globs still narrows (include-only filtering).
+        assert!(
+            filter_matcher("", "*.md", "", FilterOptions::default())
+                .keeps("docs/readme.md", "readme.md")
+        );
+        assert!(
+            !filter_matcher("", "*.md", "", FilterOptions::default())
+                .keeps("src/main.rs", "main.rs")
+        );
+    }
+
+    #[test]
+    fn filter_matcher_regex_reports_invalid_patterns() {
+        let regex = FilterOptions {
+            regex: true,
+            ..FilterOptions::default()
+        };
+        let matcher = filter_matcher(r"^(main|lib)\.rs$", "", "", regex);
+        assert!(matcher.keeps("src/main.rs", "main.rs"));
+        assert!(!matcher.keeps("src/main.rs.bak", "main.rs.bak"));
+        assert!(FilterMatcher::compile(&filter_state("[", "", "", regex)).is_err());
     }
 
     #[test]

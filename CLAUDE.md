@@ -511,7 +511,11 @@ HACKING.md — budget time for that before promising a patched build.
   the shared cwd follower as manually overridden before rebuilding either view.
 - "Open with Default App" (`actions::open_external`, in the Explorer menu for FILE rows
   only and in the SCM file menu unless the entry's status letter is `D`) hands the path to
-  the OS shell association. Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer
+  the OS shell association. The Explorer list's `o` key is its keyboard twin but
+  deliberately wider: on a folder the association (xdg-open / `open` / explorer.exe)
+  opens the file manager INSIDE it (the tree keymap runs only with no overlay, so
+  Search never sees a bare `o`, and the SCM app keeps its own `o` — open diff).
+  Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer
   is GUI-subsystem, so no console is created and Windows 11 never flashes a Windows Terminal
   window; it resolves the association exactly like a double click (verified live — a .html
   row launched the ChromeHTML handler; a broken/unregistered association falls back to the
@@ -544,6 +548,19 @@ HACKING.md — budget time for that before promising a patched build.
   fits a ~34-col pane.
 - Gotcha: after the ✧ suggestion lands, panel focus moves to the message box — letter keys
   then type text instead of triggering actions (Esc returns to the list).
+- `f` opens the Explorer's filter form above the tree: a name query plus the Search view's
+  include/exclude path globs (the same `build_search_globs`, so `tests/, *.md, .cache` works)
+  and `Aa`/`.*`/`gi` chips (`Alt+C`/`Alt+R`/`Alt+G` or a click; `Tab`/`Shift+Tab` cycle the
+  three fields). Rows come from `Tree::filtered_rows`, a predicate walk that keeps the ancestor
+  FOLDERS so matches stay treed (barren folders drop out; the walk deliberately ignores the
+  expanded set, so ancestors render open). `gi` hides the rows the decorations mark `I`, so it
+  needs Git decorations enabled to have anything to hide. ANY field activates the filter; an
+  all-empty form keeps the ordinary tree. Esc closes and restores, Up/Down/PageUp/PageDown and
+  Enter keep working on the filtered rows, and bare digits type into the focused field (only
+  Ctrl+1/2/3 still switch views). While the form is open the pane neither persists nor adopts
+  shared tree state (`persist_tree`/`sync_shared_tree` early-return), so a sibling sidebar never
+  follows the filtered cursor; the walk rides the tree's cached listings, so typing never
+  re-reads the disk.
 - Explorer Quick Open is `Ctrl+P` and reuses the normal preview client rather than inventing
   a second open path. Its in-process filename index is capped at 20,000 files, never descends
   into `.git`, follows the Explorer dotfile toggle, does not follow directory symlinks, honors
@@ -566,7 +583,10 @@ HACKING.md — budget time for that before promising a patched build.
   and caps both indexed files and returned matches. Results are grouped by relative file path;
   selecting a match sends a line-bearing file request through the existing preview client.
   Search is a persistent first-class activity view, not a popup: it updates after a 300 ms typing
-  debounce and exposes VS Code-style match-case, whole-word, and regex toggles. `1`, `2`, and `3`
+  debounce and exposes VS Code-style match-case (`Alt+C`), whole-word (`Alt+W`), and regex
+  (`Alt+R`) toggles plus a `gi` chip (`Alt+G`) for following `.gitignore`: off searches
+  git-ignored files too (the walker drops git_ignore/git_global/git_exclude/.ignore and parent
+  ignore discovery; the caller's file cap still bounds the walk). `1`, `2`, and `3`
   select Explorer, Search, and Source Control — the SAME left-to-right order as the activity bar
   and VS Code (Search is `2`, Source Control is `3`). Switching INTO Search does NOT focus the
   search box (`open_content_search(false)` → `SearchFocus::Results`): the box stays unfocused so
@@ -580,8 +600,9 @@ HACKING.md — budget time for that before promising a patched build.
   overlay/focus dispatch, the keyboard way out of a focused search/commit field. A modal opened
   from Search (branch picker via a footer click, or ⚙ Settings) is parked over the search overlay
   (`suspended_search`) and restored with its query on close, instead of dropping back to the tree.
-  The overflow control reveals include/exclude glob
-  filters. Unfocused empty inputs render dim placeholders without mutating input state; focusing an
+  The overflow control reveals include/exclude glob filters (comma-separated; a bare name also
+  matches that directory's descendants, so `tests/, *.md, .cache` works). Unfocused empty inputs
+  render dim placeholders without mutating input state; focusing an
   empty input hides its placeholder and puts the block caret in the first cell. The Replace field is
   always visible without a disclosure chevron, and remains deliberately inert until replacement can
   ship with explicit confirmation, previews, and safe failure semantics. Result line numbers use the
@@ -678,6 +699,24 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Source Control view specifics (`src/scm_app.rs`)
 
+- **View as tree** (`t` or ⚙ Settings → "View as tree"; persisted globally as `scm_tree`,
+  default OFF = the historical flat list): the Staged/Changes sections group their entries
+  into VS Code's collapsible folder tree. `changes_tree_rows` (pure, unit-tested) builds it:
+  folders first, case-insensitive; a folder holding no changes and exactly one subfolder
+  COMPACTS into one row (`a/b/c`) while the full path stays the collapse key; files nest under
+  their folder. Left/`h` folds the selected folder or steps out to the parent row, Right/`l`
+  unfolds, Enter/click on a folder row folds it. `Row` must stay `Copy`, so folder paths/labels
+  live in `App::tree_nodes` (referenced by `Row::StagedFolder`/`ChangesFolder`) and the indent
+  comes from `row_depth`, a vector kept aligned with `rows` — a compacted parent's children sit
+  one level under it, not at their path depth. Collapse sets are per-repo and per-section
+  (`staged_tree_collapsed`/`changes_tree_collapsed`), in-memory only for now. The tree feeds the
+  same `Row::Staged`/`Unstaged` file rows, so stage/unstage/commit/diff/context menus are
+  unchanged, and `row_stable_id` covers folder rows so the selection survives a rebuild.
+  Folder rows open their own path-level menu (`folder_menu_entries`): "Add to .gitignore",
+  Copy Path / Copy Relative Path, Reveal — no diff and no per-file staging, which stay on
+  the Changes header. "Add to .gitignore" writes the line through `Git::add_to_gitignore`
+  (a file adds its path, a folder a directory-only `dir/` rule, and an already-listed rule
+  is refused rather than duplicated).
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two
   levels down (`.git` dir or file), skipping `target`/`node_modules`/`.claude` (the agent
   worktrees under `.claude/worktrees` would otherwise show up as repos). With >1 repo the
@@ -697,6 +736,29 @@ HACKING.md — budget time for that before promising a patched build.
   y/N prompt. Hovered file rows show a `+`/`−` glyph (click zone = last 5 columns) and the
   section headers a section-wide one (last 6); a dim "ctrl+rclick for menus" hint sits on
   the « footer line whenever the footer is otherwise empty.
+- **The GRAPH drawer draws lanes, not git's ASCII art**: `Git::graph` fetches
+  `--topo-order --pretty=format:%h%x1f%p%x1f%D%x1f%s` (unit separators keep subjects with
+  `|` or `(` intact; `--topo-order` is required — a parent must never precede its child) and
+  `parse_graph_log` splits it into `GraphLine { commit, text }`. `graph::layout` (pure, no
+  git/terminal/colors, 11 tests) turns the commits into fixed-width rows of `GraphCell
+  { glyph, color }` (`●` commit, `│` pass-through, `─` horizontal, `╭ ╮` turns), reusing freed
+  lanes so the width stays the window's real concurrency. `DrawerPanel::graph` holds the rows
+  parallel to `lines`, and `drawer_line_spans` renders each lane glyph in `lane_color` (8
+  slots, lane index mod 8; the light palette swaps yellow out) followed by the commit text —
+  every other drawer keeps the plain three-space indent.
+- **A GRAPH commit expands its files INLINE**: click/⏎ on a graph line opens that commit's
+  changed files right under it (`Row::CommitFile`, `expanded_commit` + `commit_files`, one
+  commit at a time and matched by HASH so a refresh keeps it), pushing the rest of the graph
+  down instead of opening a second pane; ⏎ on one of those files shows
+  `git show <hash> -- <path>` in the preview pane, and Right/`l` / Left/`h` open and close
+  (`list_left`/`list_right` wrap the tree's fold behaviour). The chevron lives in the column
+  LEFT of the first lane, so commits read as expandable without shifting the graph. Files come
+  from `Git::commit_files` — `show --first-parent --name-status` parsed by `parse_name_status`
+  (without `--first-parent` a MERGE shows nothing). A file inside a commit is a DIFF, not a
+  `git show`: `viewer::load_show` with a path runs a plain
+  `show --first-parent --format= --patch` and hands it to `diffview::render`, so it looks
+  exactly like the Changes section's diff (the whole-commit view keeps git's colored
+  `--stat --patch`).
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

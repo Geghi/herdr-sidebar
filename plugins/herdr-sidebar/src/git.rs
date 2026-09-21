@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::graph::GraphCommit;
+
 const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One file in the staged or unstaged list.
@@ -39,6 +41,16 @@ pub struct Status {
 #[derive(Clone)]
 pub struct Git {
     root: PathBuf,
+}
+
+/// One row of the commit-graph window: the commit the lane layout needs, plus
+/// the text line the drawer draws after the lanes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GraphLine {
+    /// The commit itself (short hash + parent hashes).
+    pub commit: GraphCommit,
+    /// `hash (decorations) subject` — decorations omitted when there are none.
+    pub text: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +264,16 @@ impl Git {
         Ok(parse_ignored(&out))
     }
 
+    /// Append `pattern` to the repository's root `.gitignore`, creating the
+    /// file when it is missing, so the path stops showing up in `git status`.
+    /// A folder is passed with a trailing `/` (VS Code's directory-only
+    /// rule). A pattern already listed — with or without the slash — is
+    /// refused rather than duplicated, and the exact line written is
+    /// returned.
+    pub fn add_to_gitignore(&self, pattern: &str) -> Result<String, String> {
+        append_ignore(&self.root.join(".gitignore"), pattern)
+    }
+
     /// The repository that OWNS `path`: the NEAREST enclosing repo, found by
     /// git's own upward walk. A path inside a nested repository therefore
     /// belongs to the nested repo, never to the parent — the boundary rule
@@ -350,12 +372,22 @@ impl Git {
 
     // ---- Drawer queries (display-only lists, VS Code Git-Graph style) ----
 
-    pub fn graph(&self, limit: usize) -> Result<Vec<String>, String> {
+    /// The commit-graph window, newest first: the structured commits the lane
+    /// layout needs, each with the display line drawn after its lanes.
+    /// `--topo-order` is not optional — the layout relies on a parent never
+    /// appearing before one of its children.
+    pub fn graph(&self, limit: usize) -> Result<Vec<GraphLine>, String> {
         let n = format!("-{limit}");
-        lines(run_in(
+        let raw = run_in(
             &self.root,
-            &["log", "--graph", "--oneline", "--decorate=short", &n],
-        )?)
+            &[
+                "log",
+                "--topo-order",
+                "--pretty=format:%h%x1f%p%x1f%D%x1f%s",
+                &n,
+            ],
+        )?;
+        Ok(parse_graph_log(&raw))
     }
 
     pub fn commits(&self, limit: usize) -> Result<Vec<String>, String> {
@@ -364,6 +396,17 @@ impl Git {
             &self.root,
             &["log", "--oneline", "--decorate=short", "--date=short", &n],
         )?)
+    }
+
+    /// The files a single commit touched, for the inline graph expansion.
+    /// `--first-parent` is what makes a MERGE show what it brought in, against
+    /// its first parent, instead of git's empty default diff for merges.
+    pub fn commit_files(&self, hash: &str) -> Result<Vec<FileEntry>, String> {
+        let raw = run_in(
+            &self.root,
+            &["show", "--first-parent", "--name-status", "--format=", hash],
+        )?;
+        Ok(parse_name_status(&raw))
     }
 
     pub fn file_history(&self, path: &str, limit: usize) -> Result<Vec<String>, String> {
@@ -865,12 +908,105 @@ pub fn under(path: &str, prefix: Option<&str>) -> bool {
             && path.as_bytes()[prefix.len()] == b'/')
 }
 
+/// Append `pattern` to the `.gitignore` at `path`, creating the file when it
+/// is missing. The duplicate check compares lines with surrounding whitespace
+/// and a trailing `/` stripped, so `build/` and `build` count as one rule
+/// while the line actually written keeps the slash a folder rule needs.
+fn append_ignore(path: &Path, pattern: &str) -> Result<String, String> {
+    let written = pattern.trim();
+    let key = written.trim_end_matches('/');
+    if key.is_empty() {
+        return Err("nothing to ignore".to_string());
+    }
+    let mut text = std::fs::read_to_string(path).unwrap_or_default();
+    if text
+        .lines()
+        .any(|line| line.trim().trim_end_matches('/') == key)
+    {
+        return Err(format!("{key} is already in .gitignore"));
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(written);
+    text.push('\n');
+    std::fs::write(path, text).map_err(|e| format!("writing .gitignore: {e}"))?;
+    Ok(written.to_string())
+}
+
 /// NUL-delimited paths from `ls-files --others --ignored --directory`, with
 /// the collapsed-directory trailing slash removed for normal path matching.
 pub fn parse_ignored(raw: &str) -> Vec<String> {
     raw.split('\0')
         .map(|path| path.trim_end_matches('/').to_string())
         .filter(|path| !path.is_empty())
+        .collect()
+}
+
+/// `git show --name-status` rows into file entries: `M<TAB>path`,
+/// `A<TAB>path`, `D<TAB>path`, `R100<TAB>old<TAB>new`. Status letters the
+/// panel does not model (type changes, unmerged) read as modifications.
+pub fn parse_name_status(raw: &str) -> Vec<FileEntry> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim_end();
+            if line.is_empty() {
+                return None;
+            }
+            let mut fields = line.split('\t');
+            let status = fields.next()?.chars().next().unwrap_or('M');
+            let letter = match status {
+                'A' | 'C' | 'D' | 'M' | 'R' | 'U' => status,
+                _ => 'M',
+            };
+            let first = fields.next()?.to_string();
+            match letter {
+                'C' | 'R' => {
+                    let path = fields.next().unwrap_or(&first).to_string();
+                    Some(FileEntry {
+                        path,
+                        orig: Some(first),
+                        letter,
+                    })
+                }
+                _ => Some(FileEntry {
+                    path: first,
+                    orig: None,
+                    letter,
+                }),
+            }
+        })
+        .collect()
+}
+
+/// Split a `%h%x1f%p%x1f%D%x1f%s` log dump into graph rows, newest first. The
+/// unit separator keeps subjects that contain spaces, `|` or `(` intact.
+pub fn parse_graph_log(raw: &str) -> Vec<GraphLine> {
+    raw.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let mut fields = line.splitn(4, '\u{1f}');
+            let hash = fields.next().unwrap_or_default().to_string();
+            let parents = fields
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            let refs = fields.next().unwrap_or_default().trim();
+            let subject = fields.next().unwrap_or_default();
+            // Decorations go LAST: a narrow pane truncates from the right, so
+            // the subject must win the width over `(HEAD -> main, tag: …)`.
+            let text = if refs.is_empty() {
+                format!("{hash} {subject}")
+            } else {
+                format!("{hash} {subject} ({refs})")
+            };
+            GraphLine {
+                commit: GraphCommit { hash, parents },
+                text,
+            }
+        })
         .collect()
 }
 
@@ -1235,8 +1371,16 @@ mod tests {
 
     #[test]
     fn ignored_scan_lock_is_single_flight() {
-        let root =
-            std::env::temp_dir().join(format!("ignored-lock-single-flight-{}", std::process::id()));
+        // A stamp as well as the pid: the lock file lives in the SHARED temp
+        // dir, and two test binaries can otherwise pick the same path.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "ignored-lock-single-flight-{}-{stamp}",
+            std::process::id()
+        ));
         let first = IgnoredScanLock::acquire(&root).unwrap();
         assert!(
             IgnoredScanLock::acquire(&root).is_err(),
@@ -1659,5 +1803,62 @@ mod tests {
     fn paths_with_spaces_survive() {
         let s = parse_status("M  my docs/read me.md\0");
         assert_eq!(s.staged, vec![entry("my docs/read me.md", 'M', None)]);
+    }
+
+    #[test]
+    fn graph_log_splits_hash_parents_refs_and_subject() {
+        let sep = '\u{1f}';
+        let raw = format!(
+            "m1{sep}a1 b1{sep}HEAD -> main, tag: v1{sep}merge a pipe | and (parens)\n\
+             a1{sep}r1{sep}{sep}subject with spaces\n\
+             r1{sep}{sep}{sep}root"
+        );
+        let rows = parse_graph_log(&raw);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].commit.hash, "m1");
+        assert_eq!(rows[0].commit.parents, ["a1", "b1"]);
+        assert_eq!(
+            rows[0].text,
+            "m1 merge a pipe | and (parens) (HEAD -> main, tag: v1)"
+        );
+        assert_eq!(rows[1].commit.parents, ["r1"]);
+        assert_eq!(
+            rows[1].text, "a1 subject with spaces",
+            "an empty decoration column adds no parens"
+        );
+        assert_eq!(rows[2].commit.parents, Vec::<String>::new());
+        assert_eq!(rows[2].text, "r1 root");
+    }
+
+    #[test]
+    fn add_to_gitignore_writes_a_folder_rule_once() {
+        let git = repo_with_head("gitignore");
+        std::fs::create_dir_all(git.root.join("target")).unwrap();
+        std::fs::write(git.root.join("target/junk.bin"), "x").unwrap();
+
+        assert_eq!(git.add_to_gitignore("target/").unwrap(), "target/");
+        assert_eq!(
+            std::fs::read_to_string(git.root.join(".gitignore")).unwrap(),
+            "target/\n"
+        );
+        assert_eq!(
+            git.ignored().unwrap(),
+            ["target"],
+            "git now reports the folder as ignored"
+        );
+        // The same rule, slash or not, is never appended twice.
+        assert!(git.add_to_gitignore("target").is_err());
+        assert_eq!(
+            std::fs::read_to_string(git.root.join(".gitignore")).unwrap(),
+            "target/\n"
+        );
+        // A file that does not end in a newline still gets a clean break.
+        std::fs::write(git.root.join(".gitignore"), "target").unwrap();
+        assert_eq!(git.add_to_gitignore("dist/").unwrap(), "dist/");
+        assert_eq!(
+            std::fs::read_to_string(git.root.join(".gitignore")).unwrap(),
+            "target\ndist/\n"
+        );
+        let _ = std::fs::remove_dir_all(&git.root);
     }
 }

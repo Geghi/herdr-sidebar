@@ -12,6 +12,7 @@ pub mod ensure;
 pub mod fontsetup;
 pub mod git;
 pub mod gitdeco;
+pub mod graph;
 pub mod icons;
 pub mod ipc;
 pub mod launch;

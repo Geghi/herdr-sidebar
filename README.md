@@ -48,7 +48,10 @@ Use the mouse or press `1`, `2`, and `3`.
   same tab instead by setting **Preview opens in** to `pane`.
 - Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
   Read-only previews support mouse selection and clipboard copy.
-- Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
+- Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F` — narrow
+  with comma-separated include/exclude globs (folders work too: `tests/, *.md`) and toggle
+  whether `.gitignore` is followed with `Alt+G`. The Explorer filter (`f`) offers the same
+  globs plus `Aa`/`.*`/`gi` chips.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
@@ -62,6 +65,15 @@ Use the mouse or press `1`, `2`, and `3`.
 </div>
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
+- Add a file or a whole folder to `.gitignore` from its `m` / Ctrl+right-click menu — a file
+  adds its path, a folder a directory-only `dir/` rule, and an existing rule is never
+  duplicated. Folder rows in the tree view carry their own path-level menu.
+- Read history in a VS Code-style commit graph: colored lanes with `●` commits and `│ ─ ╭ ╮`
+  connectors instead of git's ASCII `* | \` art.
+- Click a commit in the graph to expand its changed files inline, right under that commit
+  (`←`/`→` close and open), and pick one to read its diff in that commit without leaving the
+  panel — the same diff view the Changes section uses. A merge lists what it brought in,
+  against its first parent.
 - Click the branch name—in the panel header, a repository row, or the Git footer—to
   switch local branches or create a local tracking branch from a remote.
 - Use one commit box per repository in multi-repo folders.
@@ -99,11 +111,15 @@ folder stays put until that pane changes directory again.
 | `Ctrl+P` | quick open | `A` | draft message |
 | `Ctrl+F` | content search | `S` | sync |
 | `.` | hidden files | `o` | open diff |
+| `f` | filter files (name + globs, esc clears) |  |  |
+| `o` | open with default app |  |  |
 | `r` | refresh | `r` | refresh |
 | `m` | context menu | `m` | context menu |
 | `s` | settings | `s` | settings |
 | `b` | hide | `b` | hide |
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
+|  |  | `t` | view as tree |
+|  |  | `←→` / `hl` | fold / unfold |
 
 Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown to scroll,
 `w` to toggle wrapping, and `q` or Esc to close.
