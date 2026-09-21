@@ -736,6 +736,22 @@ HACKING.md — budget time for that before promising a patched build.
   y/N prompt. Hovered file rows show a `+`/`−` glyph (click zone = last 5 columns) and the
   section headers a section-wide one (last 6); a dim "ctrl+rclick for menus" hint sits on
   the « footer line whenever the footer is otherwise empty.
+- **Pull Requests is a THIRD view** (`View::PullRequests`, `pr_app.rs`, key `4`, the fourth
+  activity chip `\u{ea64}` cod-git-pull-request): three drawers (`pr::PrFilter::Authored` /
+  `ReviewRequested` / `Open`) over `gh pr list --json`, each row `#<n> <review glyph> <title>`.
+  `Enter` opens the overview in the preview pane (a new `Request::Pr` → `pr::overview` →
+  markdown → glow), `Right`/`l` expands the files the request touches INLINE
+  (`pr::files` via `gh api .../pulls/<n>/files`, rendered with the panel's own row anatomy),
+  and `Enter` on one opens `diff <root> <path> pr:<n>` — `load_diff` runs `gh pr diff <n>`
+  once and slices the file's section with `pr::patch_for_file`, so it renders through
+  `diffview` exactly like a Changes diff. `m` carries the pull request menu (overview /
+  browser / copy URL / copy branch).
+  **`gh` is a NETWORK cli with no timeout of its own**: every call runs on a worker thread
+  and lands in the App through a channel polled from `tick()` (`refresh` sends one page per
+  drawer, `toggle_files` one file list), so the pane never blocks; `run_prs` in main.rs ticks
+  at `PR_TICK` (250ms) while the App throttles its own refresh to `REFRESH_EVERY` (120s).
+  `launch_decision_for` generalises the git pane decision over a view's token/label, so the
+  PR view keeps the ensure hook's focus/open/close behaviour.
 - **The GRAPH drawer draws lanes, not git's ASCII art**: `Git::graph` fetches
   `--topo-order --pretty=format:%h%x1f%p%x1f%D%x1f%s` (unit separators keep subjects with
   `|` or `(` intact; `--topo-order` is required — a parent must never precede its child) and

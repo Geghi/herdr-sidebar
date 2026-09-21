@@ -318,6 +318,18 @@ const PREVIEW_METADATA_SOURCE: &str = "herdr-sidebar-preview";
 /// Like [`launch_decision`], but for the separated Source Control pane (the
 /// unified Sidebar pane carries BOTH tokens, so it satisfies this too).
 pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
+    launch_decision_for(pane_list_json, now, SC_METADATA_SOURCE, SC_PANE_LABEL)
+}
+
+/// The decision for one view's OWN standalone pane, identified by its metadata
+/// token (and its label as a fallback): focus a live pane in the focused tab,
+/// open when there is none.
+pub fn launch_decision_for(
+    pane_list_json: &str,
+    now: u64,
+    metadata_source: &str,
+    pane_label: &str,
+) -> String {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return "OPEN".to_string();
     };
@@ -326,7 +338,7 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
         return "OPEN".to_string();
     };
     let panel = panes.iter().find(|p| {
-        (p.tokens.contains_key(SC_METADATA_SOURCE) || p.label.as_deref() == Some(SC_PANE_LABEL))
+        (p.tokens.contains_key(metadata_source) || p.label.as_deref() == Some(pane_label))
             && p.tab_id.as_deref() == focused.tab_id.as_deref()
     });
     let Some(pane) = panel else {
@@ -335,9 +347,8 @@ pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     let Some(id) = pane.pane_id.as_deref().filter(|id| is_flag_safe(id)) else {
         return "OPEN".to_string();
     };
-    if token_stale(&pane.tokens, SC_METADATA_SOURCE, now)
-        || (pane.label.as_deref() == Some(SC_PANE_LABEL)
-            && !pane.tokens.contains_key(SC_METADATA_SOURCE))
+    if token_stale(&pane.tokens, metadata_source, now)
+        || (pane.label.as_deref() == Some(pane_label) && !pane.tokens.contains_key(metadata_source))
     {
         return format!("REPLACE {id}");
     }

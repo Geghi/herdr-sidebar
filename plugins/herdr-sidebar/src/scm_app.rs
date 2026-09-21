@@ -576,6 +576,7 @@ struct ClickZones {
     explorer: (u16, u16),
     search: (u16, u16),
     source_control: (u16, u16),
+    pull_requests: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
     message: Rect,
@@ -1570,6 +1571,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => return self.switch_to(View::PullRequests),
             _ => {}
         }
         None
@@ -1620,6 +1622,9 @@ impl App {
             }
             if hits_activity_button(z.source_control, z.activity_row, x, y) {
                 return self.switch_to(View::SourceControl);
+            }
+            if hits_activity_button(z.pull_requests, z.activity_row, x, y) {
+                return self.switch_to(View::PullRequests);
             }
         }
         if hits(z.gear, x, y) {
@@ -3318,7 +3323,7 @@ impl App {
             state.active = view;
             state.search_active = false;
         });
-        Some(Exit::Switch)
+        Some(Exit::Switch(view))
     }
 
     fn open_search(&mut self, focus_query: bool) -> Option<Exit> {
@@ -3860,7 +3865,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let [exp_icon, search_icon, git_icon, pr_icon] = activity_icons(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -3876,6 +3881,8 @@ impl App {
             Span::raw(format!(" {search_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {pr_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -3889,6 +3896,7 @@ impl App {
         self.zones.explorer = bounds[1];
         self.zones.search = bounds[3];
         self.zones.source_control = bounds[5];
+        self.zones.pull_requests = bounds[7];
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
@@ -3896,6 +3904,7 @@ impl App {
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
         let git_hovered = hovered(bounds[5]);
+        let pr_hovered = hovered(bounds[7]);
         spans[1].style = activity_button_style(false, explorer_hovered);
         spans[3].style = activity_button_style(false, search_hovered);
         spans[5].style = activity_button_style(true, git_hovered);
@@ -3906,9 +3915,12 @@ impl App {
             outer_bottom,
             palette().selection_bg,
         );
-        for (is_hovered, button_bounds) in
-            [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
-        {
+        for (is_hovered, button_bounds) in [
+            (explorer_hovered, bounds[1]),
+            (search_hovered, bounds[3]),
+            (git_hovered, bounds[5]),
+            (pr_hovered, bounds[7]),
+        ] {
             if is_hovered {
                 draw_activity_caps(
                     frame,

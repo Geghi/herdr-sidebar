@@ -429,6 +429,7 @@ struct ActivityZones {
     explorer: (u16, u16),
     search: (u16, u16),
     source_control: (u16, u16),
+    pull_requests: (u16, u16),
 }
 
 impl Default for ActivityZones {
@@ -439,6 +440,7 @@ impl Default for ActivityZones {
             explorer: (0, 0),
             search: (0, 0),
             source_control: (0, 0),
+            pull_requests: (0, 0),
         }
     }
 }
@@ -1020,7 +1022,7 @@ impl App {
             state.active = view;
             state.search_active = false;
         });
-        Some(Exit::Switch)
+        Some(Exit::Switch(view))
     }
 
     /// Close the other panel's standalone pane in our tab, if one is open.
@@ -1285,6 +1287,7 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('4') => return self.switch_to(View::PullRequests),
             _ => {}
         }
         None
@@ -1314,6 +1317,9 @@ impl App {
                 }
                 if hits_activity_button(zones.source_control, zones.row, mouse.column, mouse.row) {
                     return self.switch_to(View::SourceControl);
+                }
+                if hits_activity_button(zones.pull_requests, zones.row, mouse.column, mouse.row) {
+                    return self.switch_to(View::PullRequests);
                 }
             }
             let gear = self.gear;
@@ -3918,7 +3924,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let [exp_icon, search_icon, git_icon, pr_icon] = activity_icons(self.theme);
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
@@ -3935,6 +3941,8 @@ impl App {
             Span::raw(format!(" {search_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {git_icon}{slack} ")),
+            Span::raw(" "),
+            Span::raw(format!(" {pr_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -3949,6 +3957,7 @@ impl App {
             explorer: bounds[1],
             search: bounds[3],
             source_control: bounds[5],
+            pull_requests: bounds[7],
         };
         let hovered = |bounds| {
             self.mouse_pos
@@ -3957,9 +3966,11 @@ impl App {
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
         let git_hovered = hovered(bounds[5]);
+        let pr_hovered = hovered(bounds[7]);
         spans[1].style = activity_button_style(!search_active, explorer_hovered);
         spans[3].style = activity_button_style(search_active, search_hovered);
         spans[5].style = activity_button_style(false, git_hovered);
+        spans[7].style = activity_button_style(false, pr_hovered);
         let (chip_start, chip_end) = if search_active { bounds[3] } else { bounds[1] };
         draw_activity_caps(
             frame,
@@ -3972,6 +3983,7 @@ impl App {
             (!search_active, explorer_hovered, bounds[1]),
             (search_active, search_hovered, bounds[3]),
             (false, git_hovered, bounds[5]),
+            (false, pr_hovered, bounds[7]),
         ] {
             if !active && is_hovered {
                 draw_activity_caps(

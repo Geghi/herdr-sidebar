@@ -154,6 +154,12 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     let decision = match decision_view {
         View::Explorer => launch::launch_decision_in(&panes, now, &scope),
         View::SourceControl => launch::launch_decision_git(&panes, now),
+        View::PullRequests => launch::launch_decision_for(
+            &panes,
+            now,
+            View::PullRequests.plugin_id(),
+            View::PullRequests.label(),
+        ),
     };
     let decision = if toggle && state.strict_toggle {
         launch::focus_as_close(&decision)

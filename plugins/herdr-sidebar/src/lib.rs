@@ -16,6 +16,7 @@ pub mod graph;
 pub mod icons;
 pub mod ipc;
 pub mod launch;
+pub mod pr;
 pub mod snooze;
 pub mod state;
 pub mod suggest;

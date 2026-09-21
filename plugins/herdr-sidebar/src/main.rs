@@ -8,6 +8,7 @@
 //! `--*` stdin→stdout helpers expose the unit-tested launch calculations.
 
 mod explorer_app;
+mod pr_app;
 mod scm_app;
 
 use std::cell::RefCell;
@@ -22,6 +23,9 @@ use state::{Exit, View};
 /// How often the source-control view re-reads `git status` while idle.
 const REFRESH_EVERY: Duration = Duration::from_millis(1500);
 const ANIMATION_FRAME: Duration = Duration::from_millis(120);
+/// The Pull Requests view polls its workers on this cadence (its own network
+/// refresh is throttled inside the App).
+const PR_TICK: Duration = Duration::from_millis(250);
 
 fn main() -> std::io::Result<()> {
     let mode = std::env::args().nth(1);
@@ -167,7 +171,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|pr|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }
@@ -274,11 +278,18 @@ fn main() -> std::io::Result<()> {
                 &workspace_label,
                 &spawn_cwd,
             ),
+            View::PullRequests => run_prs(
+                &mut terminal,
+                Rc::clone(&cwd_follower),
+                &root_key,
+                &workspace_label,
+                &spawn_cwd,
+            ),
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),
-            Ok(Exit::Switch) => {
-                view = view.other();
+            Ok(Exit::Switch(target)) => {
+                view = target;
             }
             Ok(Exit::Search { focus_query }) => {
                 view = View::Explorer;
@@ -455,6 +466,51 @@ fn run_scm(
         app.heartbeat();
         app.poll_picker();
         if last_tick.elapsed() >= REFRESH_EVERY {
+            app.tick();
+            last_tick = std::time::Instant::now();
+        }
+        let root = app.root_path().to_path_buf();
+        if root != remembered_root {
+            herdr_sidebar::state::save_root(root_key, &root);
+            remembered_root = root;
+        }
+    }
+}
+
+/// The Pull Requests view: same one-terminal loop as Source Control, with a
+/// faster tick so a worker's page lands as soon as it arrives.
+fn run_prs(
+    terminal: &mut ratatui::DefaultTerminal,
+    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
+    root_key: &str,
+    legacy_workspace_label: &str,
+    spawn_cwd: &std::path::Path,
+) -> std::io::Result<Exit> {
+    let cwd = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
+    let mut remembered_root = cwd.clone();
+    let mut app = pr_app::App::new(cwd, cwd_follower);
+    let mut last_tick = std::time::Instant::now();
+    loop {
+        terminal.draw(|frame| app.draw(frame))?;
+        if event::poll(PR_TICK)? {
+            let exit = match event::read()? {
+                Event::Key(key) => app.on_key(key),
+                Event::Mouse(mouse) => app.on_mouse(mouse),
+                Event::Resize(width, _) => {
+                    app.on_resize(width);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(exit) = exit {
+                if exit == Exit::Quit {
+                    app.clear_identity();
+                }
+                return Ok(exit);
+            }
+        }
+        app.heartbeat();
+        if last_tick.elapsed() >= PR_TICK {
             app.tick();
             last_tick = std::time::Instant::now();
         }

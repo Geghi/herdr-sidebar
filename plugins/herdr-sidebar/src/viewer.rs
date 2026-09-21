@@ -142,6 +142,15 @@ pub fn doc_key_for_show(root: &Path, spec: &str, path: Option<&str>) -> String {
 /// edit marker. A pinned tab reads as a plain name. `tab.rename` is the only
 /// display lever herdr gives a plugin.
 pub fn tab_label(doc_key: &str, pinned: bool) -> String {
+    if let Some(pr) = doc_key.strip_prefix("pr:") {
+        let number = pr.rsplit(':').next().unwrap_or(pr);
+        let name = format!("PR #{number}");
+        return if pinned {
+            name
+        } else {
+            format!("{name} · preview")
+        };
+    }
     let display_key = if let Some(diff) = doc_key.strip_prefix("diff:") {
         diff.rsplit_once(':').map(|(path, _)| path).unwrap_or(diff)
     } else if let Some(show) = doc_key.strip_prefix("show:") {
@@ -177,6 +186,7 @@ impl Request {
             Self::File { path, .. } => doc_key_for_file(path),
             Self::Diff { root, rel, kind } => doc_key_for_diff(root, rel, kind),
             Self::Show { root, spec, path } => doc_key_for_show(root, spec, path.as_deref()),
+            Self::Pr { root, number } => doc_key_for_pr(root, *number),
         }
     }
 }
@@ -205,6 +215,8 @@ enum Request {
         spec: String,
         path: Option<String>,
     },
+    /// A GitHub pull request's overview (`gh pr view`), rendered as markdown.
+    Pr { root: PathBuf, number: u64 },
 }
 
 /// Control-file payload for a file preview.
@@ -220,6 +232,16 @@ pub fn file_request_at(path: &Path, line: usize) -> String {
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
 pub fn diff_request(root: &Path, rel: &str, kind: &str) -> String {
     format!("diff\t{}\t{rel}\t{kind}", root.display())
+}
+
+/// Control-file payload for a GitHub pull request's overview.
+pub fn pr_request(root: &Path, number: u64) -> String {
+    format!("pr\t{}\t{number}", root.display())
+}
+
+/// The document key for a pull request's overview.
+pub fn doc_key_for_pr(root: &Path, number: u64) -> String {
+    format!("pr:{}:{number}", root.display())
 }
 
 /// Control-file payload for `git show <spec>` (commit hash, stash@{n}, tag…),
@@ -248,6 +270,10 @@ fn parse_request(raw: &str) -> Option<Request> {
             let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
             Some(Request::Show { root, spec, path })
         }
+        Some("pr") => Some(Request::Pr {
+            root: PathBuf::from(parts.next()?),
+            number: parts.next()?.parse().ok()?,
+        }),
         Some("file") => Some(Request::File {
             path: PathBuf::from(parts.next()?),
             line: parts
@@ -271,6 +297,7 @@ fn request_payload(request: &Request) -> String {
             .unwrap_or_else(|| file_request(path)),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
+        Request::Pr { root, number } => pr_request(root, *number),
     }
 }
 
@@ -673,6 +700,42 @@ fn load(request: &Request) -> Doc {
         Request::File { path, line } => load_file(path, *line),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
+        Request::Pr { root, number } => load_pr(root, *number),
+    }
+}
+
+/// A pull request's overview: `gh pr view` rendered as markdown, so the pane
+/// carries the description, the checks and the conversation the way GitHub
+/// shows them.
+fn load_pr(root: &Path, number: u64) -> Doc {
+    let name = format!("PR #{number}");
+    let context = format!("pull request #{number} — {}", root.display());
+    let lines = match crate::pr::overview(root, number) {
+        Err(e) => vec![Line::raw(format!("({e})"))],
+        Ok(markdown) => {
+            let width = crossterm::terminal::size()
+                .map(|(width, _)| width)
+                .unwrap_or(100);
+            glow_markdown(&markdown, width).unwrap_or_else(|| {
+                markdown
+                    .lines()
+                    .map(|line| Line::raw(line.to_string()))
+                    .collect()
+            })
+        }
+    };
+    Doc {
+        name,
+        context,
+        lines,
+        numbered: false,
+        media: None,
+        scroll: 0,
+        wrap: true,
+        rows: Vec::new(),
+        rows_key: None,
+        pending_src: None,
+        selection: PreviewSelection::default(),
     }
 }
 
@@ -693,6 +756,10 @@ fn loading_doc(request: &Request) -> Doc {
             root.display().to_string(),
         ),
         Request::Show { root, spec, .. } => (spec.clone(), root.display().to_string()),
+        Request::Pr { root, number } => (
+            format!("PR #{number}"),
+            format!("pull request #{number} — {}", root.display()),
+        ),
     };
     Doc {
         name,
@@ -1265,6 +1332,31 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
+    // A file inside a PULL REQUEST: `gh pr diff` prints the whole patch, and
+    // the slice for this file renders through the same renderer as any other
+    // diff, so the Changes look carries over.
+    if let Some(number) = kind.strip_prefix("pr:").and_then(|n| n.parse::<u64>().ok()) {
+        let lines = match crate::pr::diff(root, number) {
+            Err(e) => vec![Line::raw(format!("({e})"))],
+            Ok(patch) => match crate::pr::patch_for_file(&patch, rel) {
+                Some(section) => crate::diffview::render(rel, &section),
+                None => vec![Line::raw("(no changes for this file)")],
+            },
+        };
+        return Doc {
+            name,
+            context: format!("PR #{number} — {}", root.join(rel).display()),
+            lines,
+            numbered: false,
+            media: None,
+            scroll: 0,
+            wrap: true,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+        };
+    }
     // Plain (uncolored) diff: crate::diffview parses it and renders the
     // VS Code look — dual gutters, tinted rows, syntax-highlighted code.
     let mut args: Vec<String> = vec!["diff".into(), "--no-ext-diff".into()];

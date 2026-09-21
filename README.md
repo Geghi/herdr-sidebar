@@ -83,6 +83,19 @@ Use the mouse or press `1`, `2`, and `3`.
 - Keep branch and sync controls visible in every sidebar view with the compact Git footer;
   hide it from Settings if you prefer the extra row.
 
+## Pull Requests
+
+- Browse open pull requests from GitHub in three drawers: yours, the ones waiting on your
+  review, and every open request on the project.
+- `Enter` opens the pull request in the preview pane (description, checks and conversation
+  rendered as markdown); `→`/`l` expands the files it touches right in the sidebar, and
+  `Enter` on one shows that file's diff in the pull request — the same diff view the Changes
+  section uses.
+- `m` offers the pull request's menu: open it, open it in the browser, copy its URL or its
+  branch name.
+- Needs the GitHub CLI (`gh`) installed and authenticated; without it the view says so
+  instead of showing an empty list.
+
 ## Settings
 
 <div align="center">
@@ -103,21 +116,21 @@ folder stays put until that pane changes directory again.
 
 ## Keys
 
-| Explorer / Search | Action | Source Control | Action |
-|---|---|---|---|
-| `↑↓` / `jk` | move | `Enter` | stage / unstage |
-| `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none |
-| `Enter` | toggle / preview | `c` | commit message |
-| `Ctrl+P` | quick open | `A` | draft message |
-| `Ctrl+F` | content search | `S` | sync |
-| `.` | hidden files | `o` | open diff |
-| `f` | filter files (name + globs, esc clears) |  |  |
-| `o` | open with default app |  |  |
-| `r` | refresh | `r` | refresh |
-| `m` | context menu | `m` | context menu |
-| `s` | settings | `s` | settings |
-| `b` | hide | `b` | hide |
-| `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
+| Explorer / Search | Action | Source Control | Action | Pull Requests | Action |
+|---|---|---|---|---|---|
+| `↑↓` / `jk` | move | `Enter` | stage / unstage | `↑↓` / `jk` | move |
+| `←→` / `hl` | fold / unfold | `a` / `u` | stage all / none | `←→` / `hl` | fold / expand |
+| `Enter` | toggle / preview | `c` | commit message | `Enter` | open request / file diff |
+| `Ctrl+P` | quick open | `A` | draft message | `r` | refresh |
+| `Ctrl+F` | content search | `S` | sync | `m` | context menu |
+| `.` | hidden files | `o` | open diff | `b` | hide |
+| `f` | filter files (name + globs, esc clears) |  |  |  |  |
+| `o` | open with default app |  |  |  |  |
+| `r` | refresh | `r` | refresh |  |  |
+| `m` | context menu | `m` | context menu |  |  |
+| `s` | settings | `s` | settings |  |  |
+| `b` | hide | `b` | hide |  |  |
+| `1` / `2` / `3` / `4` | change view | `1` / `2` / `3` / `4` | change view | `1` / `2` / `3` | change view |
 |  |  | `t` | view as tree |
 |  |  | `←→` / `hl` | fold / unfold |
 

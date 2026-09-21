@@ -15,7 +15,7 @@ use crate::graph::GraphCommit;
 const IGNORED_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One file in the staged or unstaged list.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
     /// Repo-relative path (the new path, for renames), `/`-separated as git reports it.
     pub path: String,

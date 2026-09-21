@@ -77,8 +77,8 @@ pub fn unix_now() -> u64 {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Exit {
     Quit,
-    /// The user picked the other view — main re-renders in process.
-    Switch,
+    /// The user picked another view — main re-renders in process.
+    Switch(View),
     /// Switch to the Search view. `focus_query` puts the caret in the search
     /// box (the Ctrl+F "find" gesture); a plain view switch passes false so the
     /// box isn't focused and 1/2/3 keep switching.
@@ -93,13 +93,18 @@ pub enum Exit {
 pub enum View {
     Explorer,
     SourceControl,
+    PullRequests,
 }
 
 impl View {
+    /// The view this one pairs with as a standalone pane. With three views
+    /// only Explorer/SourceControl swap; the PR view rides along in the merged
+    /// sidebar and pairs with the Explorer.
     pub fn other(self) -> View {
         match self {
             View::Explorer => View::SourceControl,
             View::SourceControl => View::Explorer,
+            View::PullRequests => View::Explorer,
         }
     }
 
@@ -108,6 +113,7 @@ impl View {
         match self {
             View::Explorer => "Explorer",
             View::SourceControl => "Source Control",
+            View::PullRequests => "Pull Requests",
         }
     }
 
@@ -116,6 +122,7 @@ impl View {
         match self {
             View::Explorer => "herdr-sidebar-explorer",
             View::SourceControl => "herdr-sidebar-git",
+            View::PullRequests => "herdr-sidebar-pr",
         }
     }
 
@@ -124,6 +131,7 @@ impl View {
         match self {
             View::Explorer => "explorer",
             View::SourceControl => "git",
+            View::PullRequests => "pr",
         }
     }
 
@@ -133,6 +141,7 @@ impl View {
         match self {
             View::Explorer => "sidebar",
             View::SourceControl => "source-control",
+            View::PullRequests => "pull-requests",
         }
     }
 
@@ -140,6 +149,7 @@ impl View {
         match flag {
             "explorer" => Some(View::Explorer),
             "git" => Some(View::SourceControl),
+            "pr" => Some(View::PullRequests),
             _ => None,
         }
     }
@@ -149,6 +159,7 @@ impl View {
         match self {
             View::Explorer => "explorer",
             View::SourceControl => "source-control",
+            View::PullRequests => "pull-requests",
         }
     }
 
@@ -156,6 +167,7 @@ impl View {
         match self {
             View::Explorer => "explorer",
             View::SourceControl => "source-control",
+            View::PullRequests => "pull-requests",
         }
     }
 
@@ -163,6 +175,7 @@ impl View {
         match name {
             "explorer" => Some(View::Explorer),
             "source-control" => Some(View::SourceControl),
+            "pull-requests" => Some(View::PullRequests),
             _ => None,
         }
     }
