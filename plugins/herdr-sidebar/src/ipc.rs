@@ -58,8 +58,8 @@ pub fn call_text(method: &str, params: serde_json::Value) -> std::io::Result<Str
 /// Stamp a sidebar pane's identity tokens with a fresh heartbeat timestamp
 /// (launchers treat stale stamps as dead panes — see
 /// `launch::HEARTBEAT_STALE_SECS`): always the pane's own view; in merged
-/// mode also the other view's (one Sidebar pane satisfies both plugins'
-/// launchers), otherwise the other view's token is cleared with an explicit
+/// mode also every other view's (one Sidebar pane satisfies all three
+/// launchers), otherwise the others' tokens are cleared with an explicit
 /// null VALUE — `pane.report_metadata` MERGES the token map, so an empty
 /// map is a no-op (verified live, herdr 0.7.1).
 pub fn report_identity(pane_id: &str, my: crate::state::View, merged: bool) {
@@ -69,34 +69,37 @@ pub fn report_identity(pane_id: &str, my: crate::state::View, merged: bool) {
 /// Checked form used by launchers before they perform focus-emitting layout
 /// operations. A TUI heartbeat uses [`report_identity`] because a transient
 /// reporting failure should not end its event loop.
+///
+/// In merged mode the pane stamps ALL THREE view tokens: any of the three
+/// launchers then finds the one unified pane (a separated pane stamps only
+/// its own and clears the others, so a unified-off transition leaves no
+/// stale sibling token behind).
 pub fn report_identity_checked(
     pane_id: &str,
     my: crate::state::View,
     merged: bool,
 ) -> std::io::Result<()> {
     let now = crate::state::unix_now().to_string();
-    let mine = serde_json::json!({
-        my.plugin_id(): now,
-        crate::launch::STARTING_TOKEN: serde_json::Value::Null,
-    });
-    call_text(
-        "pane.report_metadata",
-        serde_json::json!({ "pane_id": pane_id, "source": my.plugin_id(), "tokens": mine }),
-    )?;
-    let other = my.other();
-    let other_tokens = if merged {
-        serde_json::json!({ other.plugin_id(): now })
-    } else {
-        serde_json::json!({ other.plugin_id(): serde_json::Value::Null })
-    };
-    call_text(
-        "pane.report_metadata",
-        serde_json::json!({
-            "pane_id": pane_id,
-            "source": other.plugin_id(),
-            "tokens": other_tokens,
-        }),
-    )?;
+    for view in [
+        crate::state::View::Explorer,
+        crate::state::View::SourceControl,
+        crate::state::View::PullRequests,
+    ] {
+        let tokens = if view == my {
+            serde_json::json!({
+                my.plugin_id(): now,
+                crate::launch::STARTING_TOKEN: serde_json::Value::Null,
+            })
+        } else if merged {
+            serde_json::json!({ view.plugin_id(): now })
+        } else {
+            serde_json::json!({ view.plugin_id(): serde_json::Value::Null })
+        };
+        call_text(
+            "pane.report_metadata",
+            serde_json::json!({ "pane_id": pane_id, "source": view.plugin_id(), "tokens": tokens }),
+        )?;
+    }
     Ok(())
 }
 
@@ -121,15 +124,22 @@ pub fn report_starting_identity(
         }),
     )?;
     if merged {
-        let other = my.other();
-        call_text(
-            "pane.report_metadata",
-            serde_json::json!({
-                "pane_id": pane_id,
-                "source": other.plugin_id(),
-                "tokens": { other.plugin_id(): now },
-            }),
-        )?;
+        for view in [
+            crate::state::View::Explorer,
+            crate::state::View::SourceControl,
+            crate::state::View::PullRequests,
+        ] {
+            if view != my {
+                call_text(
+                    "pane.report_metadata",
+                    serde_json::json!({
+                        "pane_id": pane_id,
+                        "source": view.plugin_id(),
+                        "tokens": { view.plugin_id(): now },
+                    }),
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -189,12 +199,13 @@ pub fn open_plugin_pane(
     Ok(pane_id)
 }
 
-/// Clear both sidebar identity tokens after the event loop has finished its
+/// Clear every sidebar identity token after the event loop has finished its
 /// final persistence.
 pub fn clear_identity(pane_id: &str) {
     for view in [
         crate::state::View::Explorer,
         crate::state::View::SourceControl,
+        crate::state::View::PullRequests,
     ] {
         let _ = call_text(
             "pane.report_metadata",

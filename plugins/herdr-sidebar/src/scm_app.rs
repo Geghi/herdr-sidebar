@@ -1438,9 +1438,9 @@ impl App {
             return Some(Exit::QuickOpen);
         }
         // View switching has to reach past the commit message box, where bare
-        // 1/2/3 type into the draft — Ctrl+1/2/3 mirror VS Code's activity bar
-        // from any focus (1 Explorer, 2 Search, 3 Source Control). Bare 1/2/3
-        // still switch from the file list.
+        // 1/2/3/4 type into the draft — Ctrl+1/2/3/4 mirror VS Code's activity
+        // bar from any focus (1 Explorer, 2 Search, 3 Source Control, 4 Pull
+        // Requests). Bare 1/2/3/4 still switch from the file list.
         let injected_view = match key.code {
             KeyCode::F(9) => Some('1'),
             KeyCode::F(10) => Some('2'),
@@ -1448,7 +1448,7 @@ impl App {
             _ => None,
         };
         let keyboard_view = match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3'))
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4'))
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1461,6 +1461,7 @@ impl App {
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
+                '4' => self.switch_to(View::PullRequests),
                 _ => self.switch_to(View::SourceControl),
             };
         }

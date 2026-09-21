@@ -12,6 +12,9 @@ fn main() {
         Some("--toggle-git") => {
             herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::SourceControl)
         }
+        Some("--toggle-pr") => {
+            herdr_sidebar::ensure::Mode::Toggle(herdr_sidebar::state::View::PullRequests)
+        }
         Some("--show-explorer") => {
             herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::Explorer)
         }
@@ -20,6 +23,9 @@ fn main() {
         }
         Some("--show-git") => {
             herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::SourceControl)
+        }
+        Some("--show-pr") => {
+            herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::PullRequests)
         }
         Some("--quick-open") => {
             herdr_sidebar::ensure::Mode::Activate(herdr_sidebar::ensure::Target::QuickOpen)

@@ -24,6 +24,7 @@ pub enum Target {
     Explorer,
     Search,
     SourceControl,
+    PullRequests,
     QuickOpen,
 }
 
@@ -33,6 +34,7 @@ impl Target {
             "explorer" => Some(Self::Explorer),
             "search" => Some(Self::Search),
             "source-control" => Some(Self::SourceControl),
+            "pull-requests" => Some(Self::PullRequests),
             "quick-open" => Some(Self::QuickOpen),
             _ => None,
         }
@@ -43,6 +45,7 @@ impl Target {
             Self::Explorer => "explorer",
             Self::Search => "search",
             Self::SourceControl => "source-control",
+            Self::PullRequests => "pull-requests",
             Self::QuickOpen => "quick-open",
         }
     }
@@ -50,6 +53,7 @@ impl Target {
     pub fn pane_view(self, merged: bool) -> View {
         match self {
             Self::SourceControl if !merged => View::SourceControl,
+            Self::PullRequests if !merged => View::PullRequests,
             _ => View::Explorer,
         }
     }
@@ -57,6 +61,7 @@ impl Target {
     pub fn initial_view(self) -> View {
         match self {
             Self::SourceControl => View::SourceControl,
+            Self::PullRequests => View::PullRequests,
             _ => View::Explorer,
         }
     }
@@ -66,6 +71,11 @@ impl Target {
             Self::Explorer => "f9",
             Self::Search => "f10",
             Self::SourceControl => "f11",
+            // Ctrl+4 round-trips through legacy terminal encoding (0x1C;
+            // crossterm decodes it back as Char('4')+CONTROL), unlike Ctrl+3
+            // which collides with Escape — and it matches the Ctrl+1/2/3
+            // activity chords, so the existing pane also switches in-process.
+            Self::PullRequests => "ctrl+4",
             Self::QuickOpen => "f12",
         }
     }
@@ -149,17 +159,13 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
     let now = crate::state::unix_now();
     let decision_view = activation.map_or(view, |target| match target {
         Target::SourceControl => View::SourceControl,
+        Target::PullRequests => View::PullRequests,
         _ => View::Explorer,
     });
     let decision = match decision_view {
         View::Explorer => launch::launch_decision_in(&panes, now, &scope),
         View::SourceControl => launch::launch_decision_git(&panes, now),
-        View::PullRequests => launch::launch_decision_for(
-            &panes,
-            now,
-            View::PullRequests.plugin_id(),
-            View::PullRequests.label(),
-        ),
+        View::PullRequests => launch::launch_decision_pr(&panes, now),
     };
     let decision = if toggle && state.strict_toggle {
         launch::focus_as_close(&decision)
@@ -276,6 +282,10 @@ fn prepare_activation(target: Target) {
         }
         Target::SourceControl => {
             state.active = View::SourceControl;
+            state.search_active = false;
+        }
+        Target::PullRequests => {
+            state.active = View::PullRequests;
             state.search_active = false;
         }
     });
@@ -515,6 +525,7 @@ mod tests {
             (Target::Explorer, "explorer", "f9"),
             (Target::Search, "search", "f10"),
             (Target::SourceControl, "source-control", "f11"),
+            (Target::PullRequests, "pull-requests", "ctrl+4"),
             (Target::QuickOpen, "quick-open", "f12"),
         ] {
             assert_eq!(Target::from_env_value(value), Some(target));
@@ -524,6 +535,8 @@ mod tests {
         }
         assert_eq!(Target::SourceControl.pane_view(false), View::SourceControl);
         assert_eq!(Target::SourceControl.initial_view(), View::SourceControl);
+        assert_eq!(Target::PullRequests.pane_view(false), View::PullRequests);
+        assert_eq!(Target::PullRequests.initial_view(), View::PullRequests);
         assert_eq!(Target::from_env_value("unknown"), None);
     }
 }

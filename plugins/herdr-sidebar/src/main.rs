@@ -37,6 +37,9 @@ fn main() -> std::io::Result<()> {
         Some("--toggle-git") => {
             return ensure::run(ensure::Mode::Toggle(View::SourceControl));
         }
+        Some("--toggle-pr") => {
+            return ensure::run(ensure::Mode::Toggle(View::PullRequests));
+        }
         Some("--show-explorer") => {
             return ensure::run(ensure::Mode::Activate(ensure::Target::Explorer));
         }
@@ -45,6 +48,9 @@ fn main() -> std::io::Result<()> {
         }
         Some("--show-git") => {
             return ensure::run(ensure::Mode::Activate(ensure::Target::SourceControl));
+        }
+        Some("--show-pr") => {
+            return ensure::run(ensure::Mode::Activate(ensure::Target::PullRequests));
         }
         Some("--quick-open") => {
             return ensure::run(ensure::Mode::Activate(ensure::Target::QuickOpen));
@@ -60,6 +66,8 @@ fn main() -> std::io::Result<()> {
             let scope = std::env::args().nth(3).unwrap_or_default();
             let mut out = if std::env::args().nth(2).as_deref() == Some("git") {
                 launch::launch_decision_git(&read_stdin()?, now)
+            } else if std::env::args().nth(2).as_deref() == Some("pr") {
+                launch::launch_decision_pr(&read_stdin()?, now)
             } else {
                 launch::launch_decision_in(&read_stdin()?, now, &scope)
             };
@@ -171,7 +179,7 @@ fn main() -> std::io::Result<()> {
         Some(other) => {
             eprintln!("herdr-sidebar: unknown argument `{other}`");
             eprintln!(
-                "usage: herdr-sidebar [--view explorer|git|pr|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--show-explorer|--show-search|--show-git|--quick-open|--launch-decision [git]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
+                "usage: herdr-sidebar [--view explorer|git|pr|--preview [ctl]|--run-custom-editor|--ensure|--toggle|--toggle-git|--toggle-pr|--show-explorer|--show-search|--show-git|--show-pr|--quick-open|--launch-decision [git|pr]|--focused-pane|--pane-has-token <id>|--open-plan|--focused-tab|--auto-open|--focus-on-open|--dock-right]"
             );
             std::process::exit(2);
         }

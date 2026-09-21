@@ -149,7 +149,9 @@ impl View {
         match flag {
             "explorer" => Some(View::Explorer),
             "git" => Some(View::SourceControl),
-            "pr" => Some(View::PullRequests),
+            // The separated pane also accepts the token name, so a launcher
+            // can pass it without knowing the short flag.
+            "pr" | "pull-requests" => Some(View::PullRequests),
             _ => None,
         }
     }

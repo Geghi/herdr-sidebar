@@ -313,12 +313,21 @@ pub fn focus_as_close(decision: &str) -> String {
 /// Source-control identity for the separated Source Control pane.
 pub const SC_PANE_LABEL: &str = "Source Control";
 pub const SC_METADATA_SOURCE: &str = "herdr-sidebar-git";
+/// Pull-request identity for the separated Pull Requests pane.
+pub const PR_PANE_LABEL: &str = "Pull Requests";
+pub const PR_METADATA_SOURCE: &str = "herdr-sidebar-pr";
 const PREVIEW_METADATA_SOURCE: &str = "herdr-sidebar-preview";
 
 /// Like [`launch_decision`], but for the separated Source Control pane (the
-/// unified Sidebar pane carries BOTH tokens, so it satisfies this too).
+/// unified Sidebar pane carries every identity token, so it satisfies this
+/// too).
 pub fn launch_decision_git(pane_list_json: &str, now: u64) -> String {
     launch_decision_for(pane_list_json, now, SC_METADATA_SOURCE, SC_PANE_LABEL)
+}
+
+/// Like [`launch_decision_git`], but for the separated Pull Requests pane.
+pub fn launch_decision_pr(pane_list_json: &str, now: u64) -> String {
+    launch_decision_for(pane_list_json, now, PR_METADATA_SOURCE, PR_PANE_LABEL)
 }
 
 /// The decision for one view's OWN standalone pane, identified by its metadata
@@ -369,7 +378,9 @@ pub fn pane_has_token(pane_list_json: &str, pane_id: &str) -> bool {
         .iter()
         .filter(|p| p.pane_id.as_deref() == Some(pane_id))
         .any(|p| {
-            p.tokens.contains_key(METADATA_SOURCE) || p.tokens.contains_key(SC_METADATA_SOURCE)
+            p.tokens.contains_key(METADATA_SOURCE)
+                || p.tokens.contains_key(SC_METADATA_SOURCE)
+                || p.tokens.contains_key(PR_METADATA_SOURCE)
         })
 }
 
@@ -443,8 +454,10 @@ fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
                 && p.pane_id.as_deref() != Some(my_pane_id)
                 && !p.is_explorer()
                 && !p.tokens.contains_key(SC_METADATA_SOURCE)
+                && !p.tokens.contains_key(PR_METADATA_SOURCE)
                 && !p.tokens.contains_key(PREVIEW_METADATA_SOURCE)
                 && p.label.as_deref() != Some(SC_PANE_LABEL)
+                && p.label.as_deref() != Some(PR_PANE_LABEL)
                 && !p.label.as_deref().is_some_and(is_preview_label)
         })
         .filter_map(|p| {

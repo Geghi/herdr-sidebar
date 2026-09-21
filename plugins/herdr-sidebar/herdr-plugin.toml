@@ -1,6 +1,6 @@
-# Manifest for herdr-sidebar — the VS Code sidebar for herdr: file explorer
-# and source control in one plugin (one pane by default, separated panes on
-# request via the ⚙ settings).
+# Manifest for herdr-sidebar — the VS Code sidebar for herdr: file explorer,
+# source control and pull requests in one plugin (one pane by default,
+# separated panes on request via the ⚙ settings).
 #
 # Cross-platform notes (verified against herdr 0.8; see CLAUDE.md for the
 # full findings list):
@@ -19,7 +19,7 @@
 id = "herdr-sidebar"
 name = "herdr-sidebar"
 version = "0.13.0"
-description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) in one herdr pane."
+description = "VS Code-style sidebar: file explorer + source control (with ✧ AI commit messages) + pull requests in one herdr pane."
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos", "windows"]
 
@@ -48,6 +48,15 @@ id = "source-control"
 title = "Source Control"
 placement = "split"
 command = ["./target/release/herdr-sidebar", "--view", "git"]
+platforms = ["linux", "macos"]
+
+# The Pull Requests view's separated pane: pinned to PR the same way the
+# source-control entrypoint pins its view.
+[[panes]]
+id = "pull-requests"
+title = "Pull Requests"
+placement = "split"
+command = ["./target/release/herdr-sidebar", "--view", "pr"]
 platforms = ["linux", "macos"]
 
 # Toggle the sidebar: open at the configured dock edge / focus / close.
@@ -81,6 +90,36 @@ platforms = ["windows"]
 title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
 command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle-git"]
+
+# The Pull Requests view, separated or unified: its own pane (toggle), or the
+# show-* host binding that opens/focuses it.
+[[actions]]
+id = "open-pr"
+platforms = ["linux", "macos"]
+title = "Toggle pull requests"
+description = "Open a separate Pull Requests pane (focus it if open; close it if focused)."
+command = ["./target/release/herdr-sidebar", "--toggle-pr"]
+
+[[actions]]
+id = "open-pr-windows"
+platforms = ["windows"]
+title = "Toggle pull requests"
+description = "Open a separate Pull Requests pane (focus it if open; close it if focused)."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle-pr"]
+
+[[actions]]
+id = "show-pr"
+platforms = ["linux", "macos"]
+title = "Show Pull Requests"
+description = "Open or focus the sidebar and switch to Pull Requests."
+command = ["./target/release/herdr-sidebar", "--show-pr"]
+
+[[actions]]
+id = "show-pr-windows"
+platforms = ["windows"]
+title = "Show Pull Requests"
+description = "Open or focus the sidebar and switch to Pull Requests."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--show-pr"]
 
 # Direct activities for host-level keybindings. Unlike the legacy toggles,
 # these always open/focus the sidebar and leave it on the requested view.

@@ -1141,13 +1141,14 @@ impl App {
             return None;
         }
         // View switching from the keyboard, VS Code's activity-bar order:
-        // 1 Explorer, 2 Search, 3 Source Control. Ctrl+1/2/3 always switch (an
-        // editor's group-focus chord), so they work even mid-word in a focused
-        // search field. Bare 1/2/3 ALSO switch while the Search box is NOT
-        // focused (its Results list) — the state you land in when switching to
-        // Search — so the keys stay a switcher until you deliberately focus the
-        // box (Ctrl+F / Tab / click); a focused box captures digits as text so
-        // "3" is searchable. The tree's own bare 1/2/3 are handled further down.
+        // 1 Explorer, 2 Search, 3 Source Control, 4 Pull Requests. Ctrl+1/2/3/4
+        // always switch (an editor's group-focus chord), so they work even
+        // mid-word in a focused search field. Bare 1/2/3/4 ALSO switch while
+        // the Search box is NOT focused (its Results list) — the state you
+        // land in when switching to Search — so the keys stay a switcher
+        // until you deliberately focus the box (Ctrl+F / Tab / click); a
+        // focused box captures digits as text so "3" is searchable. The tree's
+        // own bare 1/2/3/4 are handled further down.
         let injected_view = match key.code {
             KeyCode::F(9) => Some('1'),
             KeyCode::F(10) => Some('2'),
@@ -1155,7 +1156,7 @@ impl App {
             _ => None,
         };
         if let Some(c) = injected_view.or(match key.code {
-            KeyCode::Char(c @ ('1' | '2' | '3')) => Some(c),
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4')) => Some(c),
             _ => None,
         }) {
             let ctrl = injected_view.is_some()
@@ -1185,6 +1186,7 @@ impl App {
                         self.open_content_search(false);
                         None
                     }
+                    '4' => self.switch_to(View::PullRequests),
                     _ => self.switch_to(View::SourceControl),
                 };
             }

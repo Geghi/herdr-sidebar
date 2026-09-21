@@ -14,7 +14,9 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -24,7 +26,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use crate::scm_app::{ChangeTreeRow, TreeNode, changes_tree_rows, folder_item};
 use herdr_sidebar::actions::copy_to_clipboard;
 use herdr_sidebar::git::FileEntry;
-use herdr_sidebar::icons::IconTheme;
+use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::pr::{
     self, MergeMethod, PrFile, PrFilter, PullRequest, ReviewState, Thread, Verdict,
 };
@@ -374,8 +376,17 @@ impl App {
 
     /// Hide the sidebar: snooze this tab and close our own pane.
     fn hide(&mut self) {
+        self.close(true);
+    }
+
+    /// Close our own pane. Ctrl+Q from a toggle launcher closes without
+    /// snoozing (the toggle's own decision already knows whether to re-dock);
+    /// `q`/`b` behave like the other views' hide instead.
+    fn close(&mut self, snooze: bool) {
         let Some(ctl) = &self.pane_ctl else { return };
-        if let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) {
+        if snooze
+            && let Ok(json) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({}))
+        {
             let tab = herdr_sidebar::launch::tab_of(&json, &ctl.pane_id);
             herdr_sidebar::snooze::set(&herdr_sidebar::snooze::dir(), &tab);
         }
@@ -444,9 +455,15 @@ impl App {
         };
         let path = folder.path.clone();
         if !self.tree_collapsed.remove(&path) {
-            self.tree_collapsed.insert(path);
+            self.tree_collapsed.insert(path.clone());
         }
         self.rebuild();
+        // The fold hides whatever file was selected under it, so the plain
+        // stable-id re-find would clamp to a neighbour — re-find the folder
+        // itself instead, like the SCM tree.
+        if let Some(index) = self.find_row_by_stable_id(&format!("folder:{path}")) {
+            self.select(index);
+        }
     }
 
     /// Start (or stop) the inline file list of one pull request.
@@ -535,16 +552,34 @@ impl App {
         }
     }
 
-    /// Poll the workers and refresh on a slow cadence.
+    /// Poll the workers, refresh on a slow cadence, and re-read the shared
+    /// display settings — another pane's `t` (or the ⚙ row) flips the tree
+    /// view for every pane, separated ones included.
     pub fn tick(&mut self) {
         self.poll();
+        let shared = sidebar::load_state();
+        if shared.scm_tree != self.sidebar_state.scm_tree {
+            self.sidebar_state.scm_tree = shared.scm_tree;
+            self.rebuild();
+        }
+        if shared.color_theme != self.sidebar_state.color_theme {
+            self.sidebar_state.color_theme = shared.color_theme;
+            set_color_theme(shared.color_theme);
+        }
+        if shared.show_hotkeys != self.sidebar_state.show_hotkeys {
+            self.sidebar_state.show_hotkeys = shared.show_hotkeys;
+        }
         if self.fetching.is_none() && self.last_refresh.elapsed() >= REFRESH_EVERY {
             self.refresh();
         }
     }
 
-    /// Rebuild the row list from the drawers.
+    /// Rebuild the row list from the drawers. The selection follows the
+    /// row's stable id — folding a folder, toggling the tree, or finishing
+    /// a network refresh keeps it on the same logical row, not the same
+    /// index.
     fn rebuild(&mut self) {
+        let keep = self.selected.and_then(|i| self.row_stable_id(i));
         self.tree_nodes.clear();
         let tree = self.tree();
         let (rows, depths) = build_rows(
@@ -563,11 +598,49 @@ impl App {
             self.hovered = None;
             return;
         }
-        if let Some(selected) = self.selected {
-            self.selected = Some(selected.min(self.rows.len() - 1));
-        } else {
-            self.selected = Some(0);
+        let found = keep
+            .as_deref()
+            .and_then(|id| self.find_row_by_stable_id(id));
+        if found != self.selected {
+            self.snap = true;
         }
+        self.selected = found
+            .or_else(|| self.selected.map(|s| s.min(self.rows.len() - 1)))
+            .or(Some(0));
+    }
+
+    /// A row's stable id — drawer, pull request number, file path, or
+    /// tree-folder path — so the selection survives a rebuild.
+    fn row_stable_id(&self, index: usize) -> Option<String> {
+        match self.rows.get(index)? {
+            Row::Header(drawer) => Some(format!("header:{drawer}")),
+            Row::Pr(drawer, i) => self.drawers[*drawer]
+                .prs
+                .get(*i)
+                .map(|pr| format!("pr:{}", pr.number)),
+            Row::File(i) => self
+                .files
+                .get(*i)
+                .map(|file| format!("file:{}", file.entry.path)),
+            Row::FileFolder(node) => self
+                .tree_nodes
+                .get(*node)
+                .map(|folder| format!("folder:{}", folder.path)),
+        }
+    }
+
+    /// Inverse of [`row_stable_id`]: the row whose id matches, if any.
+    fn find_row_by_stable_id(&self, id: &str) -> Option<usize> {
+        (0..self.rows.len()).find(|&i| self.row_stable_id(i).as_deref() == Some(id))
+    }
+
+    /// The nearest row above `index` with a shallower depth — a file's (or a
+    /// folded folder's) parent row, like the Source Control tree.
+    fn parent_row(&self, index: usize) -> Option<usize> {
+        let depth = *self.row_depth.get(index)?;
+        (0..index)
+            .rev()
+            .find(|&i| self.row_depth.get(i).is_some_and(|row| *row < depth))
     }
 
     fn select(&mut self, index: usize) {
@@ -646,7 +719,9 @@ impl App {
         }
     }
 
-    /// Left/`h`: close the selected row.
+    /// Left/`h`: close the selected row. In tree mode a file — or an
+    /// already-folded folder — steps out to its parent row, like the
+    /// Source Control tree.
     fn collapse(&mut self) {
         let Some(&row) = self.selected.and_then(|index| self.rows.get(index)) else {
             return;
@@ -672,9 +747,21 @@ impl App {
                     .is_some_and(|folder| folder.expanded)
                 {
                     self.toggle_tree_folder(node);
+                } else if self.tree()
+                    && let Some(index) = self.selected
+                    && let Some(parent) = self.parent_row(index)
+                {
+                    self.select(parent);
                 }
             }
-            Row::File(_) => {}
+            Row::File(_) => {
+                if self.tree()
+                    && let Some(index) = self.selected
+                    && let Some(parent) = self.parent_row(index)
+                {
+                    self.select(parent);
+                }
+            }
         }
     }
 
@@ -875,6 +962,58 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Exit> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+        // Ctrl+Q from a toggle launcher: close our own pane gracefully, in
+        // front of any overlay — like the other views.
+        if key.code == KeyCode::Char('q')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            self.close(false);
+            return None;
+        }
+        // Ctrl+P / F12 is the host's Quick Open gesture, like in the other
+        // apps — but only the unified sidebar has an Explorer to open it in.
+        if ((key.code == KeyCode::Char('p')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT))
+            || key.code == KeyCode::F(12))
+            && self.merged()
+        {
+            self.sidebar_state = sidebar::update_state(|state| {
+                state.active = View::Explorer;
+                state.search_active = false;
+            });
+            return Some(Exit::QuickOpen);
+        }
+        // View-switch transports reach past any open overlay or focused
+        // input: F9–F11 are the host's synthetic keys for views 1–3, and
+        // Ctrl+1/2/3/4 mirror the activity-bar chords (Ctrl+4 reaches this
+        // view, a no-op while it is already showing — including in a pinned
+        // standalone pane).
+        let injected_view = match key.code {
+            KeyCode::F(9) => Some('1'),
+            KeyCode::F(10) => Some('2'),
+            KeyCode::F(11) => Some('3'),
+            _ => None,
+        };
+        let keyboard_view = match key.code {
+            KeyCode::Char(c @ ('1' | '2' | '3' | '4'))
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                Some(c)
+            }
+            _ => None,
+        };
+        if let Some(c) = injected_view.or(keyboard_view) {
+            self.overlay = None;
+            return match c {
+                '1' => self.switch_to(View::Explorer),
+                '2' => self.open_search(),
+                '4' => self.switch_to(View::PullRequests),
+                _ => self.switch_to(View::SourceControl),
+            };
         }
         if self.overlay.is_some() {
             return self.overlay_key(key);
@@ -1166,8 +1305,10 @@ impl App {
                     },
                     Row::File(i) => match self.files.get(i) {
                         Some(file) => {
-                            let depth = self.row_depth.get(index).copied().unwrap_or(0);
-                            file_item(file, depth, width)
+                            let tree = self
+                                .tree()
+                                .then(|| self.row_depth.get(index).copied().unwrap_or(0));
+                            file_item(file, tree, width, self.theme)
                         }
                         None => ListItem::new(Line::default()),
                     },
@@ -1568,37 +1709,58 @@ fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>
 }
 
 /// A file row of the expanded pull request.
-fn file_item(file: &PrFile, depth: usize, width: usize) -> ListItem<'static> {
-    ListItem::new(Line::from(file_spans(file, depth, width)))
+fn file_item(file: &PrFile, depth: Option<usize>, width: usize, theme: IconTheme) -> ListItem<'static> {
+    ListItem::new(Line::from(file_spans(file, depth, width, theme)))
 }
 
-/// A file row's spans: indent, the file name, its status letter and its churn.
-fn file_spans(file: &PrFile, depth: usize, width: usize) -> Vec<Span<'static>> {
-    let churn = format!("+{} −{}", file.additions, file.deletions);
-    let letter = format!("{} ", file.entry.letter);
-    // A tree row nests under its folders; a flat row starts where a top-level
-    // tree row does, so the two views line up.
-    let indent = 3 + depth * 2 + 2;
-    let room = width
-        .saturating_sub(indent + churn.chars().count() + letter.chars().count() + 2)
-        .max(6);
-    let name = file
-        .entry
-        .path
-        .rsplit('/')
-        .next()
-        .unwrap_or(&file.entry.path);
-    let text = herdr_sidebar::ui::truncate_to(name.to_string(), room);
-    let pad = width.saturating_sub(
-        indent + text.chars().count() + letter.chars().count() + churn.chars().count(),
-    );
-    vec![
+/// A file row's spans: the Source Control view's file-row anatomy (indent,
+/// icon, the bare name in its status color, the right-aligned letter) plus
+/// the `+A −D` churn. A tree row nests under its folders; a flat row
+/// carries the dim directory instead.
+fn file_spans(
+    file: &PrFile,
+    depth: Option<usize>,
+    width: usize,
+    theme: IconTheme,
+) -> Vec<Span<'static>> {
+    let (dir, name) = match file.entry.path.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, file.entry.path.as_str()),
+    };
+    let color = herdr_sidebar::ui::status_color(file.entry.letter);
+    let file_icon = icon(theme, name, false, false);
+    let icon_style = herdr_sidebar::ui::icon_style(file_icon.rgb);
+    let indent = match depth {
+        Some(depth) => 3 + depth * 2 + 2,
+        None => 3,
+    };
+    let mut spans = vec![
         Span::raw(" ".repeat(indent)),
-        Span::styled(text, Style::default()),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(letter, Style::default().fg(palette().modified)),
-        Span::styled(churn, Style::default().dim()),
-    ]
+        Span::styled(format!("{} ", file_icon.glyph), icon_style),
+    ];
+    let churn = format!("+{} −{}", file.additions, file.deletions);
+    let tail = 2 + churn.chars().count();
+    let prefix_width: usize = spans.iter().map(Span::width).sum();
+    let room = width.saturating_sub(prefix_width + tail).max(6);
+    let visible_name = herdr_sidebar::ui::truncate_to(name.to_string(), room);
+    spans.push(Span::styled(visible_name, Style::default().fg(color)));
+    if let Some(dir) = dir.filter(|_| depth.is_none()) {
+        let used: usize = spans.iter().map(Span::width).sum();
+        let avail = width.saturating_sub(used + tail);
+        let text = herdr_sidebar::ui::truncate_to(format!(" {dir}"), avail);
+        if !text.is_empty() {
+            spans.push(Span::styled(text, Style::default().dim()));
+        }
+    }
+    let left_width: usize = spans.iter().map(Span::width).sum();
+    let pad = width.saturating_sub(left_width + tail);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(
+        file.entry.letter.to_string(),
+        Style::default().fg(color).bold(),
+    ));
+    spans.push(Span::styled(format!(" {churn}"), Style::default().dim()));
+    spans
 }
 
 #[cfg(test)]
@@ -1807,6 +1969,68 @@ mod tests {
     }
 
     #[test]
+    fn selection_survives_folds_step_outs_and_the_tree_toggle() {
+        fn test_app() -> App {
+            let follower = Rc::new(RefCell::new(
+                herdr_sidebar::launch::CwdFollower::default(),
+            ));
+            App::new(std::env::temp_dir(), follower)
+        }
+        let mut app = test_app();
+        app.fetching = None;
+        app.drawers = drawers(vec![pull(7, ReviewState::Pending)], vec![]);
+        app.expanded = Some(7);
+        app.files = vec![
+            pr_file("src/a.rs", 'M'),
+            pr_file("src/deep/b.rs", 'A'),
+            pr_file("CLAUDE.md", 'M'),
+        ];
+        // Tree rows: [Header, Pr, Folder(src), Folder(src/deep),
+        // File(deep/b.rs), File(src/a.rs), File(CLAUDE.md), …].
+        app.sidebar_state.scm_tree = true;
+        app.rebuild();
+        app.select(4);
+        assert_eq!(app.rows[app.selected.unwrap()], Row::File(1));
+        // Folding the folder keeps the selection on its row.
+        app.toggle_tree_folder(1);
+        assert_eq!(
+            app.rows[app.selected.unwrap()],
+            Row::FileFolder(1),
+            "the fold keeps its folder selected"
+        );
+        // Left on a folded folder steps out to the parent.
+        app.collapse();
+        assert_eq!(
+            app.rows[app.selected.unwrap()],
+            Row::FileFolder(0),
+            "a folded folder steps out"
+        );
+        // Left on an open folder folds it instead of leaving.
+        app.collapse();
+        assert_eq!(app.rows[app.selected.unwrap()], Row::FileFolder(0));
+        assert!(
+            !app.tree_nodes[0].expanded,
+            "Left folds an open folder first"
+        );
+        // Flat mode keeps the selection on the same file, not the same
+        // index — unfold both folders again, sit on the deep file, toggle.
+        app.toggle_tree_folder(0);
+        app.toggle_tree_folder(1);
+        app.select(4);
+        assert_eq!(app.rows[app.selected.unwrap()], Row::File(1));
+        app.sidebar_state.scm_tree = false;
+        app.rebuild();
+        assert_eq!(
+            app.rows[app.selected.unwrap()],
+            Row::File(1),
+            "the tree toggle keeps the file, not the index"
+        );
+        // Left on a flat file row is a no-op.
+        app.collapse();
+        assert_eq!(app.rows[app.selected.unwrap()], Row::File(1));
+    }
+
+    #[test]
     fn a_collapsed_drawer_hides_its_pull_requests() {
         let mut panels = drawers(vec![pull(7, ReviewState::Pending)], vec![]);
         panels[0].expanded = false;
@@ -1869,13 +2093,29 @@ mod tests {
             additions: 12,
             deletions: 3,
         };
-        let text = joined(&file_spans(&file, 0, 40));
+        let text = joined(&file_spans(&file, None, 40, IconTheme::Emoji));
         assert!(
             text.contains("app.rs"),
-            "the name, not the whole path: {text}"
+            "the flat row names the file: {text}"
         );
-        assert!(text.contains("M "), "{text}");
+        assert!(
+            text.contains("src/deep"),
+            "the flat row keeps the dim directory: {text}"
+        );
+        assert!(text.contains('M'), "{text}");
         assert!(text.contains("+12 −3"), "{text}");
+        let tree = joined(&file_spans(&file, Some(1), 40, IconTheme::Emoji));
+        assert!(tree.contains("app.rs"), "{tree}");
+        assert!(
+            !tree.contains("src/deep"),
+            "the tree row nests under its folders instead: {tree}"
+        );
+        assert!(
+            file_spans(&file, None, 40, IconTheme::Emoji)
+                .iter()
+                .any(|span| span.style.fg == Some(herdr_sidebar::ui::status_color('M'))),
+            "the name takes its status color"
+        );
     }
 
     #[test]
