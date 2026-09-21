@@ -1304,6 +1304,8 @@ mod tests {
                {"pane_id":"w1:p1","tab_id":"w1:t1","label":"Source Control","foreground_cwd":"/sc"},
                {"pane_id":"w1:p2","tab_id":"w1:t1","label":"Preview · routes.rs","foreground_cwd":"/preview"},
                {"pane_id":"w1:p5","tab_id":"w1:t1","label":"routes.rs · editor","foreground_cwd":"/editor"},
+               {"pane_id":"w1:p6","tab_id":"w1:t1","label":"Pull Requests","foreground_cwd":"/pr"},
+               {"pane_id":"w1:p7","tab_id":"w1:t1","foreground_cwd":"/pr2","tokens":{"herdr-sidebar-pr":"95"}},
                {"pane_id":"w1:p4","tab_id":"w1:t2","foreground_cwd":"/other"}"#,
         );
         assert_eq!(CwdFollower::default().next_cwd(&json, "w1:p3"), None);
@@ -1413,6 +1415,27 @@ mod tests {
             r#"{FOCUSED},{{"pane_id":"w1:p3","tab_id":"w1:t1","tokens":{{"herdr-sidebar-git":95}}}}"#
         ));
         assert_eq!(launch_decision_git(&sc_live, 100), "FOCUS w1:p3");
+        // Same rules for the separated Pull Requests decision.
+        let pr_corpse = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p4","label":"Pull Requests","tab_id":"w1:t1"}}"#
+        ));
+        assert_eq!(launch_decision_pr(&pr_corpse, 100), "REPLACE w1:p4");
+        let pr_stale = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p4","tab_id":"w1:t1","tokens":{{"herdr-sidebar-pr":40}}}}"#
+        ));
+        assert_eq!(launch_decision_pr(&pr_stale, 100), "REPLACE w1:p4");
+        let pr_live = pane_list(&format!(
+            r#"{FOCUSED},{{"pane_id":"w1:p4","tab_id":"w1:t1","tokens":{{"herdr-sidebar-pr":95}}}}"#
+        ));
+        assert_eq!(launch_decision_pr(&pr_live, 100), "FOCUS w1:p4");
+        assert!(pane_has_token(&pr_live, "w1:p4"));
+        // The Explorer decision must not mistake a standalone PR pane for a
+        // sidebar: the ensure hook still docks the Explorer next to it.
+        assert_eq!(
+            launch_decision(&pr_live, 100),
+            "OPEN",
+            "a PR pane is not an Explorer pane"
+        );
     }
 
     #[test]

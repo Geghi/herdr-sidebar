@@ -569,12 +569,18 @@ HACKING.md — budget time for that before promising a patched build.
   prebuilts must behave consistently on fresh machines. Build and cache the index on a worker
   polled from `App::tick`: a user-selected root can be enormous, and a synchronous walk can
   starve the heartbeat long enough for the launcher to replace a healthy pane as stale.
-- Host-remappable activity actions (`show-explorer`, `show-search`, `show-git`, and
-  `quick-open`, each with a Windows-suffixed twin) route through native `ensure::Mode::Activate`.
-  They never toggle closed: an existing pane receives an F9–F12 transport key that the PTY decoder
+- Host-remappable activity actions (`show-explorer`, `show-search`, `show-git`, `show-pr`,
+  and `quick-open`, each with a Windows-suffixed twin) route through native `ensure::Mode::Activate`.
+  They never toggle closed: an existing pane receives a transport key that the PTY decoder
   emits reliably, while a fresh pane receives `HERDR_SIDEBAR_INITIAL_ACTIVITY` so it starts on the
-  exact requested view without racing terminal input against its shell/TUI startup. Do not use
-  synthetic Ctrl+number here: legacy terminal encoding turns Ctrl+3 into Escape. This is also how
+  exact requested view without racing terminal input against its shell/TUI startup. Views 1–3 and
+  Quick Open use F9–F12. There is no F13: herdr's `parse_key_combo` accepts any `f<n>` but its
+  legacy encoder emits NOTHING for F13+ (`encode_f_key` returns empty — verified in herdr
+  `src/input/encode.rs`), so the key would be silently dropped. `show-pr` instead sends `ctrl+4`:
+  Ctrl+4 encodes to 0x1C and crossterm decodes it back as `Char('4')`+CONTROL (verified against
+  both codebases), and it completes the Ctrl+1/2/3 activity-bar chords in every app, so the switch
+  reaches past focused commit boxes and search fields. Do not use synthetic Ctrl+number OTHERWISE:
+  legacy terminal encoding turns Ctrl+3 into Escape. This is also how
   a host `cmd+p` binding opens Quick Open without pretending terminals can portably report the
   Command key.
 - Project content search accepts both `Ctrl+F` and `Ctrl+Shift+F`: terminals that collapse the
@@ -751,10 +757,28 @@ HACKING.md — budget time for that before promising a patched build.
   `Overlay::Threads` (a GraphQL `reviewThreads` fetch, resolved one by one with
   `resolveReviewThread`). Every mutating call is a `Job` on a worker thread with a `JobKind`
   so `poll()` routes the result back; the overlays keep a second job from starting.
+  The PR view is first-class like Source Control: a `[[panes]] pull-requests` entrypoint
+  (`--view pr`, `--view pull-requests` accepted too), `--toggle-pr` / `--show-pr` launcher
+  modes (plus the manifest `open-pr` / `show-pr` actions with `-windows` twins and the
+  sidecar flags), and `Target::PullRequests` wired through `pane_view` / `initial_view` /
+  `decision_view`. Its expanded file list renders as the SCM tree (`changes_tree_rows` +
+  `folder_item`, folders-first at each level — NOT files-immediately-under-folder) behind the
+  shared `scm_tree` setting with the same `t` / Left-fold-or-step-out / Right-unfold /
+  Enter-fold gestures and stable-id selection; file rows share SCM's icon/status-color
+  anatomy (a dim directory in flat mode). Ctrl+4 also switches every app to the PR view from
+  any focus, and the PR app answers the F9–F11 / Ctrl+1/2/3 transports plus Ctrl+Q graceful
+  close, so `show-*` works with the PR view showing. The merged pane stamps ALL THREE
+  identity tokens (a separated pane stamps its own and nulls the other two): with only
+  my+other, a fresh `show-pr` found no pr token on the unified pane and docked a duplicate.
+  `pr_app` unit tests construct `App::new` directly (safe: no `pane_ctl` without
+  `HERDR_PANE_ID`, `gh` fails fast off-repo, state defaults without the env dir) to cover
+  rebuild/selection behaviour the pure `build_rows` tests cannot reach.
 - **`markdown.rs` is the pane's own markdown renderer** (headings, emphasis, inline code,
   links, lists, task boxes, quotes, fenced code, rules and aligned tables, HTML comments
-  stripped): it draws a pull request's overview (`pr::render_overview` — title, branches,
-  churn, checks and conversation in colour) and it is the FALLBACK for markdown FILES when
+  stripped): it draws a pull request's description and conversation bodies inside
+  `pr::render_overview` (the overview itself is a structured native summary — state badge,
+  metadata card, grouped check rows with failing names first, headed `·`-separated
+  conversation blocks — never raw markdown) and it is the FALLBACK for markdown FILES when
   `glow` is missing, because a raw `#`/`**` dump is not a preview.
   **`gh` is a NETWORK cli with no timeout of its own**: every call runs on a worker thread
   and lands in the App through a channel polled from `tick()` (`refresh` sends one page per

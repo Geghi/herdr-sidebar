@@ -1206,10 +1206,20 @@ mod tests {
     fn views_pair_up() {
         assert_eq!(View::Explorer.other(), View::SourceControl);
         assert_eq!(View::SourceControl.other(), View::Explorer);
+        assert_eq!(View::PullRequests.other(), View::Explorer);
         assert_eq!(View::Explorer.label(), "Explorer");
         assert_eq!(View::SourceControl.plugin_id(), "herdr-sidebar-git");
+        assert_eq!(View::PullRequests.plugin_id(), "herdr-sidebar-pr");
         assert_eq!(View::Explorer.entrypoint(), "sidebar");
         assert_eq!(View::SourceControl.entrypoint(), "source-control");
+        assert_eq!(View::PullRequests.entrypoint(), "pull-requests");
+        assert_eq!(View::from_view_flag("pr"), Some(View::PullRequests));
+        assert_eq!(
+            View::from_view_flag("pull-requests"),
+            Some(View::PullRequests)
+        );
+        assert_eq!(View::from_view_flag("git"), Some(View::SourceControl));
+        assert_eq!(View::from_view_flag("nope"), None);
     }
 
     #[test]

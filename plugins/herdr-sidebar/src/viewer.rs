@@ -215,7 +215,8 @@ enum Request {
         spec: String,
         path: Option<String>,
     },
-    /// A GitHub pull request's overview (`gh pr view`), rendered as markdown.
+    /// A GitHub pull request's overview (`gh pr view`), rendered as a
+    /// structured native summary.
     Pr { root: PathBuf, number: u64 },
 }
 
@@ -704,9 +705,9 @@ fn load(request: &Request) -> Doc {
     }
 }
 
-/// A pull request's overview: `gh pr view` rendered as markdown, so the pane
-/// carries the description, the checks and the conversation the way GitHub
-/// shows them.
+/// A pull request's overview: `gh pr view` rendered as a structured native
+/// summary, so the pane carries the description, the checks and the
+/// conversation the way GitHub shows them.
 fn load_pr(root: &Path, number: u64) -> Doc {
     let name = format!("PR #{number}");
     let context = format!("pull request #{number} — {}", root.display());
