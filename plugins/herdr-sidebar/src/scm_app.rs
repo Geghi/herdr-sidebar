@@ -352,15 +352,16 @@ enum Row {
 }
 
 /// One folder row of the tree view (VS Code's "View as Tree"), rebuilt with
-/// `rows` and referenced by the folder [`Row`] variants.
+/// `rows` and referenced by the folder [`Row`] variants. Shared with the PR
+/// view, which shows a pull request's files the same way.
 #[derive(Clone)]
-struct TreeNode {
+pub(crate) struct TreeNode {
     /// Repo-relative `/`-separated directory path — the collapse key.
-    path: String,
+    pub(crate) path: String,
     /// The display label; single-child folder chains are compacted (`a/b/c`).
-    label: String,
-    depth: usize,
-    expanded: bool,
+    pub(crate) label: String,
+    pub(crate) depth: usize,
+    pub(crate) expanded: bool,
 }
 
 impl Row {
@@ -5083,7 +5084,7 @@ fn lane_color(lane: u8) -> Color {
 
 /// One row of a changed-files section's tree.
 #[derive(Debug)]
-enum ChangeTreeRow {
+pub(crate) enum ChangeTreeRow {
     /// A folder: its repo-relative path (the collapse key), the display label
     /// (single-child chains compacted: `a/b/c`) and its indent depth.
     Folder {
@@ -5106,7 +5107,10 @@ struct ChangeDir {
 /// insensitive), single-child folder chains compacted into one row, files
 /// nested under their folders. A collapsed folder keeps its row and drops its
 /// contents.
-fn changes_tree_rows(entries: &[FileEntry], collapsed: &BTreeSet<String>) -> Vec<ChangeTreeRow> {
+pub(crate) fn changes_tree_rows(
+    entries: &[FileEntry],
+    collapsed: &BTreeSet<String>,
+) -> Vec<ChangeTreeRow> {
     let mut root = ChangeDir::default();
     for (index, entry) in entries.iter().enumerate() {
         let parts: Vec<&str> = entry.path.split('/').collect();
@@ -5199,7 +5203,7 @@ fn join_change_dir(parent: &str, name: &str) -> String {
 
 /// A folder row of the tree view: indent, disclosure chevron, folder icon,
 /// and the (possibly compacted) label — VS Code's Source Control tree.
-fn folder_item(node: &TreeNode, width: usize, theme: IconTheme) -> ListItem<'static> {
+pub(crate) fn folder_item(node: &TreeNode, width: usize, theme: IconTheme) -> ListItem<'static> {
     let arrow = if node.expanded { "▾" } else { "▸" };
     let folder_icon = icon(theme, &node.label, true, node.expanded);
     let icon_style = ui_icon_style(folder_icon.rgb);

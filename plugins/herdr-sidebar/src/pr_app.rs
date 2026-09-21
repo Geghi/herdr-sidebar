@@ -8,6 +8,7 @@
 //! as a list that is still empty.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -20,7 +21,9 @@ use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 
+use crate::scm_app::{ChangeTreeRow, TreeNode, changes_tree_rows, folder_item};
 use herdr_sidebar::actions::copy_to_clipboard;
+use herdr_sidebar::git::FileEntry;
 use herdr_sidebar::icons::IconTheme;
 use herdr_sidebar::pr::{
     self, MergeMethod, PrFile, PrFilter, PullRequest, ReviewState, Thread, Verdict,
@@ -50,6 +53,9 @@ enum Row {
     Pr(usize, usize),
     /// A changed file of the expanded pull request.
     File(usize),
+    /// A folder row of that file list in tree view (index into
+    /// [`App::tree_nodes`]).
+    FileFolder(usize),
 }
 
 /// One drawer: whether it is open, its page, and the error that replaced it.
@@ -248,6 +254,12 @@ pub struct App {
     /// The pull request whose files are expanded inline, by number.
     expanded: Option<u64>,
     files: Vec<PrFile>,
+    /// The file list as a tree (the same "View as tree" setting the Source
+    /// Control view uses): folder rows and the collapse set that drives them.
+    tree_nodes: Vec<TreeNode>,
+    tree_collapsed: BTreeSet<String>,
+    /// Indent depth per row, parallel to `rows` (tree view).
+    row_depth: Vec<usize>,
     /// The pull request whose files are being fetched.
     files_loading: Option<u64>,
     rows: Vec<Row>,
@@ -303,6 +315,9 @@ impl App {
             drawers,
             expanded: None,
             files: Vec::new(),
+            tree_nodes: Vec::new(),
+            tree_collapsed: BTreeSet::new(),
+            row_depth: Vec::new(),
             files_loading: None,
             rows: Vec::new(),
             selected: None,
@@ -410,6 +425,30 @@ impl App {
         self.fetching = Some(receiver);
     }
 
+    /// Whether the file list renders as a tree (shared with the Source
+    /// Control view's "View as tree" setting).
+    fn tree(&self) -> bool {
+        self.sidebar_state.scm_tree
+    }
+
+    /// `t`: flip the tree/flat rendering of a pull request's files.
+    fn toggle_tree_view(&mut self) {
+        self.sidebar_state = sidebar::update_state(|state| state.scm_tree = !state.scm_tree);
+        self.rebuild();
+    }
+
+    /// Fold/unfold a file-tree folder, keeping the selection on its row.
+    fn toggle_tree_folder(&mut self, node: usize) {
+        let Some(folder) = self.tree_nodes.get(node) else {
+            return;
+        };
+        let path = folder.path.clone();
+        if !self.tree_collapsed.remove(&path) {
+            self.tree_collapsed.insert(path);
+        }
+        self.rebuild();
+    }
+
     /// Start (or stop) the inline file list of one pull request.
     fn toggle_files(&mut self, number: u64) {
         if self.expanded == Some(number) {
@@ -506,7 +545,18 @@ impl App {
 
     /// Rebuild the row list from the drawers.
     fn rebuild(&mut self) {
-        self.rows = build_rows(&self.drawers, self.expanded, self.files.len());
+        self.tree_nodes.clear();
+        let tree = self.tree();
+        let (rows, depths) = build_rows(
+            &self.drawers,
+            self.expanded,
+            &self.files,
+            tree,
+            &self.tree_collapsed,
+            &mut self.tree_nodes,
+        );
+        self.rows = rows;
+        self.row_depth = depths;
         if self.rows.is_empty() {
             self.selected = None;
             self.scroll = 0;
@@ -562,6 +612,7 @@ impl App {
                 }
             }
             Row::File(index) => self.open_file_diff(index),
+            Row::FileFolder(node) => self.toggle_tree_folder(node),
         }
     }
 
@@ -580,6 +631,15 @@ impl App {
             Row::Pr(..) => {
                 if let Some(number) = self.selected_pr_number() {
                     self.toggle_files(number);
+                }
+            }
+            Row::FileFolder(node) => {
+                if self
+                    .tree_nodes
+                    .get(node)
+                    .is_some_and(|folder| !folder.expanded)
+                {
+                    self.toggle_tree_folder(node);
                 }
             }
             Row::File(_) => {}
@@ -603,6 +663,15 @@ impl App {
                     && Some(number) == self.expanded
                 {
                     self.toggle_files(number);
+                }
+            }
+            Row::FileFolder(node) => {
+                if self
+                    .tree_nodes
+                    .get(node)
+                    .is_some_and(|folder| folder.expanded)
+                {
+                    self.toggle_tree_folder(node);
                 }
             }
             Row::File(_) => {}
@@ -826,6 +895,7 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
             KeyCode::Char('m') => self.open_menu(),
+            KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Right | KeyCode::Char('l') => self.expand(),
             KeyCode::Left | KeyCode::Char('h') => self.collapse(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
@@ -1095,7 +1165,14 @@ impl App {
                         None => ListItem::new(Line::default()),
                     },
                     Row::File(i) => match self.files.get(i) {
-                        Some(file) => file_item(file, width),
+                        Some(file) => {
+                            let depth = self.row_depth.get(index).copied().unwrap_or(0);
+                            file_item(file, depth, width)
+                        }
+                        None => ListItem::new(Line::default()),
+                    },
+                    Row::FileFolder(node) => match self.tree_nodes.get(node) {
+                        Some(folder) => folder_item(folder, width, self.theme),
                         None => ListItem::new(Line::default()),
                     },
                 };
@@ -1375,24 +1452,65 @@ fn summary_of(text: &str) -> String {
 }
 
 /// The row list: every drawer header, its pull requests when open, and the
-/// files of the expanded one under their pull request.
-fn build_rows(drawers: &[DrawerPanel; 3], expanded: Option<u64>, files: usize) -> Vec<Row> {
+/// expanded one's files — a tree when `tree`, a flat list otherwise. Returns
+/// the rows with their indent depths, which must stay parallel to each other.
+fn build_rows(
+    drawers: &[DrawerPanel; 3],
+    expanded: Option<u64>,
+    files: &[PrFile],
+    tree: bool,
+    collapsed: &BTreeSet<String>,
+    nodes: &mut Vec<TreeNode>,
+) -> (Vec<Row>, Vec<usize>) {
     let mut rows = Vec::new();
+    let mut depths = Vec::new();
     for (drawer, panel) in drawers.iter().enumerate() {
         rows.push(Row::Header(drawer));
+        depths.push(0);
         if !panel.expanded {
             continue;
         }
         for (index, pr) in panel.prs.iter().enumerate() {
             rows.push(Row::Pr(drawer, index));
-            if expanded == Some(pr.number) {
-                for file in 0..files {
-                    rows.push(Row::File(file));
+            depths.push(0);
+            if expanded != Some(pr.number) {
+                continue;
+            }
+            if tree {
+                let entries: Vec<FileEntry> =
+                    files.iter().map(|file| file.entry.clone()).collect();
+                for row in changes_tree_rows(&entries, collapsed) {
+                    match row {
+                        ChangeTreeRow::Folder {
+                            path,
+                            label,
+                            depth,
+                            expanded,
+                        } => {
+                            rows.push(Row::FileFolder(nodes.len()));
+                            depths.push(depth);
+                            nodes.push(TreeNode {
+                                path,
+                                label,
+                                depth,
+                                expanded,
+                            });
+                        }
+                        ChangeTreeRow::File { index, depth } => {
+                            rows.push(Row::File(index));
+                            depths.push(depth);
+                        }
+                    }
+                }
+            } else {
+                for index in 0..files.len() {
+                    rows.push(Row::File(index));
+                    depths.push(0);
                 }
             }
         }
     }
-    rows
+    (rows, depths)
 }
 
 /// A drawer header row.
@@ -1450,16 +1568,19 @@ fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>
 }
 
 /// A file row of the expanded pull request.
-fn file_item(file: &PrFile, width: usize) -> ListItem<'static> {
-    ListItem::new(Line::from(file_spans(file, width)))
+fn file_item(file: &PrFile, depth: usize, width: usize) -> ListItem<'static> {
+    ListItem::new(Line::from(file_spans(file, depth, width)))
 }
 
-/// A file row's spans: the file name, its status letter and its churn.
-fn file_spans(file: &PrFile, width: usize) -> Vec<Span<'static>> {
+/// A file row's spans: indent, the file name, its status letter and its churn.
+fn file_spans(file: &PrFile, depth: usize, width: usize) -> Vec<Span<'static>> {
     let churn = format!("+{} −{}", file.additions, file.deletions);
     let letter = format!("{} ", file.entry.letter);
+    // A tree row nests under its folders; a flat row starts where a top-level
+    // tree row does, so the two views line up.
+    let indent = 3 + depth * 2 + 2;
     let room = width
-        .saturating_sub(churn.chars().count() + letter.chars().count() + 8)
+        .saturating_sub(indent + churn.chars().count() + letter.chars().count() + 2)
         .max(6);
     let name = file
         .entry
@@ -1469,10 +1590,10 @@ fn file_spans(file: &PrFile, width: usize) -> Vec<Span<'static>> {
         .unwrap_or(&file.entry.path);
     let text = herdr_sidebar::ui::truncate_to(name.to_string(), room);
     let pad = width.saturating_sub(
-        4 + text.chars().count() + letter.chars().count() + churn.chars().count() + 1,
+        indent + text.chars().count() + letter.chars().count() + churn.chars().count(),
     );
     vec![
-        Span::raw("    "),
+        Span::raw(" ".repeat(indent)),
         Span::styled(text, Style::default()),
         Span::raw(" ".repeat(pad)),
         Span::styled(letter, Style::default().fg(palette().modified)),
@@ -1577,15 +1698,32 @@ mod tests {
         assert_eq!(summary_of(""), "done");
     }
 
+    fn pr_file(path: &str, letter: char) -> PrFile {
+        PrFile {
+            entry: FileEntry {
+                path: path.into(),
+                orig: None,
+                letter,
+            },
+            additions: 1,
+            deletions: 0,
+        }
+    }
+
+    fn flat(panels: &[DrawerPanel; 3], expanded: Option<u64>, files: &[PrFile]) -> Vec<Row> {
+        let mut nodes = Vec::new();
+        build_rows(panels, expanded, files, false, &BTreeSet::new(), &mut nodes).0
+    }
+
     #[test]
     fn rows_nest_files_under_their_pull_request_only() {
         let panels = drawers(
             vec![pull(7, ReviewState::Pending)],
             vec![pull(9, ReviewState::Approved)],
         );
-        let rows = build_rows(&panels, None, 0);
+        let none: Vec<PrFile> = Vec::new();
         assert_eq!(
-            rows,
+            flat(&panels, None, &none),
             [
                 Row::Header(0),
                 Row::Pr(0, 0),
@@ -1595,9 +1733,9 @@ mod tests {
             ],
             "a closed drawer contributes only its header"
         );
-        let rows = build_rows(&panels, Some(9), 2);
+        let two = [pr_file("a.rs", 'M'), pr_file("b.rs", 'A')];
         assert_eq!(
-            rows,
+            flat(&panels, Some(9), &two),
             [
                 Row::Header(0),
                 Row::Pr(0, 0),
@@ -1609,8 +1747,13 @@ mod tests {
             ],
             "the expanded pull request carries its files"
         );
+        let three = [
+            pr_file("a.rs", 'M'),
+            pr_file("b.rs", 'A'),
+            pr_file("c.rs", 'D'),
+        ];
         assert_eq!(
-            build_rows(&panels, Some(7), 3),
+            flat(&panels, Some(7), &three),
             [
                 Row::Header(0),
                 Row::Pr(0, 0),
@@ -1626,11 +1769,50 @@ mod tests {
     }
 
     #[test]
+    fn the_tree_view_groups_files_under_their_folders() {
+        let panels = drawers(vec![pull(7, ReviewState::Pending)], vec![]);
+        let files = [
+            pr_file("src/a.rs", 'M'),
+            pr_file("src/deep/b.rs", 'A'),
+            pr_file("CLAUDE.md", 'M'),
+        ];
+        let mut nodes = Vec::new();
+        let (rows, depths) = build_rows(
+            &panels,
+            Some(7),
+            &files,
+            true,
+            &BTreeSet::new(),
+            &mut nodes,
+        );
+        assert_eq!(
+            rows,
+            [
+                Row::Header(0),
+                Row::Pr(0, 0),
+                Row::FileFolder(0),
+                Row::FileFolder(1),
+                Row::File(1),
+                Row::File(0),
+                Row::File(2),
+                Row::Header(1),
+                Row::Header(2),
+            ],
+            "folders lead at each level and files nest under them, exactly like SCM"
+        );
+        assert_eq!(depths, [0, 0, 0, 1, 2, 1, 0, 0, 0], "indent per row");
+        assert_eq!(nodes[0].path, "src");
+        assert_eq!(nodes[1].path, "src/deep");
+        assert!(nodes[0].expanded, "a folder holding files is open");
+    }
+
+    #[test]
     fn a_collapsed_drawer_hides_its_pull_requests() {
         let mut panels = drawers(vec![pull(7, ReviewState::Pending)], vec![]);
         panels[0].expanded = false;
+        let none: Vec<PrFile> = Vec::new();
         assert_eq!(
-            build_rows(&panels, None, 0),
+            flat(&panels, None, &none),
             [Row::Header(0), Row::Header(1), Row::Header(2)]
         );
     }
@@ -1687,7 +1869,7 @@ mod tests {
             additions: 12,
             deletions: 3,
         };
-        let text = joined(&file_spans(&file, 40));
+        let text = joined(&file_spans(&file, 0, 40));
         assert!(
             text.contains("app.rs"),
             "the name, not the whole path: {text}"
