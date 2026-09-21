@@ -22,7 +22,9 @@ use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 
 use herdr_sidebar::actions::copy_to_clipboard;
 use herdr_sidebar::icons::IconTheme;
-use herdr_sidebar::pr::{self, PrFile, PrFilter, PullRequest, ReviewState};
+use herdr_sidebar::pr::{
+    self, MergeMethod, PrFile, PrFilter, PullRequest, ReviewState, Thread, Verdict,
+};
 use herdr_sidebar::state::{self as sidebar, Exit, View};
 use herdr_sidebar::ui::{
     activity_button_style, activity_icons, draw_activity_caps, draw_scrollbar, hits,
@@ -75,8 +77,93 @@ struct Files {
 enum MenuAction {
     OpenOverview,
     OpenInBrowser,
+    Checkout,
+    Merge(MergeMethod),
+    Ready,
+    Review(Verdict),
+    Comment,
+    ResolveThreads,
     CopyUrl,
     CopyBranch,
+}
+
+impl MenuAction {
+    /// Whether running it changes the repository or the pull request, and so
+    /// goes through the y/N prompt first.
+    fn needs_confirm(self) -> bool {
+        matches!(self, Self::Checkout | Self::Merge(_))
+    }
+
+    /// Whether it asks for a body first. An approval does not need one;
+    /// a comment or a change request does.
+    fn needs_body(self) -> bool {
+        matches!(
+            self,
+            Self::Comment | Self::Review(Verdict::RequestChanges | Verdict::Comment)
+        )
+    }
+
+    /// The prompt shown while it runs.
+    fn progress(self, number: u64) -> String {
+        match self {
+            Self::Checkout => format!("checking out PR #{number}…"),
+            Self::Merge(method) => format!("{} PR #{number}…", method.label(),),
+            Self::Ready => format!("marking PR #{number} ready…"),
+            Self::Review(Verdict::Approve) => format!("approving PR #{number}…"),
+            Self::Review(Verdict::RequestChanges) => format!("requesting changes on PR #{number}…"),
+            Self::Review(Verdict::Comment) => format!("reviewing PR #{number}…"),
+            Self::Comment => format!("commenting on PR #{number}…"),
+            Self::ResolveThreads => format!("loading conversations of PR #{number}…"),
+            _ => format!("PR #{number}…"),
+        }
+    }
+
+    /// The confirmation question for a destructive action.
+    fn confirm_prompt(self, number: u64) -> String {
+        match self {
+            Self::Checkout => format!("Check out the branch of PR #{number}? (y/N)"),
+            Self::Merge(method) => {
+                format!("{} on PR #{number}? (y/N)", method.label())
+            }
+            _ => format!("Run this on PR #{number}? (y/N)"),
+        }
+    }
+}
+
+/// The context menu for one pull request, which depends on its state: a draft
+/// is offered "ready for review" instead of the merge options.
+fn menu_entries(pr: &PullRequest) -> Vec<MenuEntry> {
+    let mut entries = vec![
+        MenuEntry::Action(MenuAction::OpenOverview, "Open Pull Request"),
+        MenuEntry::Action(MenuAction::OpenInBrowser, "Open in Browser"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Checkout, "Checkout Branch"),
+    ];
+    if pr.draft {
+        entries.push(MenuEntry::Action(
+            MenuAction::Ready,
+            "Mark Ready for Review",
+        ));
+    } else {
+        for method in MergeMethod::ALL {
+            entries.push(MenuEntry::Action(MenuAction::Merge(method), method.label()));
+        }
+    }
+    entries.extend([
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Review(Verdict::Approve), "Approve"),
+        MenuEntry::Action(
+            MenuAction::Review(Verdict::RequestChanges),
+            "Request Changes…",
+        ),
+        MenuEntry::Action(MenuAction::Comment, "Comment…"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::ResolveThreads, "Resolve Conversations…"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::CopyUrl, "Copy URL"),
+        MenuEntry::Action(MenuAction::CopyBranch, "Copy Branch Name"),
+    ]);
+    entries
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +180,37 @@ enum Overlay {
         selected: usize,
         rect: Rect,
     },
+    /// The y/N prompt in front of a mutating action.
+    Confirm { number: u64, action: MenuAction },
+    /// A one-line body for a comment or a review.
+    Input {
+        number: u64,
+        action: MenuAction,
+        text: Vec<char>,
+        cursor: usize,
+    },
+    /// The pull request's unresolved conversations.
+    Threads {
+        number: u64,
+        threads: Vec<Thread>,
+        selected: usize,
+    },
+}
+
+/// A background operation with one result.
+enum Job {
+    /// A `gh` command that mutates something.
+    Command(Result<String, String>),
+    /// A pull request's review conversations.
+    Threads(Result<Vec<Thread>, String>),
+}
+
+/// What a finished job was for.
+#[derive(Clone, PartialEq, Eq)]
+enum JobKind {
+    Action,
+    Threads(u64),
+    Resolve(String),
 }
 
 /// Identity/label control of our own pane over the socket API.
@@ -141,6 +259,9 @@ pub struct App {
     /// One list fetch in flight: a second refresh would only queue latency.
     fetching: Option<Receiver<Page>>,
     files_rx: Option<Receiver<Files>>,
+    /// One mutating command or conversation fetch at a time: the overlays keep
+    /// the user from starting a second one.
+    job: Option<(JobKind, Receiver<Job>)>,
     last_refresh: Instant,
     overlay: Option<Overlay>,
     last_width: u16,
@@ -191,6 +312,7 @@ impl App {
             flash: None,
             fetching: None,
             files_rx: None,
+            job: None,
             last_refresh: Instant::now() - REFRESH_EVERY,
             overlay: None,
             last_width: 0,
@@ -315,6 +437,15 @@ impl App {
 
     /// Collect whatever the workers finished.
     fn poll(&mut self) {
+        if let Some((kind, receiver)) = self.job.take() {
+            match receiver.try_recv() {
+                Ok(job) => self.apply_job(kind, job),
+                Err(TryRecvError::Empty) => self.job = Some((kind, receiver)),
+                Err(TryRecvError::Disconnected) => {
+                    self.flash = Some(("gh exited without a result".into(), true));
+                }
+            }
+        }
         if let Some(receiver) = self.fetching.take() {
             let mut pages = Vec::new();
             let mut done = false;
@@ -512,16 +643,15 @@ impl App {
 
     /// `m`: the context menu of the selected pull request.
     fn open_menu(&mut self) {
-        let Some(number) = self.selected_pr_number() else {
+        let Some(index) = self.selected else { return };
+        let Some(&Row::Pr(drawer, i)) = self.rows.get(index) else {
             return;
         };
-        let entries = vec![
-            MenuEntry::Action(MenuAction::OpenOverview, "Open Pull Request"),
-            MenuEntry::Action(MenuAction::OpenInBrowser, "Open in Browser"),
-            MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::CopyUrl, "Copy URL"),
-            MenuEntry::Action(MenuAction::CopyBranch, "Copy Branch Name"),
-        ];
+        let Some(pr) = self.drawers[drawer].prs.get(i) else {
+            return;
+        };
+        let number = pr.number;
+        let entries = menu_entries(pr);
         self.overlay = Some(Overlay::Menu {
             number,
             entries,
@@ -533,16 +663,6 @@ impl App {
     fn run_menu_action(&mut self, number: u64, action: MenuAction) {
         match action {
             MenuAction::OpenOverview => self.open_overview(number),
-            MenuAction::OpenInBrowser => {
-                let root = self.cwd.clone();
-                std::thread::spawn(move || {
-                    let _ = std::process::Command::new("gh")
-                        .args(["pr", "view", &number.to_string(), "--web"])
-                        .current_dir(&root)
-                        .output();
-                });
-                self.flash = Some((format!("opening PR #{number} in the browser"), false));
-            }
             MenuAction::CopyUrl | MenuAction::CopyBranch => {
                 let Some(pr) = self.find_pr(number) else {
                     return;
@@ -557,6 +677,100 @@ impl App {
                     Err(e) => (format!("copy failed: {e}"), true),
                 });
             }
+            MenuAction::ResolveThreads => {
+                self.flash = Some((action.progress(number), false));
+                let root = self.cwd.clone();
+                let work = move || Job::Threads(pr::threads(&root, number));
+                self.spawn_job(JobKind::Threads(number), work);
+            }
+            _ if action.needs_confirm() => {
+                self.overlay = Some(Overlay::Confirm { number, action });
+            }
+            _ if action.needs_body() => {
+                self.overlay = Some(Overlay::Input {
+                    number,
+                    action,
+                    text: Vec::new(),
+                    cursor: 0,
+                });
+            }
+            _ => self.spawn_action(number, action, String::new()),
+        }
+    }
+
+    /// Run a mutating `gh` command on a worker thread.
+    fn spawn_action(&mut self, number: u64, action: MenuAction, body: String) {
+        self.flash = Some((action.progress(number), false));
+        let root = self.cwd.clone();
+        let work = move || {
+            let result = match action {
+                MenuAction::Checkout => pr::checkout(&root, number),
+                MenuAction::Merge(method) => pr::merge(&root, number, method),
+                MenuAction::Ready => pr::ready(&root, number),
+                MenuAction::Review(verdict) => pr::review(&root, number, verdict, &body),
+                MenuAction::Comment => pr::comment(&root, number, &body),
+                MenuAction::OpenInBrowser => pr::open_in_browser(&root, number),
+                _ => Ok(String::new()),
+            };
+            Job::Command(result)
+        };
+        self.spawn_job(JobKind::Action, work);
+    }
+
+    /// Run `work` on a worker thread; `poll` routes the result back by kind.
+    fn spawn_job<F>(&mut self, kind: JobKind, work: F)
+    where
+        F: FnOnce() -> Job + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        self.job = Some((kind, receiver));
+    }
+
+    /// Apply a finished background job.
+    fn apply_job(&mut self, kind: JobKind, job: Job) {
+        match (kind, job) {
+            (JobKind::Action, Job::Command(result)) => {
+                self.flash = Some(match result {
+                    Ok(text) => (summary_of(&text), false),
+                    Err(e) => (e, true),
+                });
+                self.refresh();
+            }
+            (JobKind::Threads(number), Job::Threads(result)) => match result {
+                Ok(threads) => {
+                    if threads.is_empty() {
+                        self.flash = Some(("no unresolved conversations".into(), false));
+                    } else {
+                        self.flash = None;
+                        self.overlay = Some(Overlay::Threads {
+                            number,
+                            threads,
+                            selected: 0,
+                        });
+                    }
+                }
+                Err(e) => self.flash = Some((e, true)),
+            },
+            (JobKind::Resolve(id), Job::Command(result)) => {
+                match result {
+                    Ok(_) => {
+                        if let Some(Overlay::Threads {
+                            threads, selected, ..
+                        }) = &mut self.overlay
+                        {
+                            threads.retain(|thread| thread.id != id);
+                            *selected = (*selected).min(threads.len().saturating_sub(1));
+                        }
+                        self.flash = Some(("conversation resolved".into(), false));
+                    }
+                    Err(e) => self.flash = Some((e, true)),
+                }
+                self.refresh();
+            }
+            _ => {}
         }
     }
 
@@ -623,45 +837,104 @@ impl App {
     }
 
     fn overlay_key(&mut self, key: KeyEvent) -> Option<Exit> {
-        match key.code {
-            KeyCode::Esc => self.overlay = None,
-            KeyCode::Char('j') | KeyCode::Down => self.step_menu(1),
-            KeyCode::Char('k') | KeyCode::Up => self.step_menu(-1),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(Overlay::Menu {
-                    number,
-                    entries,
-                    selected,
-                    ..
-                }) = self.overlay.take()
-                    && let Some(MenuEntry::Action(action, _)) = entries.get(selected)
-                {
-                    self.run_menu_action(number, *action);
+        // Read the key against the open overlay first, then act: every branch
+        // below needs `&mut self` for the action itself.
+        let mut chosen: Option<(u64, MenuAction)> = None;
+        let mut agreed: Option<bool> = None;
+        let mut submitted = false;
+        let mut resolve: Option<String> = None;
+        let mut close = false;
+        match &mut self.overlay {
+            Some(Overlay::Menu {
+                number,
+                entries,
+                selected,
+                ..
+            }) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Char('j') | KeyCode::Down => step_menu(entries, selected, 1),
+                KeyCode::Char('k') | KeyCode::Up => step_menu(entries, selected, -1),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(MenuEntry::Action(action, _)) = entries.get(*selected) {
+                        chosen = Some((*number, *action));
+                    }
                 }
+                _ => {}
+            },
+            Some(Overlay::Confirm { .. }) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => agreed = Some(true),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => agreed = Some(false),
+                _ => {}
+            },
+            Some(Overlay::Input { text, cursor, .. }) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Enter => submitted = true,
+                KeyCode::Backspace => {
+                    if *cursor > 0 {
+                        *cursor -= 1;
+                        text.remove(*cursor);
+                    }
+                }
+                KeyCode::Left => *cursor = cursor.saturating_sub(1),
+                KeyCode::Right => *cursor = (*cursor + 1).min(text.len()),
+                KeyCode::Char(character) if !character.is_control() => {
+                    text.insert(*cursor, character);
+                    *cursor += 1;
+                }
+                _ => {}
+            },
+            Some(Overlay::Threads {
+                threads, selected, ..
+            }) => match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    *selected = (*selected + 1).min(threads.len().saturating_sub(1));
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    resolve = threads.get(*selected).map(|thread| thread.id.clone());
+                }
+                _ => {}
+            },
+            None => {}
+        }
+        if close {
+            self.overlay = None;
+        }
+        if let Some((number, action)) = chosen {
+            self.overlay = None;
+            self.run_menu_action(number, action);
+        }
+        if let Some(agree) = agreed
+            && let Some(Overlay::Confirm { number, action }) = self.overlay.take()
+        {
+            if agree {
+                self.spawn_action(number, action, String::new());
+            } else {
+                self.flash = Some(("cancelled".into(), false));
             }
-            _ => {}
+        }
+        if submitted
+            && let Some(Overlay::Input {
+                number,
+                action,
+                text,
+                ..
+            }) = self.overlay.take()
+        {
+            let body: String = text.iter().collect();
+            self.spawn_action(number, action, body);
+        }
+        if let Some(id) = resolve {
+            self.flash = Some(("resolving conversation…".into(), false));
+            let root = self.cwd.clone();
+            let thread = id.clone();
+            let work = move || Job::Command(pr::resolve_thread(&root, &thread));
+            self.spawn_job(JobKind::Resolve(id), work);
         }
         None
-    }
-
-    fn step_menu(&mut self, direction: isize) {
-        let Some(Overlay::Menu {
-            entries, selected, ..
-        }) = &mut self.overlay
-        else {
-            return;
-        };
-        let mut index = *selected as isize;
-        loop {
-            index += direction;
-            if index < 0 || index >= entries.len() as isize {
-                return;
-            }
-            if matches!(entries[index as usize], MenuEntry::Action(..)) {
-                *selected = index as usize;
-                return;
-            }
-        }
     }
 
     pub fn on_mouse(&mut self, mouse: MouseEvent) -> Option<Exit> {
@@ -697,7 +970,15 @@ impl App {
                 }
                 let index = self.row_at(y)?;
                 self.select(index);
-                self.activate();
+                // The chevron column opens the file list; the rest of the row
+                // opens the request itself, the way VS Code splits the two.
+                if x <= self.body.x.saturating_add(1)
+                    && matches!(self.rows.get(index), Some(Row::Pr(..)))
+                {
+                    self.expand();
+                } else {
+                    self.activate();
+                }
             }
             _ => {}
         }
@@ -810,7 +1091,7 @@ impl App {
                         )
                     }
                     Row::Pr(drawer, i) => match self.drawers[drawer].prs.get(i) {
-                        Some(pr) => pr_item(pr, width),
+                        Some(pr) => pr_item(pr, self.expanded == Some(pr.number), width),
                         None => ListItem::new(Line::default()),
                     },
                     Row::File(i) => match self.files.get(i) {
@@ -898,6 +1179,26 @@ impl App {
     }
 
     fn footer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let modal: Option<String> = match &self.overlay {
+            Some(Overlay::Confirm { number, action }) => Some(action.confirm_prompt(*number)),
+            Some(Overlay::Input { action, .. }) => Some(
+                match action {
+                    MenuAction::Comment => "Comment — ⏎ to send, esc to cancel",
+                    _ => "Review body — ⏎ to send, esc to cancel",
+                }
+                .to_string(),
+            ),
+            Some(Overlay::Threads { .. }) => {
+                Some("⏎ resolves the conversation, esc closes".to_string())
+            }
+            _ => None,
+        };
+        if let Some(text) = modal {
+            return wrap_footer_message(&text, width, 4)
+                .into_iter()
+                .map(Line::from)
+                .collect();
+        }
         if let Some((text, is_error)) = &self.flash {
             let color = if *is_error {
                 palette().deleted
@@ -925,53 +1226,152 @@ impl App {
     }
 
     fn draw_overlay(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(Overlay::Menu {
-            entries,
-            selected,
-            rect,
-            ..
-        }) = &mut self.overlay
-        else {
-            return;
-        };
-        let width = entries
-            .iter()
-            .map(|entry| match entry {
-                MenuEntry::Action(_, label) => label.len() + 4,
-                MenuEntry::Separator => 0,
-            })
-            .max()
-            .unwrap_or(12)
-            .clamp(12, usize::from(area.width.saturating_sub(2)));
-        let height = (entries.len() as u16 + 2).min(area.height);
-        let popup = Rect {
-            x: area.x + (area.width.saturating_sub(width as u16)) / 2,
-            y: area.y + (area.height.saturating_sub(height)) / 2,
-            width: width as u16,
-            height,
-        };
-        *rect = popup;
-        frame.render_widget(Clear, popup);
-        let items: Vec<ListItem> = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| match entry {
-                MenuEntry::Separator => ListItem::new(Line::from(Span::raw(""))),
-                MenuEntry::Action(_, label) => {
-                    let line = Line::from(Span::raw(format!(" {label}")));
-                    if index == *selected {
-                        ListItem::new(line).style(selection_style(true))
-                    } else {
-                        ListItem::new(line)
-                    }
-                }
-            })
-            .collect();
-        frame.render_widget(
-            List::new(items).block(Block::bordered().border_style(Style::default().dim())),
-            popup,
-        );
+        match &mut self.overlay {
+            Some(Overlay::Menu {
+                entries,
+                selected,
+                rect,
+                ..
+            }) => {
+                let width = entries
+                    .iter()
+                    .map(|entry| match entry {
+                        MenuEntry::Action(_, label) => label.len() + 4,
+                        MenuEntry::Separator => 0,
+                    })
+                    .max()
+                    .unwrap_or(12)
+                    .clamp(12, usize::from(area.width.saturating_sub(2)));
+                let height = (entries.len() as u16 + 2).min(area.height);
+                let popup_rect = Rect {
+                    x: area.x + (area.width.saturating_sub(width as u16)) / 2,
+                    y: area.y + (area.height.saturating_sub(height)) / 2,
+                    width: width as u16,
+                    height,
+                };
+                *rect = popup_rect;
+                frame.render_widget(Clear, popup_rect);
+                let items: Vec<ListItem> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| match entry {
+                        MenuEntry::Separator => ListItem::new(Line::from(Span::raw(""))),
+                        MenuEntry::Action(_, label) => {
+                            let line = Line::from(Span::raw(format!(" {label}")));
+                            if index == *selected {
+                                ListItem::new(line).style(selection_style(true))
+                            } else {
+                                ListItem::new(line)
+                            }
+                        }
+                    })
+                    .collect();
+                frame.render_widget(
+                    List::new(items).block(Block::bordered().border_style(Style::default().dim())),
+                    popup_rect,
+                );
+            }
+            Some(Overlay::Confirm { number, action }) => {
+                popup(
+                    frame,
+                    area,
+                    &[Line::from(action.confirm_prompt(*number))],
+                    Some("Confirm"),
+                );
+            }
+            Some(Overlay::Input {
+                action,
+                text,
+                cursor,
+                ..
+            }) => {
+                let label = if matches!(action, MenuAction::Comment) {
+                    "Comment"
+                } else {
+                    "Review body"
+                };
+                let body: String = text.iter().collect();
+                let mut line = format!(" {label}: {body}");
+                let at = 1 + label.chars().count() + 2 + *cursor;
+                line.insert(at.min(line.len()), '│');
+                popup(frame, area, &[Line::from(line)], Some(label));
+            }
+            Some(Overlay::Threads {
+                number,
+                threads,
+                selected,
+            }) => {
+                let items: Vec<Line> = threads
+                    .iter()
+                    .enumerate()
+                    .map(|(index, thread)| {
+                        let line = Line::from(vec![
+                            Span::styled(
+                                format!(" {}:{} ", thread.path, thread.line),
+                                Style::default().fg(palette().modified),
+                            ),
+                            Span::styled(thread.snippet.clone(), Style::default()),
+                        ]);
+                        if index == *selected {
+                            line.style(selection_style(true))
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
+                popup(
+                    frame,
+                    area,
+                    &items,
+                    Some(&format!("Resolve conversation · PR #{number}")),
+                );
+            }
+            None => {}
+        }
     }
+}
+
+/// A centered bordered popup sized to `lines`.
+fn popup(frame: &mut Frame, area: Rect, lines: &[Line<'static>], title: Option<&str>) {
+    let content = lines.iter().map(Line::width).max().unwrap_or(12);
+    let width = (content as u16 + 4).clamp(16, area.width.saturating_sub(2).max(16));
+    let height = (lines.len() as u16 + 2).min(area.height.max(3));
+    let rect = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let mut block = Block::bordered().border_style(Style::default().dim());
+    if let Some(title) = title {
+        block = block.title(format!(" {title} "));
+    }
+    frame.render_widget(Paragraph::new(lines.to_vec()).block(block), rect);
+}
+
+/// Next selectable menu index in `direction`, staying put at the ends.
+fn step_menu(entries: &[MenuEntry], selected: &mut usize, direction: isize) {
+    let mut index = *selected as isize;
+    loop {
+        index += direction;
+        if index < 0 || index >= entries.len() as isize {
+            return;
+        }
+        if matches!(entries[index as usize], MenuEntry::Action(..)) {
+            *selected = index as usize;
+            return;
+        }
+    }
+}
+
+/// A one-line summary of a command's stdout (`gh` prints URLs and notices).
+fn summary_of(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| herdr_sidebar::ui::truncate_to(line.to_string(), 60))
+        .unwrap_or_else(|| "done".to_string())
 }
 
 /// The row list: every drawer header, its pull requests when open, and the
@@ -1019,26 +1419,30 @@ fn header_spans(
 }
 
 /// A pull-request row.
-fn pr_item(pr: &PullRequest, width: usize) -> ListItem<'static> {
-    ListItem::new(Line::from(pr_spans(pr, width)))
+fn pr_item(pr: &PullRequest, expanded: bool, width: usize) -> ListItem<'static> {
+    ListItem::new(Line::from(pr_spans(pr, expanded, width)))
 }
 
-/// A pull-request row's spans: number, review marker, draft note and title.
-fn pr_spans(pr: &PullRequest, width: usize) -> Vec<Span<'static>> {
+/// A pull-request row's spans: the expand chevron, number, review marker,
+/// draft note and title.
+fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>> {
     let marker = pr.review.glyph();
     let color = match pr.review {
         ReviewState::Approved => palette().untracked,
         ReviewState::ChangesRequested => palette().deleted,
         ReviewState::Pending => palette().modified,
     };
-    let prefix = format!("  #{} ", pr.number);
+    let chevron = if expanded { "▾" } else { "▸" };
+    let prefix = format!("#{} ", pr.number);
     let draft = if pr.draft { "draft " } else { "" };
     let text = format!("{draft}{}", pr.title);
     let room = width
-        .saturating_sub(prefix.chars().count() + marker.chars().count() + 3)
+        .saturating_sub(prefix.chars().count() + marker.chars().count() + 4)
         .max(4);
     let title = herdr_sidebar::ui::truncate_to(text, room);
     vec![
+        Span::styled(chevron, Style::default().dim()),
+        Span::raw(" "),
         Span::styled(prefix, Style::default().dim()),
         Span::styled(format!("{marker} "), Style::default().fg(color)),
         Span::raw(title),
@@ -1105,6 +1509,72 @@ mod tests {
         panels[2].expanded = true;
         panels[2].prs = open;
         panels
+    }
+
+    fn menu_labels(entries: &[MenuEntry]) -> Vec<&'static str> {
+        entries
+            .iter()
+            .filter_map(|entry| match entry {
+                MenuEntry::Action(_, label) => Some(*label),
+                MenuEntry::Separator => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_menu_offers_the_merge_options_or_ready_for_a_draft() {
+        let labels = menu_labels(&menu_entries(&pull(1, ReviewState::Pending)));
+        for want in [
+            "Open Pull Request",
+            "Open in Browser",
+            "Checkout Branch",
+            "Merge Commit",
+            "Squash and Merge",
+            "Rebase and Merge",
+            "Approve",
+            "Request Changes…",
+            "Comment…",
+            "Resolve Conversations…",
+            "Copy URL",
+            "Copy Branch Name",
+        ] {
+            assert!(labels.contains(&want), "missing {want}: {labels:?}");
+        }
+        assert!(!labels.contains(&"Mark Ready for Review"));
+        let mut draft = pull(2, ReviewState::Pending);
+        draft.draft = true;
+        let labels = menu_labels(&menu_entries(&draft));
+        assert!(labels.contains(&"Mark Ready for Review"), "{labels:?}");
+        assert!(!labels.contains(&"Merge Commit"), "a draft is not merged");
+    }
+
+    #[test]
+    fn only_repository_changes_ask_for_confirmation() {
+        assert!(MenuAction::Checkout.needs_confirm());
+        assert!(MenuAction::Merge(MergeMethod::Squash).needs_confirm());
+        assert!(!MenuAction::Comment.needs_confirm());
+        assert!(MenuAction::Comment.needs_body());
+        assert!(MenuAction::Review(Verdict::RequestChanges).needs_body());
+        assert!(!MenuAction::Review(Verdict::Approve).needs_body());
+        assert!(
+            MenuAction::Merge(MergeMethod::Commit)
+                .confirm_prompt(7)
+                .contains("#7")
+        );
+        assert!(
+            MenuAction::Merge(MergeMethod::Squash)
+                .progress(7)
+                .contains("Squash")
+        );
+    }
+
+    #[test]
+    fn summary_of_takes_the_first_meaningful_line() {
+        assert_eq!(
+            summary_of("\n\nhttps://github.com/o/r/pull/7#merged\n"),
+            "https://github.com/o/r/pull/7#merged"
+        );
+        assert_eq!(summary_of(""), "done");
     }
 
     #[test]
@@ -1175,13 +1645,27 @@ mod tests {
 
     #[test]
     fn pr_row_carries_number_review_marker_and_title() {
-        let spans = pr_spans(&pull(74, ReviewState::Approved), 40);
+        let spans = pr_spans(&pull(74, ReviewState::Approved), false, 40);
         let text = joined(&spans);
         assert!(text.contains("#74"), "{text}");
         assert!(text.contains("✓"), "{text}");
         assert!(text.contains("title 74"), "{text}");
-        assert_eq!(spans[1].style.fg, Some(palette().untracked), "approved");
-        let changed = joined(&pr_spans(&pull(75, ReviewState::ChangesRequested), 40));
+        assert_eq!(
+            spans[0].content, "▸",
+            "a closed request leads with its chevron"
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.style.fg == Some(palette().untracked))
+        );
+        let open = joined(&pr_spans(&pull(74, ReviewState::Approved), true, 40));
+        assert!(open.starts_with('▾'), "{open}");
+        let changed = joined(&pr_spans(
+            &pull(75, ReviewState::ChangesRequested),
+            false,
+            40,
+        ));
         assert!(changed.contains("✗"), "{changed}");
     }
 
@@ -1189,7 +1673,7 @@ mod tests {
     fn pr_row_marks_drafts() {
         let mut pr = pull(12, ReviewState::Pending);
         pr.draft = true;
-        assert!(joined(&pr_spans(&pr, 40)).contains("draft title 12"));
+        assert!(joined(&pr_spans(&pr, false, 40)).contains("draft title 12"));
     }
 
     #[test]

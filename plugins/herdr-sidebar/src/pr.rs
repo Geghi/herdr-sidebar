@@ -6,9 +6,12 @@
 use std::path::Path;
 use std::process::Command;
 
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use serde_json::Value;
 
 use crate::git::FileEntry;
+use crate::ui::palette;
 
 /// The `gh pr list --json` field list the rows are built from.
 const LIST_FIELDS: &str = "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,additions,deletions,changedFiles,reviewDecision";
@@ -289,7 +292,7 @@ fn unquote_path(raw: &str) -> String {
 
 /// The pull-request overview as markdown for the preview pane: what it is, who
 /// wrote it, the conversation so far.
-pub fn overview(root: &Path, number: u64) -> Result<String, String> {
+pub fn detail(root: &Path, number: u64) -> Result<Value, String> {
     let out = run(
         root,
         &[
@@ -300,69 +303,116 @@ pub fn overview(root: &Path, number: u64) -> Result<String, String> {
             OVERVIEW_FIELDS.into(),
         ],
     )?;
-    let value: Value = serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))?;
-    Ok(overview_markdown(&value))
+    serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))
 }
 
-/// Render the `gh pr view --json` value as markdown.
-pub fn overview_markdown(detail: &Value) -> String {
+/// The overview pane's lines: a styled header, the checks, then the
+/// description and the conversation, each rendered as markdown.
+pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
     let text = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("");
-    let number = detail.get("number").and_then(Value::as_u64).unwrap_or(0);
     let author = detail
         .get("author")
         .and_then(|author| author.get("login"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let draft = if detail
+    let number = detail.get("number").and_then(Value::as_u64).unwrap_or(0);
+    let draft = detail
         .get("isDraft")
         .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        " (draft)"
-    } else {
-        ""
-    };
-    let mut out = format!(
-        "# #{} {}{}\n\n**@{}** · `{}` → `{}` · {} · +{} −{} · {} files\n\n{}\n",
-        number,
-        text("title"),
-        draft,
-        author,
-        text("headRefName"),
-        text("baseRefName"),
-        text("state").to_lowercase(),
-        detail.get("additions").and_then(Value::as_u64).unwrap_or(0),
-        detail.get("deletions").and_then(Value::as_u64).unwrap_or(0),
-        detail
-            .get("changedFiles")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        text("url"),
-    );
-    let decision = match parse_review(detail.get("reviewDecision").and_then(Value::as_str)) {
-        ReviewState::Approved => "\n**Review: approved**\n",
-        ReviewState::ChangesRequested => "\n**Review: changes requested**\n",
-        ReviewState::Pending => "",
-    };
-    out.push_str(decision);
-    if let Some(checks) = checks_summary(detail.get("statusCheckRollup")) {
-        out.push_str(&format!("\n**Checks:** {checks}\n"));
+        .unwrap_or(false);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    // Title: the number reads as a badge, the title carries the weight.
+    let mut title = vec![Span::styled(
+        format!("#{number}  "),
+        Style::default().fg(palette().header_accent),
+    )];
+    title.push(Span::styled(
+        text("title").to_string(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    if draft {
+        title.push(Span::styled(
+            "  draft",
+            Style::default().fg(palette().modified),
+        ));
     }
+    out.push(Line::from(title));
+    // Branches, size, author.
+    out.push(Line::from(vec![
+        Span::styled(format!("@{author}"), Style::default().fg(palette().accent)),
+        Span::styled(
+            format!(
+                "  {} → {}  ·  {}  ·  +{} −{}  ·  {} files",
+                text("headRefName"),
+                text("baseRefName"),
+                text("state").to_lowercase(),
+                detail.get("additions").and_then(Value::as_u64).unwrap_or(0),
+                detail.get("deletions").and_then(Value::as_u64).unwrap_or(0),
+                detail
+                    .get("changedFiles")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            ),
+            Style::default().dim(),
+        ),
+    ]));
+    if let Some((glyph, label, color)) =
+        review_line(detail.get("reviewDecision").and_then(Value::as_str))
+    {
+        out.push(Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(label, Style::default().fg(color)),
+        ]));
+    }
+    if let Some(checks) = checks_summary(detail.get("statusCheckRollup")) {
+        out.push(checks);
+    }
+    out.push(Line::from(Span::styled(
+        text("url").to_string(),
+        Style::default().dim(),
+    )));
+    out.push(rule(width));
+
     let body = text("body").trim();
     if !body.is_empty() {
-        out.push_str("\n## Description\n\n");
-        out.push_str(body);
-        out.push('\n');
+        out.extend(crate::markdown::render(body, width));
+        out.push(rule(width));
     }
-    if let Some(comments) = conversation(detail.get("comments"), detail.get("reviews")) {
-        out.push_str("\n## Conversation\n\n");
-        out.push_str(&comments);
+    if let Some(conversation) = conversation(detail.get("comments"), detail.get("reviews"), width) {
+        out.push(Line::from(Span::styled(
+            "Conversation",
+            Style::default()
+                .fg(palette().header_accent)
+                .add_modifier(Modifier::BOLD),
+        )));
+        out.push(Line::default());
+        out.extend(conversation);
     }
     out
 }
 
-/// `✓ 3 passed · ✗ 1 failed · ○ 2 pending` from `statusCheckRollup`.
-fn checks_summary(rollup: Option<&Value>) -> Option<String> {
+/// A full-width dim rule.
+fn rule(width: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.clamp(8, 80)),
+        Style::default().dim(),
+    ))
+}
+
+/// The review decision as (glyph, label, color), or `None` when undecided.
+fn review_line(
+    decision: Option<&str>,
+) -> Option<(&'static str, &'static str, ratatui::style::Color)> {
+    match parse_review(decision) {
+        ReviewState::Approved => Some(("✓", "approved", palette().untracked)),
+        ReviewState::ChangesRequested => Some(("✗", "changes requested", palette().deleted)),
+        ReviewState::Pending => None,
+    }
+}
+
+/// `✓ 3 passed · ✗ 1 failed · ○ 2 pending` as a styled line.
+fn checks_summary(rollup: Option<&Value>) -> Option<Line<'static>> {
     let items = rollup?.as_array()?;
     if items.is_empty() {
         return None;
@@ -384,21 +434,31 @@ fn checks_summary(rollup: Option<&Value>) -> Option<String> {
     let passed = count(&["SUCCESS", "NEUTRAL"]);
     let failed = count(&["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT"]);
     let pending = items.len() - passed - failed;
-    let mut parts: Vec<String> = Vec::new();
-    if passed > 0 {
-        parts.push(format!("✓ {passed} passed"));
+    let mut spans = vec![Span::styled("checks  ", Style::default().dim())];
+    let mut push = |glyph: &str, count: usize, label: &str, color: ratatui::style::Color| {
+        if count > 0 {
+            spans.push(Span::styled(
+                format!("{glyph} {count} {label}"),
+                Style::default().fg(color),
+            ));
+            spans.push(Span::styled("   ", Style::default().dim()));
+        }
+    };
+    push("✓", passed, "passed", palette().untracked);
+    push("✗", failed, "failed", palette().deleted);
+    push("○", pending, "pending", palette().modified);
+    while matches!(spans.last(), Some(span) if span.content == "   ") {
+        spans.pop();
     }
-    if failed > 0 {
-        parts.push(format!("✗ {failed} failed"));
-    }
-    if pending > 0 {
-        parts.push(format!("○ {pending} pending"));
-    }
-    (!parts.is_empty()).then(|| parts.join(" · "))
+    Some(Line::from(spans))
 }
 
-/// Comments and reviews, oldest first, as markdown.
-fn conversation(comments: Option<&Value>, reviews: Option<&Value>) -> Option<String> {
+/// Comments and reviews, oldest first, as markdown under a styled byline.
+fn conversation(
+    comments: Option<&Value>,
+    reviews: Option<&Value>,
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
     let mut entries: Vec<(String, String, String)> = Vec::new();
     for item in comments.and_then(Value::as_array).into_iter().flatten() {
         let author = item
@@ -417,7 +477,7 @@ fn conversation(comments: Option<&Value>, reviews: Option<&Value>) -> Option<Str
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
-                format!("**@{author}** commented"),
+                format!("@{author} commented"),
                 body.to_string(),
             ));
         }
@@ -435,10 +495,10 @@ fn conversation(comments: Option<&Value>, reviews: Option<&Value>) -> Option<Str
             .unwrap_or("")
             .trim();
         let head = match state {
-            "APPROVED" => format!("**@{author}** approved"),
-            "CHANGES_REQUESTED" => format!("**@{author}** requested changes"),
-            "DISMISSED" => format!("**@{author}**'s review was dismissed"),
-            _ => format!("**@{author}** reviewed"),
+            "APPROVED" => format!("@{author} approved"),
+            "CHANGES_REQUESTED" => format!("@{author} requested changes"),
+            "DISMISSED" => format!("@{author}'s review was dismissed"),
+            _ => format!("@{author} reviewed"),
         };
         if !body.is_empty() || state != "COMMENTED" {
             entries.push((
@@ -455,16 +515,264 @@ fn conversation(comments: Option<&Value>, reviews: Option<&Value>) -> Option<Str
         return None;
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out = String::new();
+    let mut out = Vec::new();
     for (stamp, head, body) in entries {
         let day = stamp.split('T').next().unwrap_or(&stamp);
-        out.push_str(&format!("{head} · {day}\n\n"));
+        out.push(Line::from(vec![
+            Span::styled(head, Style::default().fg(palette().accent)),
+            Span::styled(format!("  ·  {day}"), Style::default().dim()),
+        ]));
         if !body.is_empty() {
-            out.push_str(&body);
-            out.push_str("\n\n");
+            out.extend(crate::markdown::render(&body, width));
         }
+        out.push(Line::default());
     }
     Some(out)
+}
+
+/// What `gh pr merge` does with the branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    Commit,
+    Squash,
+    Rebase,
+}
+
+impl MergeMethod {
+    pub const ALL: [MergeMethod; 3] = [Self::Commit, Self::Squash, Self::Rebase];
+
+    /// The `gh pr merge` flag.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Commit => "--merge",
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Commit => "Merge Commit",
+            Self::Squash => "Squash and Merge",
+            Self::Rebase => "Rebase and Merge",
+        }
+    }
+}
+
+/// The verdict `gh pr review` sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl Verdict {
+    /// The `gh pr review` flag.
+    pub fn flag(self) -> &'static str {
+        match self {
+            Self::Approve => "--approve",
+            Self::RequestChanges => "--request-changes",
+            Self::Comment => "--comment",
+        }
+    }
+}
+
+/// The arguments `gh pr merge` runs with.
+pub fn merge_args(number: u64, method: MergeMethod) -> Vec<String> {
+    vec![
+        "pr".into(),
+        "merge".into(),
+        number.to_string(),
+        method.flag().into(),
+    ]
+}
+
+/// The arguments `gh pr review` runs with.
+pub fn review_args(number: u64, verdict: Verdict, body: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "pr".into(),
+        "review".into(),
+        number.to_string(),
+        verdict.flag().into(),
+    ];
+    if !body.trim().is_empty() {
+        args.push("--body".into());
+        args.push(body.trim().to_string());
+    }
+    args
+}
+
+/// Check the pull request's branch out into the working tree.
+pub fn checkout(root: &Path, number: u64) -> Result<String, String> {
+    run(root, &["pr".into(), "checkout".into(), number.to_string()])
+}
+
+/// Merge the pull request with `method`.
+pub fn merge(root: &Path, number: u64, method: MergeMethod) -> Result<String, String> {
+    run(root, &merge_args(number, method))
+}
+
+/// Comment on the pull request.
+pub fn comment(root: &Path, number: u64, body: &str) -> Result<String, String> {
+    run(
+        root,
+        &[
+            "pr".into(),
+            "comment".into(),
+            number.to_string(),
+            "--body".into(),
+            body.to_string(),
+        ],
+    )
+}
+
+/// Send a review with `verdict`.
+pub fn review(root: &Path, number: u64, verdict: Verdict, body: &str) -> Result<String, String> {
+    run(root, &review_args(number, verdict, body))
+}
+
+/// Mark a draft pull request ready for review.
+pub fn ready(root: &Path, number: u64) -> Result<String, String> {
+    run(root, &["pr".into(), "ready".into(), number.to_string()])
+}
+
+/// Open the pull request in the browser.
+pub fn open_in_browser(root: &Path, number: u64) -> Result<String, String> {
+    run(
+        root,
+        &[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--web".into(),
+        ],
+    )
+}
+
+/// One review conversation of a pull request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Thread {
+    /// The GraphQL node id `resolveReviewThread` needs.
+    pub id: String,
+    pub path: String,
+    pub line: u64,
+    pub author: String,
+    /// The first comment's text, one line.
+    pub snippet: String,
+}
+
+/// The pull request's unresolved review conversations.
+pub fn threads(root: &Path, number: u64) -> Result<Vec<Thread>, String> {
+    let (owner, repo) = repo_slug(root)?;
+    let query = "query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{id isResolved path line comments(first:1){nodes{body author{login}}}}}}}}";
+    let out = run(
+        root,
+        &[
+            "api".into(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={query}"),
+            "-f".into(),
+            format!("owner={owner}"),
+            "-f".into(),
+            format!("repo={repo}"),
+            "-F".into(),
+            format!("number={number}"),
+        ],
+    )?;
+    let value: Value = serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))?;
+    Ok(parse_threads(&value))
+}
+
+/// The unresolved threads in a `reviewThreads` GraphQL response.
+pub fn parse_threads(value: &Value) -> Vec<Thread> {
+    let nodes = value
+        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+        .and_then(Value::as_array);
+    let mut out = Vec::new();
+    for node in nodes.into_iter().flatten() {
+        if node
+            .get("isResolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(id) = node.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let comment = node
+            .pointer("/comments/nodes/0")
+            .and_then(|comment| comment.as_object());
+        let snippet = comment
+            .and_then(|comment| comment.get("body"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        out.push(Thread {
+            id: id.to_string(),
+            path: node
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            line: node.get("line").and_then(Value::as_u64).unwrap_or(0),
+            author: comment
+                .and_then(|comment| comment.get("author"))
+                .and_then(|author| author.get("login"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            snippet,
+        });
+    }
+    out
+}
+
+/// Mark a review conversation resolved.
+pub fn resolve_thread(root: &Path, thread_id: &str) -> Result<String, String> {
+    let query = "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}";
+    run(
+        root,
+        &[
+            "api".into(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={query}"),
+            "-f".into(),
+            format!("id={thread_id}"),
+        ],
+    )
+}
+
+/// The repository's `owner/name`, as `gh` resolves it for the remote.
+fn repo_slug(root: &Path) -> Result<(String, String), String> {
+    let out = run(
+        root,
+        &[
+            "repo".into(),
+            "view".into(),
+            "--json".into(),
+            "owner,name".into(),
+        ],
+    )?;
+    let value: Value = serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))?;
+    let owner = value
+        .pointer("/owner/login")
+        .and_then(Value::as_str)
+        .ok_or("gh repo view: no owner")?
+        .to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("gh repo view: no name")?
+        .to_string();
+    Ok((owner, name))
 }
 
 /// Run `gh` in `root`, returning stdout, with stderr's first line as the error.
@@ -526,6 +834,57 @@ mod tests {
             "#74 FacuVCanale feat/image-preview → main +2008 −132"
         );
         assert_eq!(prs[2].changed_files, 1);
+    }
+
+    #[test]
+    fn merge_and_review_args_carry_the_flag_and_body() {
+        assert_eq!(
+            merge_args(7, MergeMethod::Squash),
+            ["pr", "merge", "7", "--squash"]
+        );
+        assert_eq!(
+            review_args(7, Verdict::Approve, ""),
+            ["pr", "review", "7", "--approve"],
+            "an empty body adds no --body"
+        );
+        assert_eq!(
+            review_args(7, Verdict::RequestChanges, "  please split  "),
+            [
+                "pr",
+                "review",
+                "7",
+                "--request-changes",
+                "--body",
+                "please split"
+            ]
+        );
+        assert_eq!(MergeMethod::Rebase.flag(), "--rebase");
+        assert_eq!(MergeMethod::Commit.label(), "Merge Commit");
+        assert_eq!(Verdict::Comment.flag(), "--comment");
+    }
+
+    #[test]
+    fn unresolved_threads_parse_from_the_graphql_response() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+              {"id":"T1","isResolved":false,"path":"src/app.rs","line":12,
+               "comments":{"nodes":[{"body":"rename this\nsecond line","author":{"login":"bob"}}]}},
+              {"id":"T2","isResolved":true,"path":"a","line":1,
+               "comments":{"nodes":[{"body":"done","author":{"login":"ann"}}]}},
+              {"id":"T3","isResolved":false,"path":"lib.rs","line":0,
+               "comments":{"nodes":[{"body":"nit","author":{"login":"cid"}}]}}
+            ]}}}}}"#,
+        )
+        .unwrap();
+        let threads = parse_threads(&value);
+        assert_eq!(threads.len(), 2, "resolved conversations drop out");
+        assert_eq!(threads[0].id, "T1");
+        assert_eq!(threads[0].path, "src/app.rs");
+        assert_eq!(threads[0].line, 12);
+        assert_eq!(threads[0].author, "bob");
+        assert_eq!(threads[0].snippet, "rename this", "one line only");
+        assert_eq!(threads[1].snippet, "nit");
+        assert!(parse_threads(&serde_json::json!({})).is_empty());
     }
 
     #[test]
@@ -613,6 +972,19 @@ index 555..666 100644
         assert!(patch_for_file("", "any.rs").is_none());
     }
 
+    fn joined(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn overview_renders_the_pr_and_its_conversation() {
         let detail: Value = serde_json::from_str(
@@ -630,19 +1002,32 @@ index 555..666 100644
                             "submittedAt":"2026-09-21T08:00:00Z"}]}"#,
         )
         .unwrap();
-        let md = overview_markdown(&detail);
-        assert!(md.starts_with("# #74 feat: previews\n"));
-        assert!(md.contains("**@Facu** · `feat/x` → `main` · open · +10 −2 · 3 files"));
-        assert!(md.contains("**Review: approved**"));
-        assert!(md.contains("**Checks:** ✓ 2 passed · ✗ 1 failed · ○ 1 pending"));
-        assert!(md.contains("## Description"));
-        assert!(md.contains("Adds full-resolution previews."));
-        assert!(md.contains("## Conversation"));
-        let changes = md.find("requested changes").unwrap();
-        let nit = md.find("nit: rename this").unwrap();
-        let approved = md.find("approved · 2026-09-21").unwrap();
+        let lines = render_overview(&detail, 60);
+        let all = joined(&lines);
+        assert!(all.contains("#74  feat: previews"), "{all}");
+        assert!(all.contains("@Facu"), "{all}");
+        assert!(all.contains("feat/x → main"), "{all}");
+        assert!(all.contains("+10 −2"), "{all}");
+        assert!(all.contains("3 files"), "{all}");
+        assert!(all.contains("✓ approved"), "{all}");
+        assert!(all.contains("✓ 2 passed"), "{all}");
+        assert!(all.contains("✗ 1 failed"), "{all}");
+        assert!(all.contains("○ 1 pending"), "{all}");
+        assert!(all.contains("Adds full-resolution previews."), "{all}");
+        assert!(!all.contains("**"), "markdown markers are gone: {all}");
+        assert!(all.contains("Conversation"), "{all}");
+        let changes = all.find("requested changes").unwrap();
+        let nit = all.find("nit: rename this").unwrap();
+        let approved = all.find("approved  ·  2026-09-21").unwrap();
         assert!(changes < nit, "oldest first");
         assert!(nit < approved);
+        // The title is the one bold span, the number carries the accent.
+        let title = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "#74  ")
+            .unwrap();
+        assert_eq!(title.style.fg, Some(palette().header_accent));
     }
 
     #[test]
@@ -652,17 +1037,14 @@ index 555..666 100644
                 "headRefName":"a","baseRefName":"b","body":"   ","url":"u"}"#,
         )
         .unwrap();
-        let md = overview_markdown(&detail);
+        let all = joined(&render_overview(&detail, 60));
+        assert!(!all.contains("Conversation"), "{all}");
         assert!(
-            !md.contains("## Description"),
-            "a blank body adds no section"
+            !all.contains("checks"),
+            "no rollup adds no checks line: {all}"
         );
-        assert!(!md.contains("## Conversation"));
-        assert!(!md.contains("**Checks:**"));
-        assert!(
-            !md.contains("**Review:"),
-            "an undecided review adds no line"
-        );
-        assert!(md.contains("· open ·"), "the PR state is in the header");
+        assert!(!all.contains("approved"), "{all}");
+        assert!(all.contains("#1  t"), "{all}");
+        assert!(all.contains("open"), "{all}");
     }
 }

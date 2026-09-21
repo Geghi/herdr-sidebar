@@ -91,8 +91,12 @@ Use the mouse or press `1`, `2`, and `3`.
   rendered as markdown); `→`/`l` expands the files it touches right in the sidebar, and
   `Enter` on one shows that file's diff in the pull request — the same diff view the Changes
   section uses.
-- `m` offers the pull request's menu: open it, open it in the browser, copy its URL or its
-  branch name.
+- `m` opens the pull request menu: checkout its branch, merge it (merge commit, squash or
+  rebase — each behind a `y/N` prompt), approve it, request changes, comment, resolve its
+  conversations, or open it in the browser / copy its URL or branch name.
+- The overview is laid out for the terminal (title, branches, churn, checks and conversation
+  in colour), and markdown bodies render through the pane's own renderer — `glow` is used
+  when installed, but its absence no longer means reading raw `#`/`**` markers.
 - Needs the GitHub CLI (`gh`) installed and authenticated; without it the view says so
   instead of showing an empty list.
 

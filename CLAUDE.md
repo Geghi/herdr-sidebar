@@ -744,8 +744,18 @@ HACKING.md — budget time for that before promising a patched build.
   (`pr::files` via `gh api .../pulls/<n>/files`, rendered with the panel's own row anatomy),
   and `Enter` on one opens `diff <root> <path> pr:<n>` — `load_diff` runs `gh pr diff <n>`
   once and slices the file's section with `pr::patch_for_file`, so it renders through
-  `diffview` exactly like a Changes diff. `m` carries the pull request menu (overview /
-  browser / copy URL / copy branch).
+  `diffview` exactly like a Changes diff. `m` carries the menu: checkout, the three merge
+  methods, approve / request changes / comment, resolve conversations, browser, copy.
+  Destructive ones go through `Overlay::Confirm` (y/N), bodies through `Overlay::Input` (a
+  one-line editor: chars, backspace, arrows, ⏎ to send, esc to cancel), conversations through
+  `Overlay::Threads` (a GraphQL `reviewThreads` fetch, resolved one by one with
+  `resolveReviewThread`). Every mutating call is a `Job` on a worker thread with a `JobKind`
+  so `poll()` routes the result back; the overlays keep a second job from starting.
+- **`markdown.rs` is the pane's own markdown renderer** (headings, emphasis, inline code,
+  links, lists, task boxes, quotes, fenced code, rules and aligned tables, HTML comments
+  stripped): it draws a pull request's overview (`pr::render_overview` — title, branches,
+  churn, checks and conversation in colour) and it is the FALLBACK for markdown FILES when
+  `glow` is missing, because a raw `#`/`**` dump is not a preview.
   **`gh` is a NETWORK cli with no timeout of its own**: every call runs on a worker thread
   and lands in the App through a channel polled from `tick()` (`refresh` sends one page per
   drawer, `toggle_files` one file list), so the pane never blocks; `run_prs` in main.rs ticks

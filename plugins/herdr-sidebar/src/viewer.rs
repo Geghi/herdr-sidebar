@@ -710,19 +710,12 @@ fn load(request: &Request) -> Doc {
 fn load_pr(root: &Path, number: u64) -> Doc {
     let name = format!("PR #{number}");
     let context = format!("pull request #{number} — {}", root.display());
-    let lines = match crate::pr::overview(root, number) {
+    let width = crossterm::terminal::size()
+        .map(|(width, _)| usize::from(width))
+        .unwrap_or(100);
+    let lines = match crate::pr::detail(root, number) {
         Err(e) => vec![Line::raw(format!("({e})"))],
-        Ok(markdown) => {
-            let width = crossterm::terminal::size()
-                .map(|(width, _)| width)
-                .unwrap_or(100);
-            glow_markdown(&markdown, width).unwrap_or_else(|| {
-                markdown
-                    .lines()
-                    .map(|line| Line::raw(line.to_string()))
-                    .collect()
-            })
-        }
+        Ok(detail) => crate::pr::render_overview(&detail, width),
     };
     Doc {
         name,
@@ -1284,18 +1277,18 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; fall back to syntax highlight on failure.
-                // Width is approximated by subtracting 6 for the sidebar share and
-                // line-number gutter; ideal fix is to pass body.width from draw_doc.
+                // Markdown: render via glow; without it the pane's own renderer
+                // takes over (a raw `#`/`**` dump is not a preview).
                 let glow_width = crossterm::terminal::size()
                     .map(|(w, _)| w.saturating_sub(6))
                     .unwrap_or(74);
-                let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, glow_width))
-                    .flatten();
-                // Glow-rendered markdown gets no line numbers (it formats its own layout).
-                let numbered = glow_rendered.is_none();
-                let mut lines: Vec<Line<'static>> = if let Some(rendered) = glow_rendered {
+                let rendered = (is_markdown && target_line.is_none()).then(|| {
+                    glow_markdown(&text, glow_width)
+                        .unwrap_or_else(|| crate::markdown::render(&text, usize::from(glow_width)))
+                });
+                // Rendered markdown gets no line numbers (it lays itself out).
+                let numbered = rendered.is_none();
+                let mut lines: Vec<Line<'static>> = if let Some(rendered) = rendered {
                     rendered
                 } else {
                     crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
