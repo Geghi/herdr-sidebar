@@ -4262,8 +4262,7 @@ impl App {
                     }
                     Row::DrawerLine(kind, i) => {
                         let panel = &self.drawers[kind.index()];
-                        let expanded = self.graph_line_expanded(kind, i);
-                        drawer_line(kind, &panel.lines[i], panel.graph.get(i), expanded)
+                        drawer_line(kind, &panel.lines[i], panel.graph.get(i))
                     }
                     // An expanded commit's files read like the tree's file rows
                     // one level down, so the panel has a single file anatomy.
@@ -5003,11 +5002,8 @@ fn drawer_line(
     kind: Drawer,
     text: &str,
     graph_row: Option<&commit_graph::GraphRow>,
-    expanded: bool,
 ) -> ListItem<'static> {
-    ListItem::new(Line::from(drawer_line_spans(
-        kind, text, graph_row, expanded,
-    )))
+    ListItem::new(Line::from(drawer_line_spans(kind, text, graph_row)))
 }
 
 /// The spans of one drawer line: a GRAPH line leads with its lane glyphs, each
@@ -5017,7 +5013,6 @@ fn drawer_line_spans(
     kind: Drawer,
     text: &str,
     graph_row: Option<&commit_graph::GraphRow>,
-    expanded: bool,
 ) -> Vec<Span<'static>> {
     let style = match kind {
         Drawer::Branches if text.starts_with('*') => {
@@ -5028,12 +5023,10 @@ fn drawer_line_spans(
     let Some(row) = graph_row else {
         return vec![Span::styled(format!("   {text}"), style)];
     };
-    // The chevron takes the column LEFT of the first lane, so a commit reads as
-    // expandable without shifting the graph or costing any width.
-    let mut spans: Vec<Span> = vec![Span::styled(
-        if expanded { "▾" } else { "▸" },
-        Style::default().dim(),
-    )];
+    // No disclosure chevron: the first lane starts at the row's left edge like
+    // every other drawer's content, and an expanded commit is told by its
+    // inline file rows underneath.
+    let mut spans: Vec<Span> = Vec::with_capacity(row.cells.len() + 3);
     for cell in &row.cells {
         // The commit dot is the landmark; the rails around it stay quiet so
         // they read as structure rather than as content.
@@ -5690,23 +5683,20 @@ mod tests {
             },
         ];
         let rows = commit_graph::layout(&commits);
-        let spans = drawer_line_spans(Drawer::Graph, "m (main) merge", Some(&rows[0]), false);
+        let spans = drawer_line_spans(Drawer::Graph, "m (main) merge", Some(&rows[0]));
         assert_eq!(
-            spans[0].content, "▸",
-            "the chevron sits left of the first lane"
+            spans[0].content, "●",
+            "no chevron: the first lane cell is the row's first span"
         );
-        assert_eq!(spans[1].content, "●");
-        assert_eq!(spans[1].style.fg, Some(lane_color(0)));
-        assert_eq!(spans[2].content, "╮");
-        assert_eq!(spans[2].style.fg, Some(lane_color(1)));
-        assert_eq!(spans[3].content, " ");
-        assert_eq!(spans[4].content, "m", "the hash is its own dim span");
-        assert!(spans[4].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(spans[5].content, " (main) merge");
-        let expanded = drawer_line_spans(Drawer::Graph, "m (main) merge", Some(&rows[0]), true);
-        assert_eq!(expanded[0].content, "▾");
+        assert_eq!(spans[0].style.fg, Some(lane_color(0)));
+        assert_eq!(spans[1].content, "╮");
+        assert_eq!(spans[1].style.fg, Some(lane_color(1)));
+        assert_eq!(spans[2].content, " ");
+        assert_eq!(spans[3].content, "m", "the hash is its own dim span");
+        assert!(spans[3].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(spans[4].content, " (main) merge");
         // Every other drawer keeps the plain indent and no lane spans.
-        let plain = drawer_line_spans(Drawer::Commits, "abc subject", None, false);
+        let plain = drawer_line_spans(Drawer::Commits, "abc subject", None);
         assert_eq!(plain.len(), 1);
         assert_eq!(plain[0].content, "   abc subject");
     }
