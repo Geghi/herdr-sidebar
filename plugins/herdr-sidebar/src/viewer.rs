@@ -27,6 +27,7 @@ use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
+use crate::pr::{MergeMethod, Mergeability, merge_state};
 use crate::ui::{icon_style as ui_icon_style, palette};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
@@ -326,7 +327,20 @@ struct Doc {
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
     pending_src: Option<usize>,
+    /// A pull request's merge context: where to run `gh`, which request,
+    /// and the fetched overview JSON (mergeability, state). `None` for
+    /// every other doc. The overview carries the footer merge button from
+    /// this.
+    pr_target: Option<PrTarget>,
     selection: PreviewSelection,
+}
+
+/// What the overview's footer merge button needs: the repo to run `gh` in,
+/// the request number, and its `gh pr view` JSON for the mergeability.
+struct PrTarget {
+    root: PathBuf,
+    number: u64,
+    detail: serde_json::Value,
 }
 
 struct MediaPreview {
@@ -696,6 +710,7 @@ fn load(request: &Request) -> Doc {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            pr_target: None,
             selection: PreviewSelection::default(),
         },
         Request::File { path, line } => load_file(path, *line),
@@ -705,18 +720,26 @@ fn load(request: &Request) -> Doc {
     }
 }
 
-/// A pull request's overview: `gh pr view` rendered as a structured native
-/// summary, so the pane carries the description, the checks and the
-/// conversation the way GitHub shows them.
+/// A pull request's overview: `gh pr view` rendered VS Code style, so the
+/// pane carries the description, the checks and the conversation the way
+/// GitHub shows them — with a merge button in the footer. The fetched JSON
+/// stays on the doc for the button's mergeability.
 fn load_pr(root: &Path, number: u64) -> Doc {
     let name = format!("PR #{number}");
     let context = format!("pull request #{number} — {}", root.display());
     let width = crossterm::terminal::size()
         .map(|(width, _)| usize::from(width))
         .unwrap_or(100);
-    let lines = match crate::pr::detail(root, number) {
-        Err(e) => vec![Line::raw(format!("({e})"))],
-        Ok(detail) => crate::pr::render_overview(&detail, width),
+    let (lines, pr_target) = match crate::pr::detail(root, number) {
+        Err(e) => (vec![Line::raw(format!("({e})"))], None),
+        Ok(detail) => (
+            crate::pr::render_overview(&detail, width),
+            Some(PrTarget {
+                root: root.to_path_buf(),
+                number,
+                detail,
+            }),
+        ),
     };
     Doc {
         name,
@@ -729,6 +752,7 @@ fn load_pr(root: &Path, number: u64) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target,
         selection: PreviewSelection::default(),
     }
 }
@@ -766,6 +790,7 @@ fn loading_doc(request: &Request) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -818,6 +843,65 @@ impl Prompt {
             }
         }
     }
+}
+
+/// The overview footer's merge button: its click zones are stashed here
+/// each frame so the event loop can hit-test them (terminals emit no
+/// "mouse left the pane", so zones are only valid while drawn).
+struct MergeUi {
+    /// The `[✓ Merge ▾]` button — empty when no button is shown.
+    button: Rect,
+    /// The method dropdown's row block, when open.
+    menu_rect: Rect,
+    menu_open: bool,
+    /// The method the closed button would merge with (what the dropdown
+    /// opens on and what `[y]` confirms).
+    current: MergeMethod,
+    /// The highlighted method inside the drop down.
+    sel: usize,
+    /// Awaiting a [y]es/[N]o on this method.
+    confirm: Option<MergeMethod>,
+    /// `gh pr merge` is running with this method.
+    running: Option<MergeMethod>,
+}
+
+impl Default for MergeUi {
+    fn default() -> Self {
+        Self {
+            button: Rect::default(),
+            menu_rect: Rect::default(),
+            menu_open: false,
+            current: MergeMethod::Commit,
+            sel: 0,
+            confirm: None,
+            running: None,
+        }
+    }
+}
+
+/// Run `gh pr merge` on a worker so a slow network call never freezes the
+/// pane (the same discipline as preview loads and diff refreshes).
+fn start_pr_merge(
+    target: &PrTarget,
+    method: MergeMethod,
+) -> std::sync::mpsc::Receiver<Result<String, String>> {
+    let root = target.root.clone();
+    let number = target.number;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::pr::merge(&root, number, method));
+    });
+    rx
+}
+
+const MERGE_METHODS: [MergeMethod; 3] = [MergeMethod::Commit, MergeMethod::Squash, MergeMethod::Rebase];
+
+/// Whether a mouse click (0-based, like crossterm reports) lands in `rect`.
+fn rect_hits(rect: Rect, mouse: &MouseEvent) -> bool {
+    mouse.column >= rect.x
+        && mouse.column < rect.right()
+        && mouse.row >= rect.y
+        && mouse.row < rect.bottom()
 }
 
 fn mode_pane_label(mode: &ViewMode) -> String {
@@ -914,6 +998,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            pr_target: None,
             selection: PreviewSelection::default(),
         };
     }
@@ -959,6 +1044,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -1250,6 +1336,7 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -1320,6 +1407,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
+        pr_target: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -1348,6 +1436,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            pr_target: None,
             selection: PreviewSelection::default(),
         };
     }
@@ -1408,6 +1497,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target: None,
         selection: PreviewSelection::default(),
     }
 }
@@ -1673,6 +1763,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
+        pr_target: None,
         selection: PreviewSelection::default(),
     });
     let mut mode = ViewMode::Preview(doc);
@@ -1698,6 +1789,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut edit_body = Rect::default();
     let mut prompt: Option<Prompt> = None;
     let mut notice: Option<String> = None;
+    let mut merge_ui = MergeUi::default();
+    let mut merge_worker: Option<std::sync::mpsc::Receiver<Result<String, String>>> = None;
     let mut last_heartbeat = Instant::now();
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
@@ -1723,7 +1816,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             }
         }
         let prompt_text = prompt.as_ref().map(Prompt::text);
-        let draw = terminal.draw(|frame| match &mut mode {
+        let terminal_draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
                 (page, preview_body) = draw_doc(
                     frame,
@@ -1731,13 +1824,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     theme,
                     matches!(current, Some(Request::File { .. })),
                     notice.as_deref(),
+                    &mut merge_ui,
                 );
             }
             ViewMode::Edit(editor) => {
                 (page, edit_width, edit_body) = draw_editor(frame, editor, theme, prompt_text);
             }
         });
-        if let Err(e) = draw {
+        if let Err(e) = terminal_draw {
             break Err(e);
         }
         if identity_pending {
@@ -1747,6 +1841,25 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 control,
             );
             identity_pending = false;
+        }
+        if let Some(receiver) = &merge_worker
+            && let Ok(result) = receiver.try_recv()
+        {
+            merge_worker = None;
+            merge_ui.running = None;
+            notice = Some(match result {
+                Ok(_) => {
+                    // The overview's pill is stale; mark the merged state
+                    // so the footer button leaves once the user rebuilds.
+                    if let ViewMode::Preview(doc) = &mut mode
+                        && let Some(target) = doc.pr_target.as_mut()
+                    {
+                        target.detail["state"] = "MERGED".into();
+                    }
+                    "merged ✓".into()
+                }
+                Err(e) => format!("merge failed: {e}"),
+            });
         }
         let mut should_close = false;
         let poll = if preview_load.is_some() {
@@ -1858,6 +1971,62 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     } else {
                         match &mut mode {
                             ViewMode::Preview(doc) => {
+                                if doc.pr_target.is_some()
+                                    && (merge_ui.confirm.is_some()
+                                        || merge_ui.running.is_some()
+                                        || merge_ui.menu_open
+                                        || key.code == KeyCode::Char('m'))
+                                {
+                                    if let Some(method) = merge_ui.confirm {
+                                        match key.code {
+                                            KeyCode::Char('y') | KeyCode::Enter => {
+                                                merge_ui.confirm = None;
+                                                merge_ui.running = Some(method);
+                                                if let Some(target) = doc.pr_target.as_ref() {
+                                                    merge_worker =
+                                                        Some(start_pr_merge(target, method));
+                                                } else {
+                                                    merge_ui.running = None;
+                                                }
+                                            }
+                                            KeyCode::Char('n') | KeyCode::Esc => {
+                                                merge_ui.confirm = None
+                                            }
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if merge_ui.running.is_some() {
+                                        continue;
+                                    }
+                                    if merge_ui.menu_open {
+                                        match key.code {
+                                            KeyCode::Up => {
+                                                merge_ui.sel = merge_ui.sel.saturating_sub(1)
+                                            }
+                                            KeyCode::Down => {
+                                                merge_ui.sel =
+                                                    (merge_ui.sel + 1).min(MERGE_METHODS.len() - 1)
+                                            }
+                                            KeyCode::Enter => {
+                                                merge_ui.menu_open = false;
+                                                merge_ui.current = MERGE_METHODS[merge_ui.sel];
+                                                merge_ui.confirm = Some(merge_ui.current);
+                                            }
+                                            KeyCode::Esc => merge_ui.menu_open = false,
+                                            _ => {}
+                                        }
+                                        continue;
+                                    }
+                                    if key.code == KeyCode::Char('m') {
+                                        merge_ui.menu_open = !merge_ui.menu_open;
+                                        merge_ui.sel = MERGE_METHODS
+                                            .iter()
+                                            .position(|method| *method == merge_ui.current)
+                                            .unwrap_or(0);
+                                        continue;
+                                    }
+                                }
                                 let max = doc.rows.len().saturating_sub(1);
                                 let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
                                     && !key.modifiers.contains(KeyModifiers::ALT))
@@ -1971,6 +2140,35 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 }
                 Event::Mouse(mouse) => match &mut mode {
                     ViewMode::Preview(doc) => {
+                        if doc.pr_target.is_some()
+                            && merge_ui.confirm.is_none()
+                            && merge_ui.running.is_none()
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                        {
+                            let in_button = rect_hits(merge_ui.button, &mouse);
+                            let in_menu = rect_hits(merge_ui.menu_rect, &mouse);
+                            if in_button {
+                                merge_ui.menu_open = !merge_ui.menu_open;
+                                merge_ui.sel = MERGE_METHODS
+                                    .iter()
+                                    .position(|method| *method == merge_ui.current)
+                                    .unwrap_or(0);
+                                continue;
+                            }
+                            if merge_ui.menu_open && in_menu {
+                                let row =
+                                    usize::from(mouse.row.wrapping_sub(merge_ui.menu_rect.y));
+                                if row < MERGE_METHODS.len() {
+                                    merge_ui.menu_open = false;
+                                    merge_ui.current = MERGE_METHODS[row];
+                                    merge_ui.confirm = Some(merge_ui.current);
+                                }
+                                continue;
+                            }
+                            if merge_ui.menu_open {
+                                merge_ui.menu_open = false;
+                            }
+                        }
                         let max = doc.rows.len().saturating_sub(1);
                         match mouse.kind {
                             MouseEventKind::ScrollUp => doc.scroll = doc.scroll.saturating_sub(3),
@@ -2100,6 +2298,7 @@ fn draw_doc(
     theme: IconTheme,
     editable: bool,
     notice: Option<&str>,
+    merge: &mut MergeUi,
 ) -> (usize, Rect) {
     let area = frame.area();
     let [header, body, footer] = Layout::vertical([
@@ -2179,6 +2378,109 @@ fn draw_doc(
     } else {
         format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
     };
+    merge.button = Rect::default();
+    merge.menu_rect = Rect::default();
+
+    // A pull request overview gets a merge button in the footer: shown as
+    // a filled chip, it opens a method dropdown that pops up over the body
+    // and asks for a [y]/[n] before `gh pr merge` runs. The click zones
+    // live in `merge`, set here, read by the event loop.
+    if let Some(target) = &doc.pr_target {
+        if merge_state(&target.detail) != Mergeability::Ready {
+            // A merged/closed/conflicting request cannot be merged: leave
+            // any open dropdown and confirmation so stray keys don't linger.
+            merge.menu_open = false;
+            merge.confirm = None;
+        }
+        if let Some(method) = merge.running {
+            let footer_line = Span::styled(
+                format!(" Merging #{n} ({})… ", method.short(), n = target.number),
+                Style::default().fg(palette().warning),
+            );
+            frame.render_widget(Paragraph::new(Line::from(footer_line)), footer);
+            return (usize::from(body.height).saturating_sub(1).max(1), body);
+        }
+        if let Some(method) = merge.confirm {
+            let footer_line = Span::styled(
+                format!(
+                    " Merge #{n} with {}?  [y]  [n] ",
+                    method.label(),
+                    n = target.number
+                ),
+                Style::default().fg(palette().accent).bold(),
+            );
+            frame.render_widget(Paragraph::new(Line::from(footer_line)), footer);
+            return (usize::from(body.height).saturating_sub(1).max(1), body);
+        }
+
+        if merge_state(&target.detail) == Mergeability::Ready {
+            let draw_menu = merge.menu_open;
+            let glyph = if draw_menu { "▴" } else { "▾" };
+            let label = format!(" ✓ Merge {glyph} ");
+            let button_w = u16::try_from(label.chars().count()).unwrap_or(0);
+            merge.button = Rect {
+                x: 1,
+                y: footer.y,
+                width: button_w,
+                height: 1,
+            };
+            let mut line = vec![
+                Span::raw(" "),
+                Span::styled(
+                    label.clone(),
+                    Style::default()
+                        .fg(palette().button_fg)
+                        .bg(palette().button_bg)
+                        .bold(),
+                ),
+                Span::styled(format!(" {} ", merge.current.short()), Style::default().dim()),
+            ];
+            if !hint.is_empty() {
+                let used: usize = line.iter().map(Span::width).sum();
+                let room = usize::from(footer.width).saturating_sub(used + 1);
+                if room > 2 {
+                    line.push(Span::styled(
+                        crate::ui::truncate_to(hint, room + 1),
+                        Style::default().dim(),
+                    ));
+                }
+            }
+            frame.render_widget(Paragraph::new(Line::from(line)), footer);
+
+            if draw_menu {
+                let rows = MERGE_METHODS.len();
+                let label_w = MERGE_METHODS
+                    .iter()
+                    .map(|method| method.label().len() + 4)
+                    .max()
+                    .unwrap_or(0);
+                let popup_w = u16::try_from(label_w).unwrap_or(40).min(body.width);
+                merge.menu_rect = Rect {
+                    x: 1,
+                    y: footer.y.saturating_sub(rows as u16),
+                    width: popup_w.max(1),
+                    height: rows as u16,
+                };
+                let menu_lines: Vec<Line> = MERGE_METHODS
+                    .iter()
+                    .enumerate()
+                    .map(|(index, method)| {
+                        let style = if index == merge.sel {
+                            Style::default()
+                                .fg(palette().button_fg)
+                                .bg(palette().button_focus_bg)
+                        } else {
+                            Style::default()
+                        };
+                        Line::from(Span::styled(format!(" {} ", method.label()), style))
+                    })
+                    .collect();
+                frame.render_widget(Paragraph::new(menu_lines), merge.menu_rect);
+            }
+            return (usize::from(body.height).saturating_sub(1).max(1), body);
+        }
+    }
+
     frame.render_widget(Paragraph::new(Line::from(hint).dim()), footer);
     (usize::from(body.height).saturating_sub(1).max(1), body)
 }
@@ -3213,6 +3515,7 @@ mod tests {
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
+            pr_target: None,
             selection: PreviewSelection::default(),
         }
     }
@@ -3221,6 +3524,49 @@ mod tests {
         rows.iter()
             .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn merge_button_zone_matches_its_drawn_span() {
+        // The click zone must cover exactly what renders as the chip, so a
+        // click that lands on the visible button always hits; a click just
+        // outside it never does.
+        let zone = Rect::new(1, 20, 12, 1);
+        let mouse_at = |row, column| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(rect_hits(zone, &mouse_at(20, 1)));
+        assert!(rect_hits(zone, &mouse_at(20, 12)));
+        assert!(!rect_hits(zone, &mouse_at(20, 13)), "past the chip");
+        assert!(!rect_hits(zone, &mouse_at(19, 5)), "above the chip");
+        assert!(!rect_hits(zone, &mouse_at(21, 5)), "below the chip");
+    }
+
+    #[test]
+    fn merge_state_gates_the_footer_button() {
+        use crate::pr::Mergeability;
+        let open: serde_json::Value =
+            serde_json::from_str(r#"{"state":"OPEN","mergeStateStatus":"CLEAN"}"#).unwrap();
+        assert_eq!(merge_state(&open), Mergeability::Ready);
+        let blocked: serde_json::Value =
+            serde_json::from_str(r#"{"state":"OPEN","mergeStateStatus":"BLOCKED"}"#).unwrap();
+        assert_eq!(
+            merge_state(&blocked),
+            Mergeability::Ready,
+            "failing checks still offer the button; gh surfaces the error"
+        );
+        let dirty: serde_json::Value =
+            serde_json::from_str(r#"{"state":"OPEN","mergeStateStatus":"DIRTY"}"#).unwrap();
+        assert_eq!(merge_state(&dirty), Mergeability::Conflicts);
+        let merged: serde_json::Value =
+            serde_json::from_str(r#"{"state":"MERGED"}"#).unwrap();
+        assert_eq!(merge_state(&merged), Mergeability::Merged);
+        let closed: serde_json::Value =
+            serde_json::from_str(r#"{"state":"CLOSED"}"#).unwrap();
+        assert_eq!(merge_state(&closed), Mergeability::Closed);
     }
 
     #[test]
@@ -3411,8 +3757,12 @@ mod tests {
     fn build_rows_expands_tabs_in_wrapped_and_unwrapped_modes() {
         let line = Line::raw("\t1234");
         let wrapped = build_rows(std::slice::from_ref(&line), false, true, 4);
-        assert_eq!(wrapped.len(), 2);
-        assert_eq!(wrapped[0].line.spans[0].content.as_ref(), "    ");
+        // The tab's indent is the hanging anchor: each wrapped row carries it.
+        assert_eq!(wrapped.len(), 4);
+        assert!(
+            wrapped[0].line.spans[0].content.as_ref().starts_with("    "),
+            "the tab renders as a 4-wide indent"
+        );
         let unwrapped = build_rows(&[line], false, false, 4);
         let text: String = unwrapped[0]
             .line
@@ -3480,7 +3830,7 @@ mod tests {
         let render = |terminal: &mut Terminal<TestBackend>, doc: &mut Doc| -> Vec<String> {
             terminal
                 .draw(|f| {
-                    draw_doc(f, doc, IconTheme::Emoji, false, None);
+                    draw_doc(f, doc, IconTheme::Emoji, false, None, &mut MergeUi::default());
                 })
                 .unwrap();
             terminal
@@ -3525,7 +3875,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(16, 6)).unwrap();
         terminal
             .draw(|f| {
-                draw_doc(f, &mut doc, IconTheme::Emoji, false, None);
+                draw_doc(f, &mut doc, IconTheme::Emoji, false, None, &mut MergeUi::default());
             })
             .unwrap();
         assert_eq!(doc.rows.len(), 1);

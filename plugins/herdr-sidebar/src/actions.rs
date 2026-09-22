@@ -120,16 +120,24 @@ pub fn delete(path: &Path, is_dir: bool) -> io::Result<()> {
     }
 }
 
-/// Copy text to the system clipboard by piping to the platform's clipboard
-/// tool (a console child of the TUI's own pty — no window is created).
+/// Copy text to the system clipboard. A platform tool first (a console child
+/// of the TUI's own pty — no window is created), then OSC 52 as the no-tools
+/// fallback: herdr's `Osc52Forwarder` relays a pane's completed clipboard
+/// write to the host terminal, so a host that supports OSC 52 (Windows
+/// Terminal, iTerm2, Ghostty, kitty, …) receives the text even with
+/// `wl-copy`/`xclip` absent. Final transport is unacknowledged by design —
+/// terminals give no reply — but it is the only path that works with no
+/// local clipboard tool, so it still reports success.
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
     #[cfg(windows)]
     let candidates: &[&[&str]] = &[&["clip"]];
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    let candidates: &[&[&str]] = &[&["pbcopy"]];
+    #[cfg(all(unix, not(target_os = "macos")))]
     let candidates: &[&[&str]] = &[
-        &["pbcopy"],
         &["wl-copy"],
         &["xclip", "-selection", "clipboard"],
+        &["xsel", "--clipboard", "--input"],
     ];
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
@@ -139,7 +147,46 @@ pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
             Err(err) => last_err = err,
         }
     }
+    if copy_osc52(text) {
+        return Ok(());
+    }
     Err(last_err)
+}
+
+/// Emit an OSC 52 write (`ESC ] 52 ; c ; <base64> BEL`) on our own stdout.
+/// herdr relays completed writes to the host terminal, so no system tool is
+/// needed; on a host without OSC 52 the sequence is harmless and inert.
+fn copy_osc52(text: &str) -> bool {
+    use std::io::Write;
+
+    let mut out = io::stdout().lock();
+    write!(out, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes())).is_ok() && out.flush().is_ok()
+}
+
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Minimal RFC 4648 base64 encoder without newlines — enough for OSC 52.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64[(n >> 18) as usize & 63] as char);
+        out.push(BASE64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 fn copy_with(argv: &[&str], text: &str) -> io::Result<()> {
@@ -188,6 +235,7 @@ pub fn paste_from_clipboard() -> io::Result<String> {
     let candidates: &[&[&str]] = &[
         &["wl-paste", "--no-newline"],
         &["xclip", "-selection", "clipboard", "-o"],
+        &["xsel", "--clipboard", "--output"],
     ];
 
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no clipboard tool found");
@@ -723,6 +771,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("exited with"), "{error}");
+    }
+
+    #[test]
+    fn base64_encoding_matches_rfc4648() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

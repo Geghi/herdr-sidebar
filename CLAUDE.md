@@ -764,7 +764,14 @@ HACKING.md — budget time for that before promising a patched build.
   `decision_view`. Its expanded file list renders as the SCM tree (`changes_tree_rows` +
   `folder_item`, folders-first at each level — NOT files-immediately-under-folder) behind the
   shared `scm_tree` setting with the same `t` / Left-fold-or-step-out / Right-unfold /
-  Enter-fold gestures and stable-id selection; file rows share SCM's icon/status-color
+  Enter-fold gestures and stable-id selection; tree/flat rows nest one level UNDER their
+  PR (depth+1 — depth 0 reads as a sibling of the request, not its child), collapse keys
+  are per-PR (`N:path`, stripped back to plain paths for the shared builder) so two
+  requests touching the same directory do not fold each other, and PR rows carry a dim
+  `author head→base +A −D` tail beside the title (dropped under ~40 cols rather than
+  squeezing the title to a stub). The ARRIVAL branch (`base`, the right of `→`) leaves the
+  dim tail in `pr_spans` so the target of the request reads at a glance — it is the
+  destination, not just more metadata. The `t` toggle is in the footer hints; file rows share SCM's icon/status-color
   anatomy (a dim directory in flat mode). Ctrl+4 also switches every app to the PR view from
   any focus, and the PR app answers the F9–F11 / Ctrl+1/2/3 transports plus Ctrl+Q graceful
   close, so `show-*` works with the PR view showing. The merged pane stamps ALL THREE
@@ -773,13 +780,41 @@ HACKING.md — budget time for that before promising a patched build.
   `pr_app` unit tests construct `App::new` directly (safe: no `pane_ctl` without
   `HERDR_PANE_ID`, `gh` fails fast off-repo, state defaults without the env dir) to cover
   rebuild/selection behaviour the pure `build_rows` tests cannot reach.
-- **`markdown.rs` is the pane's own markdown renderer** (headings, emphasis, inline code,
+- **  `markdown.rs` is the pane's own markdown renderer** (headings, emphasis, inline code,
   links, lists, task boxes, quotes, fenced code, rules and aligned tables, HTML comments
   stripped): it draws a pull request's description and conversation bodies inside
-  `pr::render_overview` (the overview itself is a structured native summary — state badge,
-  metadata card, grouped check rows with failing names first, headed `·`-separated
-  conversation blocks — never raw markdown) and it is the FALLBACK for markdown FILES when
-  `glow` is missing, because a raw `#`/`**` dump is not a preview.
+  `pr::render_overview`. The overview is **GitHub-web style, deliberately NOT terminal boxes**
+  (a bordered-card pass was user-rejected as "fa cacare"; a later full-bleed card with filled
+  keycap-styled filepath blocks was rejected as "molto brutto" — see the rail notes below).
+  Current anatomy: a full-bleed hairline of the state color across the top, a filled `#74`
+  chip (`pill()`), a `✓ mergeable` / `✕ has conflicts` line, a meta row with
+  `@author  head → base  +add −del` plus a **gradient `stat_bar()`** (each add/del run fades
+  via `ramp()` toward the join; named colors stay flat), and every section row on a
+  `▍`-rail (`section_row`/`section_head`). The conversation is a TIMELINE (`●` dot in the
+  review verdict color + `@author · glyph · day` head, body indented two over, NO `│` rail —
+  the two rails read as noise). Nothing is boxed, so the doc is plain
+  width-wrapped lines like any preview — no width-baked artifacts, and the viewer does NOT
+  rebuild anything on resize (the card-era `Doc::pr_source` + `refresh_pr_boxing` are gone).
+  **Inline code is foreground-only** (`Palette::code_fg`, a soft violet on dark / dark violet
+  on light / cyan in the terminal theme): file paths appear in every PR body, and a filled
+  `keycap_bg` block over the card read as a smear (user-reported).
+  Markdown is also the FALLBACK for markdown FILES when `glow` is missing, because a raw
+  `#`/`**` dump is not a preview.
+  **Merging from the overview**: a ready open request (`pr::merge_state` reads
+  `gh pr view`'s `state`/`mergeStateStatus`; `DIRTY` → the button is withheld as
+  `Conflicts`, failing checks `BLOCKED` still keep it — gh surfaces that error live) gets a
+  filled ` ✓ Merge ▾ ` button in the FOOTER (`MergeUi` in the viewer, `button_bg`/`button_fg`).
+  The ▾ pops a method dropdown UP over the body (`Rect`s stashed each frame — terminals
+  emit no mouse-exit, so click zones only exist while drawn; `rect_hits`). Clicking a method
+  or pressing `m` (dropdown), `m`/⏎ to pick, then `[y]` confirms and `gh pr merge` runs on a
+  WORKER thread (`start_pr_merge`) so a slow network call can't freeze the pane; the footer
+  shows `Merging…` while it runs and flips `doc.pr_target.detail.state` to `MERGED` on
+  success so the button leaves. The merged/closed pill is already rendered in the body (a
+  refetch doesn't happen), so the merge result lands as the `merged ✓` footer notice.
+  **Menu clicks are hit-tested, not Enter-on-selection**: a left click on the PR context
+  menu (sidebar `pr_app::overlay_click`) previously CONFIRMED the merely SELECTED entry, so
+  clicking "Squash and Merge" ran "Open Pull Request" — the popup rect now maps the clicked
+  row back to its entry (`menu_hit`), and clicks outside dismiss.
   **`gh` is a NETWORK cli with no timeout of its own**: every call runs on a worker thread
   and lands in the App through a channel polled from `tick()` (`refresh` sends one page per
   drawer, `toggle_files` one file list), so the pane never blocks; `run_prs` in main.rs ticks
@@ -975,7 +1010,12 @@ setting are all gone.
   trims indentation, measures with `unicode-width` (wide CJK = 2 cells), preserves
   per-span styles across a break, and carries the LINE style so a wrapped diff row
   keeps its tint — every row is padded to the pane edge, so continuations get the
-  full-width band too.
+  full-width band too. Every continuation re-emits the line's **hanging anchor**:
+  the leading whitespace run plus one glued glyph column and its space (a card rail
+  `▍`, a bullet `●`, a diff `-`/`+`). Without it, a wrapped overview body or
+  indented code line snapped to the pane edge on the second row and the rail vanished
+  mid-word (user-reported); with it, a `▍ body text` line wraps with every row
+  starting `▍ ` and code indent stays put (see the `wrap::tests` hanging tests).
 - Rows are cached per `(width, wrap)` and rebuilt only when one of those changes — a
   resize or a `w` press, not every frame.
 - Both the `w` toggle and the ~2s diff live-refresh re-anchor the scroll by SOURCE
@@ -1036,11 +1076,18 @@ setting are all gone.
   viewer confirms save/discard/cancel and then closes itself (stale viewers are still killed
   directly). The same prompt guards control-file switches to another preview.
 - Clipboard is best-effort and command-backed: `clip` / PowerShell `Get-Clipboard` on
-  Windows, `pbcopy`/`pbpaste` on macOS, and wl-clipboard or xclip on Linux. Ctrl and Cmd
+  Windows, `pbcopy`/`pbpaste` on macOS, and wl-copy/xclip/xsel on Linux. A copy command
+  counts only when its exit status succeeds. When NO system tool exists (a bare Linux box,
+  SSH), `copy_to_clipboard` falls back to writing OSC 52 (`ESC ] 52 ; c ; <base64> BEL`) to
+  its own stdout: herdr's `Osc52Forwarder` relays a pane child's completed clipboard write to
+  the host terminal, so the text lands whenever the host supports OSC 52 (WT/iTerm2/Ghostty/
+  kitty) — exactly how herdr's own native selection copy works. The write is unacknowledged
+  (terminals give no reply; the base64 encoder is a hand-rolled RFC 4648 without newlines —
+  no `base64` crate), so "copied to clipboard" on a tool-less machine asserts only that the
+  sequence was emitted; run
+  `printf '\033]52;c;%s\a' "$(printf x | base64 -w0)"` in a pane to confirm the host accepts it.
+  Ctrl and Cmd
   shortcuts are both accepted; CONTROL+ALT chars remain text so Windows AltGr layouts work.
-  A copy command counts only when its exit status succeeds. Do not treat writing OSC 52 bytes
-  as confirmed clipboard success: terminals provide no acknowledgement here, and unconditional
-  escape output would add a behavior/security compatibility change with no opt-out.
 - ANSI parsing consumes complete OSC payloads through BEL or ST. Glow 3 emits OSC 8 hyperlinks
   under forced color; dropping only ESC exposes the hyperlink metadata as visible preview text.
 - Edit mode accepts terminal mouse input: click moves the caret, drag selects across logical and

@@ -55,6 +55,17 @@ pub struct Palette {
     /// Mouse text selection in the preview / editor. Unlike the list rows this
     /// sits UNDER syntax-colored spans, so it must not fight their foreground.
     pub text_selection_bg: Color,
+    /// The soft fill behind the overview's cards (PR header, description,
+    /// conversation): a surface a shade off the pane background, so blocks
+    /// group without box borders. The viewer pads rows whose line style has
+    /// a background out to the pane edge, which is what makes the cards
+    /// full-bleed.
+    pub card_bg: Color,
+    /// Inline code (`markdown`'s backtick spans): a foreground-only tone that
+    /// reads as code without a filled block over `card_bg`. File paths show
+    /// up in every PR body, and a rectangular highlight on them reads as a
+    /// bug-shaped smear — fg-only keeps them quiet.
+    pub code_fg: Color,
     /// Diff row tints (`diffview`), word-level tint, and the +/− gutter marks.
     pub diff_del_bg: Color,
     pub diff_del_word_bg: Color,
@@ -105,6 +116,10 @@ const VSCODE_PALETTE: Palette = Palette {
     diff_add_word_bg: Color::Rgb(0x35, 0x59, 0x3d),
     diff_del_mark: Color::Rgb(0xd1, 0x6d, 0x76),
     diff_add_mark: Color::Rgb(0x8c, 0xc9, 0x8f),
+    card_bg: Color::Rgb(0x25, 0x29, 0x30),
+    // A soft violet — distinct from wheat `modified`, green `untracked` and
+    // blue `accent`, so inline code reads as code without a background block.
+    code_fg: Color::Rgb(0xb3, 0x92, 0xe0),
     warning: Color::Yellow,
 };
 
@@ -150,6 +165,9 @@ const LIGHT_PALETTE: Palette = Palette {
     diff_add_word_bg: Color::Rgb(0xab, 0xf2, 0xbc),
     diff_del_mark: Color::Rgb(0xb3, 0x1d, 0x28),
     diff_add_mark: Color::Rgb(0x1a, 0x7f, 0x37),
+    card_bg: Color::Rgb(0xee, 0xf1, 0xf6),
+    // Dark violet, readable on white — no block background behind the code.
+    code_fg: Color::Rgb(0x5b, 0x2d, 0x90),
     warning: Color::Rgb(0x9a, 0x67, 0x00),
 };
 
@@ -190,6 +208,8 @@ const TERMINAL_PALETTE: Palette = Palette {
     diff_add_word_bg: Color::Rgb(0x35, 0x59, 0x3d),
     diff_del_mark: Color::Rgb(0xd1, 0x6d, 0x76),
     diff_add_mark: Color::Rgb(0x8c, 0xc9, 0x8f),
+    card_bg: Color::Rgb(0x25, 0x29, 0x30),
+    code_fg: Color::Cyan,
     warning: Color::Yellow,
 };
 

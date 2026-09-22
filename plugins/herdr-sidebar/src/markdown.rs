@@ -199,7 +199,7 @@ fn inline(text: &str, base: Style) -> Vec<Span<'static>> {
                 style.add_modifier(Modifier::CROSSED_OUT)
             }),
             Marker_::Code => styled_pair(&mut spans, &mut plain, rest, "`", base, |style| {
-                style.bg(palette().keycap_bg).fg(palette().keycap_fg)
+                style.fg(palette().code_fg)
             }),
             Marker_::Link => {
                 if let Some((text, url, used)) = link(rest) {
@@ -461,7 +461,9 @@ mod tests {
         };
         assert!(find("bold").add_modifier.contains(Modifier::BOLD));
         assert!(find("it").add_modifier.contains(Modifier::ITALIC));
-        assert_eq!(find("code").bg, Some(palette().keycap_bg));
+        // Inline code is foreground-only: no filled block over the card.
+        assert_eq!(find("code").bg, None);
+        assert_eq!(find("code").fg, Some(palette().code_fg));
         assert!(find("site").add_modifier.contains(Modifier::UNDERLINED));
         assert!(find("old").add_modifier.contains(Modifier::CROSSED_OUT));
         let all = text(&lines);

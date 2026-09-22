@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
@@ -306,10 +306,13 @@ pub fn detail(root: &Path, number: u64) -> Result<Value, String> {
     serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))
 }
 
-/// The overview pane's lines: a structured app-native summary — the header
-/// with a state badge, the metadata card, the checks as grouped rows, the
-/// description as clean prose, and the conversation as headed blocks. Never
-/// raw markdown: no `#`, `**` or `[..](..)` syntax reaches the pane.
+/// The overview pane's lines in the GitHub web look: a bold title, a filled
+/// state pill, the author and branches, a diff stat bar, labeled rules
+/// between sections, and the conversation as a timeline. Never raw
+/// markdown: no `#`, `**` or `[..](..)` syntax reaches the pane.
+///
+/// Nothing here is boxed, so every line re-wraps naturally when the pane
+/// width moves — no rebuild machinery needed.
 pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
     let text = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("");
     let author = detail
@@ -318,87 +321,251 @@ pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
         .and_then(Value::as_str)
         .unwrap_or("");
     let number = detail.get("number").and_then(Value::as_u64).unwrap_or(0);
+    let additions = detail
+        .get("additions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let deletions = detail
+        .get("deletions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let changed = detail
+        .get("changedFiles")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
 
     let mut out: Vec<Line<'static>> = Vec::new();
-    // Title: the number and the state badge carry the color, the title the
-    // weight.
+    // The hero card, topped by a full-bleed band in the state color — GitHub's
+    // PR card edge. The `#n` chip, the state pill, the left rail and the stat
+    // numbers all echo that color, so the request's verdict owns the top of
+    // the page. Sections below keep one shared accent rail down the left.
     let (state, state_color) = state_badge(detail);
-    out.push(Line::from(vec![
-        Span::styled(
-            format!("#{number}  "),
-            Style::default().fg(palette().header_accent),
-        ),
-        Span::styled(
-            text("title").to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("   {state}"),
-            Style::default()
-                .fg(state_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    // The metadata card: who, where, how big, and the review decision.
     out.push(Line::from(vec![Span::styled(
-        format!("@{author}"),
-        Style::default().fg(palette().accent),
+        " ".repeat(width.max(1)),
+        Style::default().bg(state_color),
     )]));
-    out.push(Line::from(vec![Span::styled(
-        format!(
-            "{} → {}  ·  +{} −{}  ·  {} files",
-            text("headRefName"),
-            text("baseRefName"),
-            detail.get("additions").and_then(Value::as_u64).unwrap_or(0),
-            detail.get("deletions").and_then(Value::as_u64).unwrap_or(0),
-            detail
-                .get("changedFiles")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        ),
-        Style::default().dim(),
-    )]));
+    out.push(rail_line(
+        state_color,
+        vec![
+            pill(&format!("#{number}"), state_color),
+            Span::styled(
+                text("title").to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ],
+    ));
+    // The pill row: the filled state badge, the review decision, mergeability.
+    let mut pills = vec![pill(state, state_color)];
     if let Some((glyph, label, color)) =
         review_line(detail.get("reviewDecision").and_then(Value::as_str))
     {
-        out.push(Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(color)),
-            Span::styled(label, Style::default().fg(color)),
-        ]));
+        pills.push(Span::raw("  "));
+        pills.push(Span::styled(
+            format!("{glyph} {label}"),
+            Style::default().fg(color),
+        ));
     }
-    out.push(Line::from(Span::styled(
+    if let Some((glyph, label, color)) = mergeability_line(detail) {
+        pills.push(Span::styled("  ·  ", Style::default().dim()));
+        pills.push(Span::styled(
+            format!("{glyph} {label}"),
+            Style::default().fg(color),
+        ));
+    }
+    out.push(rail_line(state_color, pills));
+    // Who, where, how big — the numbers first, then the diff gradient.
+    let mut meta = vec![
+        Span::styled(format!("@{author}"), Style::default().fg(palette().accent)),
+        Span::styled(
+            format!("  {} → {} ", text("headRefName"), text("baseRefName")),
+            Style::default().dim(),
+        ),
+    ];
+    meta.push(Span::styled(
+        format!("+{additions}"),
+        Style::default().fg(palette().untracked),
+    ));
+    meta.push(Span::styled(
+        format!(" −{deletions}"),
+        Style::default().fg(palette().deleted),
+    ));
+    if let Some(bar) = stat_bar(additions, deletions, width) {
+        meta.push(Span::raw("  "));
+        meta.extend(bar);
+    }
+    meta.push(Span::styled(
+        format!("  {changed} files"),
+        Style::default().dim(),
+    ));
+    out.push(rail_line(state_color, meta));
+    out.push(rail_line(state_color, vec![Span::styled(
         text("url").to_string(),
         Style::default().dim(),
-    )));
-    if let Some(checks) = checks_summary(detail.get("statusCheckRollup")) {
-        out.push(Line::default());
+    )]));
+
+    if let Some(checks) = checks_summary(detail.get("statusCheckRollup"), width) {
         out.extend(checks);
     }
 
     let body = text("body").trim();
     if !body.is_empty() {
         out.push(Line::default());
-        out.push(section_heading("Description"));
-        out.push(Line::default());
-        out.extend(crate::markdown::render(body, width));
+        out.push(section_head("Description", width));
+        out.extend(
+            crate::markdown::render(body, width.saturating_sub(3))
+                .into_iter()
+                .map(section_row),
+        );
     }
     if let Some(blocks) = conversation(detail.get("comments"), detail.get("reviews"), width) {
-        out.push(Line::default());
-        out.push(section_heading("Conversation"));
-        out.push(Line::default());
         out.extend(blocks);
     }
     out
 }
 
-/// A section heading: bold in the header accent, like the pane titles.
-fn section_heading(title: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        title.to_string(),
+/// A row on a card surface: the 1-cell left "rail" in the card's accent
+/// color — Linear-style — then a space, then the content. The viewer pads
+/// rows whose line style carries a background out to the full pane width,
+/// so every card reads as a full-bleed band, never a box.
+fn rail_line(rail: Color, spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut all = vec![
+        Span::styled("▍", Style::default().fg(rail)),
+        Span::raw(" "),
+    ];
+    all.extend(spans);
+    let mut out = Line::from(all);
+    out.style = Style::default().bg(palette().card_bg);
+    out
+}
+
+/// The same surface applied to an already-built line (markdown bodies, the
+/// checks rows, the conversation feed). The rail is fixed to the shared
+/// section accent, so all sections read as one column down the page.
+fn section_row(line: Line<'static>) -> Line<'static> {
+    let mut all = vec![
+        Span::styled("▍", Style::default().fg(palette().accent)),
+        Span::raw(" "),
+    ];
+    all.extend(line.spans);
+    let mut out = Line::from(all);
+    out.style = line.style.patch(Style::default().bg(palette().card_bg));
+    out
+}
+
+/// A section header row on its card: a bold title in the rail accent, then
+/// a dim rule filling the rest — the card's spine, not a box around it.
+fn section_head(title: &str, width: usize) -> Line<'static> {
+    let fill = width.saturating_sub(title.chars().count() + 6).max(2);
+    section_row(Line::from(vec![
+        Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(palette().accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {}", "─".repeat(fill)), Style::default().dim()),
+    ]))
+}
+
+/// A filled state pill — ` Open `, ` Merged ` — the GitHub look: the fill,
+/// not the text, carries the meaning. Dark text on the fill stays readable
+/// on light and dark terminals alike (a white label would wash out on a
+/// light profile, where ANSI white renders as pale grey).
+fn pill(label: &str, bg: Color) -> Span<'static> {
+    Span::styled(
+        format!(" {label} "),
         Style::default()
-            .fg(palette().header_accent)
+            .fg(Color::Black)
+            .bg(bg)
             .add_modifier(Modifier::BOLD),
-    ))
+    )
+}
+
+/// The diff stat bar as a two-run gradient: green for the additions, red for
+/// the deletions, each run fading toward the join (brightest at the outer
+/// edge) like the classic GitHub bar — enough cells to read at a glance
+/// without crowding a narrow pane.
+fn stat_bar(additions: u64, deletions: u64, width: usize) -> Option<Vec<Span<'static>>> {
+    let cells = ((width as u64) / 8).clamp(4, 12);
+    let total = additions + deletions;
+    if total == 0 {
+        return None;
+    }
+    let mut green = (additions * cells + total / 2) / total;
+    if additions > 0 && green == 0 {
+        green = 1;
+    }
+    if deletions > 0 && green >= cells {
+        green = cells.saturating_sub(1);
+    }
+    let green = green.min(cells);
+    let red = cells - green;
+    let mut spans = Vec::new();
+    for i in 0..green {
+        let frac = if green > 1 {
+            i as f32 / (green - 1) as f32
+        } else {
+            0.0
+        };
+        spans.push(Span::styled(
+            "█",
+            Style::default().fg(ramp(palette().untracked, frac)),
+        ));
+    }
+    for i in 0..red {
+        let frac = if red > 1 {
+            (red - 1 - i) as f32 / (red - 1) as f32
+        } else {
+            0.0
+        };
+        spans.push(Span::styled(
+            "█",
+            Style::default().fg(ramp(palette().deleted, frac)),
+        ));
+    }
+    Some(spans)
+}
+
+/// One shade of a color falling toward dark — the diff bar's join fades
+/// without mixing its two hues. Named colors (the terminal theme) carry no
+/// RGB to ramp from, so they stay flat and solid.
+fn ramp(color: Color, frac: f32) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    let f = frac.clamp(0.0, 1.0) * 0.72;
+    let to = |channel: u8| (f32::from(channel) * (1.0 - f)).round() as u8;
+    Color::Rgb(to(r), to(g), to(b))
+}
+
+/// Whether the overview's merge button is live, and why not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mergeability {
+    /// An open request `gh pr merge` may attempt — remaining failures (failing
+    /// checks, behind the base) surface as the command's own error.
+    Ready,
+    /// Conflicting files: no automatic merge exists.
+    Conflicts,
+    /// Already merged or closed: the button becomes a state pill.
+    Merged,
+    Closed,
+}
+
+/// GitHub's merge verdict for the overview: `mergeStateStatus` DIRTY means
+/// conflicting files, anything else on an open request stays an attempt.
+pub fn merge_state(detail: &Value) -> Mergeability {
+    match detail.get("state").and_then(Value::as_str).unwrap_or("") {
+        "MERGED" => Mergeability::Merged,
+        "CLOSED" => Mergeability::Closed,
+        _ => match detail
+            .get("mergeStateStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "DIRTY" => Mergeability::Conflicts,
+            _ => Mergeability::Ready,
+        },
+    }
 }
 
 /// The pull request's state as a badge label + color. Drafts read Draft
@@ -418,14 +585,6 @@ fn state_badge(detail: &Value) -> (&'static str, ratatui::style::Color) {
     }
 }
 
-/// A full-width dim rule.
-fn rule(width: usize) -> Line<'static> {
-    Line::from(Span::styled(
-        "─".repeat(width.clamp(8, 80)),
-        Style::default().dim(),
-    ))
-}
-
 /// The review decision as (glyph, label, color), or `None` when undecided.
 fn review_line(
     decision: Option<&str>,
@@ -437,6 +596,19 @@ fn review_line(
             Some(("●", "review required", palette().modified))
         }
         ReviewState::Pending => None,
+    }
+}
+
+/// GitHub's merge verdict for an open request: whether the button will
+/// attempt or the files conflict. Merged/closed show nothing extra — the
+/// state pill already owns them.
+fn mergeability_line(
+    detail: &Value,
+) -> Option<(&'static str, &'static str, ratatui::style::Color)> {
+    match merge_state(detail) {
+        Mergeability::Ready => Some(("✓", "mergeable", palette().untracked)),
+        Mergeability::Conflicts => Some(("✕", "has conflicts", palette().deleted)),
+        Mergeability::Merged | Mergeability::Closed => None,
     }
 }
 
@@ -493,17 +665,17 @@ fn parse_checks(rollup: Option<&Value>) -> Vec<Check> {
     out
 }
 
-/// The Checks section: one row per non-empty outcome group, the failing and
-/// pending checks named under theirs (capped). Passing checks are counted,
-/// not listed — a green wall of fifty names helps no one.
-fn checks_summary(rollup: Option<&Value>) -> Option<Vec<Line<'static>>> {
+/// The Checks section: one row per non-empty outcome group, the failing
+/// and pending checks named under theirs (capped). Passing checks are
+/// counted, not listed — a green wall of fifty names helps no one.
+fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'static>>> {
     let checks = parse_checks(rollup);
     if checks.is_empty() {
         return None;
     }
     /// Named rows per group before the "+N more" tail.
     const NAMED: usize = 6;
-    let mut out = vec![section_heading("Checks")];
+    let mut out = vec![Line::default(), section_head("Checks", width)];
     for (status, glyph, label, color) in [
         (
             CheckStatus::Failed,
@@ -531,13 +703,10 @@ fn checks_summary(rollup: Option<&Value>) -> Option<Vec<Line<'static>>> {
         if group.is_empty() {
             continue;
         }
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("{glyph} {} {label}", group.len()),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        out.push(section_row(Line::from(vec![Span::styled(
+            format!("{glyph} {} {label}", group.len()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )])));
         if status == CheckStatus::Passed {
             continue;
         }
@@ -547,19 +716,19 @@ fn checks_summary(rollup: Option<&Value>) -> Option<Vec<Line<'static>>> {
             } else {
                 check.name.clone()
             };
-            out.push(Line::from(vec![
-                Span::raw("    "),
+            out.push(section_row(Line::from(vec![
+                Span::raw("  "),
                 Span::styled(name, Style::default().fg(color)),
-            ]));
+            ])));
         }
         if group.len() > NAMED {
-            out.push(Line::from(vec![
-                Span::raw("    "),
+            out.push(section_row(Line::from(vec![
+                Span::raw("  "),
                 Span::styled(
                     format!("…and {} more", group.len() - NAMED),
                     Style::default().dim(),
                 ),
-            ]));
+            ])));
         }
     }
     Some(out)
@@ -586,9 +755,10 @@ fn review_badge(state: &str) -> Option<(&'static str, &'static str, ratatui::sty
     }
 }
 
-/// Comments and reviews, oldest first, as headed blocks: an
-/// `@author · state · time` line, the body indented under it, a dim rule
-/// between entries. Review states carry their badge.
+/// Comments and reviews, oldest first, as a feed: a `●` dot per entry in
+/// the review's color, the `@author · state · time` line beside it, the
+/// body indented under the dot. Gap rows stay card-free so the section
+/// reads as entries, not one continuous slab.
 fn conversation(
     comments: Option<&Value>,
     reviews: Option<&Value>,
@@ -645,42 +815,48 @@ fn conversation(
         return None;
     }
     entries.sort_by(|a, b| a.stamp.cmp(&b.stamp));
-    let mut out = Vec::new();
-    for (i, remark) in entries.iter().enumerate() {
-        if i > 0 {
-            out.push(rule(width));
-        }
+    let mut out = vec![Line::default(), section_head("Conversation", width)];
+    for remark in entries.iter() {
         let day = remark.stamp.split('T').next().unwrap_or(&remark.stamp);
-        let mut head = vec![
-            Span::styled(
-                format!("@{}", remark.author),
-                Style::default().fg(palette().accent),
-            ),
-            Span::styled(" · ", Style::default().dim()),
-        ];
-        match remark.badge {
-            Some((glyph, label, color)) => {
-                head.push(Span::styled(
+        let dot_color = remark.badge.map_or(palette().ignored, |(_, _, color)| color);
+        let mut head: Vec<Span<'static>> = match remark.badge {
+            Some((glyph, label, color)) => vec![
+                Span::styled(
+                    format!("@{}", remark.author),
+                    Style::default().fg(palette().accent),
+                ),
+                Span::styled(" · ", Style::default().dim()),
+                Span::styled(
                     format!("{glyph} {label}"),
                     Style::default().fg(color),
-                ));
-            }
-            None => head.push(Span::styled("commented", Style::default().dim())),
-        }
+                ),
+            ],
+            None => vec![
+                Span::styled(
+                    format!("@{}", remark.author),
+                    Style::default().fg(palette().accent),
+                ),
+                Span::styled(" · commented", Style::default().dim()),
+            ],
+        };
         head.push(Span::styled(
             format!(" · {day}"),
             Style::default().dim(),
         ));
-        out.push(Line::from(head));
+        let mut dot = vec![
+            Span::styled("●", Style::default().fg(dot_color)),
+            Span::raw("  "),
+        ];
+        dot.extend(head);
+        out.push(section_row(Line::from(dot)));
         if !remark.body.is_empty() {
-            out.push(Line::default());
-            for line in crate::markdown::render(&remark.body, width) {
+            for line in crate::markdown::render(&remark.body, width.saturating_sub(4)) {
                 if line.spans.is_empty() {
-                    out.push(Line::default());
+                    out.push(section_row(Line::from(vec![Span::raw("   ")])));
                 } else {
-                    let mut spans = vec![Span::raw("  ")];
-                    spans.extend(line.spans);
-                    out.push(Line::from(spans));
+                    let mut row = vec![Span::raw("  ")];
+                    row.extend(line.spans);
+                    out.push(section_row(Line::from(row)));
                 }
             }
         }
@@ -713,6 +889,15 @@ impl MergeMethod {
             Self::Commit => "Merge Commit",
             Self::Squash => "Squash and Merge",
             Self::Rebase => "Rebase and Merge",
+        }
+    }
+
+    /// The one-word name the overview's method chip shows.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Commit => "Merge",
+            Self::Squash => "Squash",
+            Self::Rebase => "Rebase",
         }
     }
 }
@@ -1164,12 +1349,15 @@ index 555..666 100644
         .unwrap();
         let lines = render_overview(&detail, 60);
         let all = joined(&lines);
-        assert!(all.contains("#74  feat: previews"), "{all}");
-        assert!(all.contains("Open"), "the state badge: {all}");
+        assert!(all.contains("feat: previews"), "{all}");
+        assert!(all.contains("#74"), "{all}");
+        assert!(all.contains(" Open "), "the state pill: {all}");
         assert!(all.contains("@Facu"), "{all}");
         assert!(all.contains("feat/x → main"), "{all}");
-        assert!(all.contains("+10 −2"), "{all}");
+        assert!(all.contains("+10"), "{all}");
+        assert!(all.contains("−2"), "{all}");
         assert!(all.contains("3 files"), "{all}");
+        assert!(all.contains("████"), "the diff stat bar: {all}");
         assert!(all.contains("✓ approved"), "{all}");
         assert!(all.contains("Checks"), "{all}");
         assert!(all.contains("✗ 1 failed"), "{all}");
@@ -1193,19 +1381,61 @@ index 555..666 100644
         assert!(all.contains("@ann · ✗ requested changes · 2026-09-19"), "{all}");
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
         assert!(all.contains("@cid · ✓ approved · 2026-09-21"), "{all}");
-        assert!(all.contains('─'), "entries are rule-separated: {all}");
+        assert!(all.contains('●'), "the timeline dots: {all}");
+        assert!(all.contains('▍'), "the card rails: {all}");
+        assert!(!all.contains('┌'), "nothing is boxed: {all}");
+        assert!(all.contains("✓ mergeable"), "the merge verdict: {all}");
         let changes = all.find("requested changes").unwrap();
         let nit = all.find("nit: rename this").unwrap();
         let approved = all.find("· ✓ approved · 2026-09-21").unwrap();
         assert!(changes < nit, "oldest first");
         assert!(nit < approved);
-        // The title is the one bold span, the number carries the accent.
-        let title = lines
+        // The state pill is a fill, not a tint: dark text on the state color.
+        let open_pill = lines
             .iter()
             .flat_map(|line| line.spans.iter())
-            .find(|span| span.content == "#74  ")
+            .find(|span| span.content == " Open ")
             .unwrap();
-        assert_eq!(title.style.fg, Some(palette().header_accent));
+        assert_eq!(open_pill.style.bg, Some(palette().untracked));
+        assert_eq!(open_pill.style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn stat_bar_scales_green_against_red() {
+        let cells = |width: usize| ((width as u64) / 8).clamp(4, 12);
+        let expect = |adds: u64, dels: u64, width: usize| {
+            let total = adds + dels;
+            if total == 0 {
+                return None;
+            }
+            let n = cells(width);
+            let mut green = (adds * n + total / 2) / total;
+            if adds > 0 && green == 0 {
+                green = 1;
+            }
+            if dels > 0 && green >= n {
+                green = n - 1;
+            }
+            Some(green.min(n))
+        };
+        let bar = stat_bar(10, 2, 80).unwrap();
+        let text: String = bar.iter().map(|span| span.content.to_string()).collect();
+        assert_eq!(text, "█".repeat(80 / 8), "{text}");
+        assert_eq!(bar.len(), 10, "{text}");
+        let green = expect(10, 2, 80).unwrap() as usize;
+        assert_eq!(green, 8, "10 of 12 changes are additions");
+        assert_eq!(bar[0].style.fg, Some(palette().untracked), "the outer edge is the full green");
+        // The tail joins dark: not the full red, a shade of it.
+        assert_ne!(bar[green].style.fg, Some(palette().deleted));
+        assert_eq!(bar[bar.len() - 1].style.fg, Some(palette().deleted));
+        assert!(stat_bar(0, 0, 80).is_none());
+        let red = stat_bar(0, 3, 80).unwrap();
+        assert_eq!(red.len(), 10, "all deletions, no green sliver");
+        let green_only = stat_bar(3, 0, 80).unwrap();
+        assert_eq!(green_only.len(), 10, "all additions, no red sliver");
+        // A trace of additions still reads next to a sea of deletions.
+        let trace = stat_bar(1, 99, 80).unwrap();
+        assert_eq!(trace[0].style.fg, Some(palette().untracked));
     }
 
     #[test]
@@ -1223,23 +1453,23 @@ index 555..666 100644
         );
         assert!(!all.contains("approved"), "{all}");
         assert!(!all.contains("Description"), "{all}");
-        assert!(all.contains("#1  t"), "{all}");
-        assert!(all.contains("Open"), "the state badge is always there: {all}");
+        assert!(all.contains("#1"), "{all}");
+        assert!(all.contains(" Open "), "the state pill is always there: {all}");
+        assert!(!all.contains('┌'), "nothing is boxed: {all}");
     }
 
     #[test]
     fn state_badges_cover_draft_merged_and_closed() {
-        let badge = |json: &str| {
+        let pill = |json: &str| {
             let detail: Value = serde_json::from_str(json).unwrap();
-            let head = joined(&render_overview(&detail, 60));
-            head.lines().next().unwrap_or_default().to_string()
+            joined(&render_overview(&detail, 60))
         };
-        let draft = badge(r#"{"number":1,"title":"t","isDraft":true,"state":"OPEN"}"#);
-        assert!(draft.contains("Draft"), "{draft}");
-        let merged = badge(r#"{"number":1,"title":"t","state":"MERGED"}"#);
-        assert!(merged.contains("Merged"), "{merged}");
-        let closed = badge(r#"{"number":1,"title":"t","state":"CLOSED"}"#);
-        assert!(closed.contains("Closed"), "{closed}");
+        let draft = pill(r#"{"number":1,"title":"t","isDraft":true,"state":"OPEN"}"#);
+        assert!(draft.contains(" Draft "), "{draft}");
+        let merged = pill(r#"{"number":1,"title":"t","state":"MERGED"}"#);
+        assert!(merged.contains(" Merged "), "{merged}");
+        let closed = pill(r#"{"number":1,"title":"t","state":"CLOSED"}"#);
+        assert!(closed.contains(" Closed "), "{closed}");
     }
 
     #[test]
@@ -1264,7 +1494,7 @@ index 555..666 100644
                 {"conclusion":"SKIPPED"}]"#,
         )
         .unwrap();
-        let all = joined(&checks_summary(Some(&rollup)).unwrap());
+        let all = joined(&checks_summary(Some(&rollup), 60).unwrap());
         assert!(all.contains("✗ 2 failed"), "{all}");
         assert!(all.contains("build"), "{all}");
         assert!(all.contains("deploy"), "{all}");
@@ -1277,8 +1507,8 @@ index 555..666 100644
         let pending = all.find("● 2 pending").unwrap();
         let passed = all.find("✓ 2 passed").unwrap();
         assert!(failed < pending && pending < passed, "{all}");
-        assert!(checks_summary(None).is_none());
-        assert!(checks_summary(Some(&Value::Array(vec![]))).is_none());
+        assert!(checks_summary(None, 60).is_none());
+        assert!(checks_summary(Some(&Value::Array(vec![])), 60).is_none());
     }
 
     #[test]
@@ -1297,10 +1527,32 @@ index 555..666 100644
         let all = joined(&lines);
         assert!(all.contains("@ann · ○ dismissed · 2026-09-19"), "{all}");
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
-        assert!(all.contains("  ☐ todo"), "bodies are indented: {all}");
+        assert!(all.contains("☐ todo"), "bodies are kept: {all}");
+        assert!(all.contains('●'), "one dot per entry: {all}");
+        assert!(all.contains('▍'), "the section rail: {all}");
         assert!(!all.contains("- [ ]"), "task syntax is gone: {all}");
         assert!(!all.contains('`'), "code ticks are gone: {all}");
-        assert!(all.contains('─'), "entries are rule-separated: {all}");
+        assert!(!all.contains('┌'), "entries are not boxed: {all}");
         assert!(conversation(None, None, 60).is_none());
+    }
+
+    #[test]
+    fn merge_state_reads_githubs_verdict() {
+        let state = |json: &str| {
+            let detail: Value = serde_json::from_str(json).unwrap();
+            merge_state(&detail)
+        };
+        assert_eq!(state(r#"{"state":"OPEN"}"#), Mergeability::Ready);
+        assert_eq!(
+            state(r#"{"state":"OPEN","mergeStateStatus":"BLOCKED"}"#),
+            Mergeability::Ready,
+            "failing checks still offer the button — gh reports why"
+        );
+        assert_eq!(
+            state(r#"{"state":"OPEN","mergeStateStatus":"DIRTY"}"#),
+            Mergeability::Conflicts
+        );
+        assert_eq!(state(r#"{"state":"MERGED"}"#), Mergeability::Merged);
+        assert_eq!(state(r#"{"state":"CLOSED"}"#), Mergeability::Closed);
     }
 }

@@ -180,6 +180,17 @@ enum MenuEntry {
     Separator,
 }
 
+/// The menu entry under a click, if the click lands on one. Entries render
+/// one row each under the popup's top border, so the row maps straight back
+/// to the entry index.
+fn menu_hit(entries: &[MenuEntry], rect: Rect, x: u16, y: u16) -> Option<usize> {
+    if x < rect.x || x >= rect.x.saturating_add(rect.width) {
+        return None;
+    }
+    let row = y.saturating_sub(rect.y.saturating_add(1)) as usize;
+    (row < entries.len()).then_some(row)
+}
+
 /// A modal layered over the list.
 enum Overlay {
     Menu {
@@ -449,19 +460,23 @@ impl App {
     }
 
     /// Fold/unfold a file-tree folder, keeping the selection on its row.
+    /// Collapse keys are scoped to the expanded pull request (`N:path`), so
+    /// two requests touching the same directory do not fold each other.
     fn toggle_tree_folder(&mut self, node: usize) {
         let Some(folder) = self.tree_nodes.get(node) else {
             return;
         };
         let path = folder.path.clone();
-        if !self.tree_collapsed.remove(&path) {
-            self.tree_collapsed.insert(path.clone());
+        let number = self.expanded.unwrap_or(0);
+        let key = format!("{number}:{path}");
+        if !self.tree_collapsed.remove(&key) {
+            self.tree_collapsed.insert(key);
         }
         self.rebuild();
         // The fold hides whatever file was selected under it, so the plain
         // stable-id re-find would clamp to a neighbour — re-find the folder
         // itself instead, like the SCM tree.
-        if let Some(index) = self.find_row_by_stable_id(&format!("folder:{path}")) {
+        if let Some(index) = self.find_row_by_stable_id(&format!("folder:{number}:{path}")) {
             self.select(index);
         }
     }
@@ -625,7 +640,7 @@ impl App {
             Row::FileFolder(node) => self
                 .tree_nodes
                 .get(*node)
-                .map(|folder| format!("folder:{}", folder.path)),
+                .map(|folder| format!("folder:{}:{}", self.expanded.unwrap_or(0), folder.path)),
         }
     }
 
@@ -794,6 +809,47 @@ impl App {
         match herdr_sidebar::viewer::open_in_pane(&pane_id, &self.cwd, &doc_key, &payload) {
             Ok(_) => {}
             Err(e) => self.flash = Some((e, true)),
+        }
+    }
+
+    /// A left click on an overlay. A menu click chooses the CLICKED entry —
+    /// a click used to confirm the merely SELECTED one, so clicking "Squash
+    /// and Merge" ran "Open Pull Request" instead. A click outside the menu
+    /// dismisses it. Other overlays keep confirming the current selection.
+    fn overlay_click(&mut self, x: u16, y: u16) {
+        enum Outcome {
+            Run(u64, MenuAction),
+            Dismiss,
+            ConfirmCurrent,
+        }
+        let outcome = match &self.overlay {
+            Some(Overlay::Menu {
+                number,
+                entries,
+                rect,
+                ..
+            }) => match menu_hit(entries, *rect, x, y) {
+                Some(index) => match entries[index] {
+                    MenuEntry::Action(action, _) => Outcome::Run(*number, action),
+                    MenuEntry::Separator => return,
+                },
+                None => Outcome::Dismiss,
+            },
+            Some(_) => Outcome::ConfirmCurrent,
+            None => return,
+        };
+        match outcome {
+            Outcome::Run(number, action) => {
+                self.overlay = None;
+                self.run_menu_action(number, action);
+            }
+            Outcome::Dismiss => self.overlay = None,
+            Outcome::ConfirmCurrent => {
+                self.overlay_key(KeyEvent::new(
+                    KeyCode::Enter,
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            }
         }
     }
 
@@ -1151,10 +1207,7 @@ impl App {
         self.mouse_pos = Some((mouse.column, mouse.row));
         if self.overlay.is_some() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.overlay_key(KeyEvent::new(
-                    KeyCode::Enter,
-                    crossterm::event::KeyModifiers::NONE,
-                ));
+                self.overlay_click(mouse.column, mouse.row);
             }
             return None;
         }
@@ -1435,6 +1488,7 @@ impl App {
             &[
                 ("⏎", "overview"),
                 ("l", "files"),
+                ("t", "tree"),
                 ("m", "menu"),
                 ("r", "refresh"),
             ],
@@ -1595,6 +1649,8 @@ fn summary_of(text: &str) -> String {
 /// The row list: every drawer header, its pull requests when open, and the
 /// expanded one's files — a tree when `tree`, a flat list otherwise. Returns
 /// the rows with their indent depths, which must stay parallel to each other.
+/// Files and folders nest one level under their pull request, like the
+/// Source Control tree nests under its section.
 fn build_rows(
     drawers: &[DrawerPanel; 3],
     expanded: Option<u64>,
@@ -1620,7 +1676,14 @@ fn build_rows(
             if tree {
                 let entries: Vec<FileEntry> =
                     files.iter().map(|file| file.entry.clone()).collect();
-                for row in changes_tree_rows(&entries, collapsed) {
+                // Collapse keys are `N:path`; strip this request's prefix so
+                // the shared SCM tree builder sees plain repo paths.
+                let prefix = format!("{}:", pr.number);
+                let scoped: BTreeSet<String> = collapsed
+                    .iter()
+                    .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+                    .collect();
+                for row in changes_tree_rows(&entries, &scoped) {
                     match row {
                         ChangeTreeRow::Folder {
                             path,
@@ -1629,24 +1692,24 @@ fn build_rows(
                             expanded,
                         } => {
                             rows.push(Row::FileFolder(nodes.len()));
-                            depths.push(depth);
+                            depths.push(depth + 1);
                             nodes.push(TreeNode {
                                 path,
                                 label,
-                                depth,
+                                depth: depth + 1,
                                 expanded,
                             });
                         }
                         ChangeTreeRow::File { index, depth } => {
                             rows.push(Row::File(index));
-                            depths.push(depth);
+                            depths.push(depth + 1);
                         }
                     }
                 }
             } else {
                 for index in 0..files.len() {
                     rows.push(Row::File(index));
-                    depths.push(0);
+                    depths.push(1);
                 }
             }
         }
@@ -1683,7 +1746,8 @@ fn pr_item(pr: &PullRequest, expanded: bool, width: usize) -> ListItem<'static> 
 }
 
 /// A pull-request row's spans: the expand chevron, number, review marker,
-/// draft note and title.
+/// draft note, title, and a dim `author head→base +A −D` tail — the branch
+/// and size VS Code's GitHub view shows, so a bare title never stands alone.
 fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>> {
     let marker = pr.review.glyph();
     let color = match pr.review {
@@ -1695,17 +1759,38 @@ fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>
     let prefix = format!("#{} ", pr.number);
     let draft = if pr.draft { "draft " } else { "" };
     let text = format!("{draft}{}", pr.title);
-    let room = width
-        .saturating_sub(prefix.chars().count() + marker.chars().count() + 4)
-        .max(4);
-    let title = herdr_sidebar::ui::truncate_to(text, room);
-    vec![
+    let overhead = prefix.chars().count() + marker.chars().count() + 4;
+    let room = width.saturating_sub(overhead).max(4);
+    let lead = format!(" · {} {}→", pr.author, pr.head);
+    let trail = format!(" +{} −{}", pr.additions, pr.deletions);
+    let detail_len = lead.chars().count() + pr.base.chars().count() + trail.chars().count();
+    // Keep the tail when the title can stay readable beside it; otherwise
+    // fall back to a title-only row rather than a one-word stub. The
+    // ARRIVAL branch (`pr.base`) leaves the dim tail so it reads as the
+    // target of the request instead of blending with the metadatum.
+    let (title, tail) = if text.chars().count() + detail_len <= room {
+        (text, detail_len)
+    } else if room.saturating_sub(detail_len) >= 8 {
+        (
+            herdr_sidebar::ui::truncate_to(text, room - detail_len),
+            detail_len,
+        )
+    } else {
+        (herdr_sidebar::ui::truncate_to(text, room), 0)
+    };
+    let mut spans = vec![
         Span::styled(chevron, Style::default().dim()),
         Span::raw(" "),
         Span::styled(prefix, Style::default().dim()),
         Span::styled(format!("{marker} "), Style::default().fg(color)),
         Span::raw(title),
-    ]
+    ];
+    if tail > 0 {
+        spans.push(Span::styled(lead, Style::default().dim()));
+        spans.push(Span::styled(pr.base.clone(), Style::default().fg(palette().header_accent)));
+        spans.push(Span::styled(trail, Style::default().dim()));
+    }
+    spans
 }
 
 /// A file row of the expanded pull request.
@@ -1962,10 +2047,36 @@ mod tests {
             ],
             "folders lead at each level and files nest under them, exactly like SCM"
         );
-        assert_eq!(depths, [0, 0, 0, 1, 2, 1, 0, 0, 0], "indent per row");
+        assert_eq!(depths, [0, 0, 1, 2, 3, 2, 1, 0, 0], "indent per row");
         assert_eq!(nodes[0].path, "src");
         assert_eq!(nodes[1].path, "src/deep");
         assert!(nodes[0].expanded, "a folder holding files is open");
+        assert_eq!(nodes[0].depth, 1, "folders nest under their pull request");
+    }
+
+    #[test]
+    fn collapse_keys_are_scoped_to_their_pull_request() {
+        let panels = drawers(vec![pull(7, ReviewState::Pending)], vec![]);
+        let files = [pr_file("src/a.rs", 'M'), pr_file("src/b.rs", 'A')];
+        // Collapsing "src" for PR #9 must not fold PR #7's folder.
+        let collapsed: BTreeSet<String> = ["9:src".into()].iter().cloned().collect();
+        let mut nodes = Vec::new();
+        let (rows, _) = build_rows(&panels, Some(7), &files, true, &collapsed, &mut nodes);
+        assert!(
+            nodes[0].expanded,
+            "another request's collapse key leaves this tree open: {rows:?}"
+        );
+        let collapsed: BTreeSet<String> = ["7:src".into()].iter().cloned().collect();
+        let mut nodes = Vec::new();
+        let (rows, _) = build_rows(&panels, Some(7), &files, true, &collapsed, &mut nodes);
+        assert!(
+            !nodes[0].expanded,
+            "our own collapse key folds the folder: {rows:?}"
+        );
+        assert_eq!(
+            rows,
+            [Row::Header(0), Row::Pr(0, 0), Row::FileFolder(0), Row::Header(1), Row::Header(2)],
+        );
     }
 
     #[test]
@@ -2050,12 +2161,19 @@ mod tests {
     }
 
     #[test]
-    fn pr_row_carries_number_review_marker_and_title() {
+    fn pr_row_carries_number_review_marker_title_and_tail() {
+        let wide = joined(&pr_spans(&pull(74, ReviewState::Approved), false, 80));
+        assert!(wide.contains("#74"), "{wide}");
+        assert!(wide.contains("✓"), "{wide}");
+        assert!(wide.contains("title 74"), "{wide}");
+        assert!(
+            wide.contains("me feat/x→main +1 −2"),
+            "author, branches and churn travel with the row: {wide}"
+        );
         let spans = pr_spans(&pull(74, ReviewState::Approved), false, 40);
-        let text = joined(&spans);
-        assert!(text.contains("#74"), "{text}");
-        assert!(text.contains("✓"), "{text}");
-        assert!(text.contains("title 74"), "{text}");
+        let narrow = joined(&spans);
+        assert!(narrow.contains("#74"), "{narrow}");
+        assert!(narrow.contains("title 74"), "{narrow}");
         assert_eq!(
             spans[0].content, "▸",
             "a closed request leads with its chevron"
@@ -2079,7 +2197,7 @@ mod tests {
     fn pr_row_marks_drafts() {
         let mut pr = pull(12, ReviewState::Pending);
         pr.draft = true;
-        assert!(joined(&pr_spans(&pr, false, 40)).contains("draft title 12"));
+        assert!(joined(&pr_spans(&pr, false, 80)).contains("draft title 12"));
     }
 
     #[test]
@@ -2124,5 +2242,69 @@ mod tests {
         assert!(text.contains("My Pull Requests"), "{text}");
         assert!(text.contains('3'), "{text}");
         assert!(joined(&header_spans(PrFilter::Open, false, 0, 40)).contains('▸'));
+    }
+
+    #[test]
+    fn menu_click_hits_the_clicked_entry() {
+        let entries = menu_entries(&pull(7, ReviewState::Pending));
+        let rect = Rect::new(10, 5, 30, 20);
+        // Entry rows sit one row under the popup's top border.
+        assert_eq!(menu_hit(&entries, rect, 12, 6), Some(0));
+        // The first merge entry, not the selected first row.
+        let merge_row = entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Action(MenuAction::Merge(_), _)))
+            .unwrap();
+        assert_eq!(
+            menu_hit(&entries, rect, 12, 5 + 1 + merge_row as u16),
+            Some(merge_row)
+        );
+        assert_eq!(menu_hit(&entries, rect, 0, 6), None, "left of the menu");
+        assert_eq!(
+            menu_hit(&entries, rect, 12, 5 + 1 + entries.len() as u16),
+            None,
+            "below the entries"
+        );
+    }
+
+    #[test]
+    fn clicking_a_menu_entry_runs_it() {
+        let follower = Rc::new(RefCell::new(
+            herdr_sidebar::launch::CwdFollower::default(),
+        ));
+        let mut app = App::new(std::env::temp_dir(), follower);
+        let entries = menu_entries(&pull(7, ReviewState::Pending));
+        let merge_row = entries
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Action(MenuAction::Merge(_), _)))
+            .unwrap();
+        app.overlay = Some(Overlay::Menu {
+            number: 7,
+            entries,
+            selected: 0,
+            rect: Rect::new(10, 5, 30, 20),
+        });
+        // Clicking "Merge Commit" asks to confirm THAT action — it used to
+        // run whatever entry was selected (the first row).
+        app.overlay_click(12, 5 + 1 + merge_row as u16);
+        assert!(
+            matches!(
+                app.overlay,
+                Some(Overlay::Confirm {
+                    number: 7,
+                    action: MenuAction::Merge(MergeMethod::Commit),
+                })
+            ),
+            "clicking merge confirms the merge"
+        );
+        // A click outside dismisses the menu.
+        app.overlay = Some(Overlay::Menu {
+            number: 7,
+            entries: menu_entries(&pull(7, ReviewState::Pending)),
+            selected: 0,
+            rect: Rect::new(10, 5, 30, 20),
+        });
+        app.overlay_click(0, 0);
+        assert!(app.overlay.is_none(), "outside clicks dismiss");
     }
 }
