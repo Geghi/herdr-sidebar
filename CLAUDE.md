@@ -836,8 +836,10 @@ HACKING.md — budget time for that before promising a patched build.
   commit at a time and matched by HASH so a refresh keeps it), pushing the rest of the graph
   down instead of opening a second pane; ⏎ on one of those files shows
   `git show <hash> -- <path>` in the preview pane, and Right/`l` / Left/`h` open and close
-  (`list_left`/`list_right` wrap the tree's fold behaviour). The chevron lives in the column
-  LEFT of the first lane, so commits read as expandable without shifting the graph. Files come
+  (`list_left`/`list_right` wrap the tree's fold behaviour). There is NO disclosure chevron on
+  graph rows (a leading ▸/▾ column was user-rejected as wasted space): the first lane starts
+  at the row's left edge like every other drawer's content, and the inline file rows are the
+  only sign a commit is open. Files come
   from `Git::commit_files` — `show --first-parent --name-status` parsed by `parse_name_status`
   (without `--first-parent` a MERGE shows nothing). A file inside a commit is a DIFF, not a
   `git show`: `viewer::load_show` with a path runs a plain
