@@ -15,9 +15,13 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     let text = strip_html(text);
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut fence: Option<String> = None;
+    // Set by a heading, cleared by the next content row: the blank rows a
+    // heading is followed by are swallowed, so a heading sits on its body.
+    let mut after_heading = false;
     let mut lines = text.lines().peekable();
     while let Some(raw) = lines.next() {
         let trimmed = raw.trim_start();
+        let was_heading = std::mem::take(&mut after_heading);
         if fence.is_some() {
             if trimmed.starts_with("```") {
                 fence = None;
@@ -38,16 +42,19 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
             continue;
         }
         if trimmed.is_empty() {
-            if !matches!(out.last(), Some(line) if line.spans.is_empty()) {
+            after_heading = was_heading;
+            if !was_heading && !matches!(out.last(), Some(line) if line.spans.is_empty()) {
                 out.push(Line::default());
             }
             continue;
         }
         if let Some((level, rest)) = heading(trimmed) {
-            if !out.is_empty() {
+            // Exactly one blank row above a heading, never two.
+            if !out.is_empty() && !matches!(out.last(), Some(line) if line.spans.is_empty()) {
                 out.push(Line::default());
             }
             out.push(heading_line(level, rest));
+            after_heading = true;
             continue;
         }
         if is_rule(trimmed) {
@@ -432,11 +439,16 @@ mod tests {
     #[test]
     fn headings_lose_their_markers_and_lead_with_a_break() {
         let lines = render("# Title\n\nbody", 40);
-        assert_eq!(text(&lines), "Title\n\nbody");
+        assert_eq!(text(&lines), "Title\nbody", "a heading sits on its body");
         assert_eq!(
             text(&render("body\n## Sub", 40)),
             "body\n\nSub",
             "a heading opens a break before itself"
+        );
+        assert_eq!(
+            text(&render("body\n\n\n## Sub\n\n\ntext", 40)),
+            "body\n\nSub\ntext",
+            "blank runs collapse to one above a heading and vanish below it"
         );
         let styles = styles(&lines);
         let (title, style) = styles.iter().find(|(t, _)| t == "Title").unwrap();

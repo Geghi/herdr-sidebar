@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::time::SystemTime;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -17,7 +18,7 @@ use crate::ui::palette;
 const LIST_FIELDS: &str = "number,title,author,headRefName,baseRefName,isDraft,updatedAt,url,additions,deletions,changedFiles,reviewDecision";
 
 /// The `gh pr view --json` field list the overview is built from.
-const OVERVIEW_FIELDS: &str = "number,title,author,state,isDraft,baseRefName,headRefName,body,url,additions,deletions,changedFiles,reviewDecision,comments,reviews,statusCheckRollup,mergeable,mergeStateStatus";
+const OVERVIEW_FIELDS: &str = "number,title,author,state,isDraft,baseRefName,headRefName,body,url,additions,deletions,changedFiles,reviewDecision,comments,reviews,statusCheckRollup,mergeable,mergeStateStatus,labels,reviewRequests,updatedAt";
 
 /// Which drawer asks `gh` for which list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,14 +307,24 @@ pub fn detail(root: &Path, number: u64) -> Result<Value, String> {
     serde_json::from_str(&out).map_err(|e| format!("gh json: {e}"))
 }
 
-/// The overview pane's lines in the GitHub web look: a bold title, a filled
-/// state pill, the author and branches, a diff stat bar, labeled rules
-/// between sections, and the conversation as a timeline. Never raw
+/// The overview pane's lines in the GitHub web look: a hero card (band, bold
+/// title, pills, a two-column meta grid), a keycap action bar, then UPPERCASE
+/// section heads over a rule. Description rows carry NO rail — eighty rows
+/// of `▍` read as a slab, not a card — while conversation bodies keep a thin
+/// `▎` in the entry's dot color so the feed still reads as entries. Never raw
 /// markdown: no `#`, `**` or `[..](..)` syntax reaches the pane.
 ///
 /// Nothing here is boxed, so every line re-wraps naturally when the pane
-/// width moves — no rebuild machinery needed.
+/// width moves; only the meta grid's column split is width-derived, and it is
+/// recomputed on every call.
 pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
+    render_overview_at(detail, width, SystemTime::now())
+}
+
+/// Widths under this collapse the meta grid to one column.
+const TWO_COLUMN_MIN: usize = 60;
+
+fn render_overview_at(detail: &Value, width: usize, now: SystemTime) -> Vec<Line<'static>> {
     let text = |key: &str| detail.get(key).and_then(Value::as_str).unwrap_or("");
     let author = detail
         .get("author")
@@ -333,12 +344,12 @@ pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
         .get("changedFiles")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let dim = Style::default().dim();
 
     let mut out: Vec<Line<'static>> = Vec::new();
     // The hero card, topped by a full-bleed band in the state color — GitHub's
-    // PR card edge. The `#n` chip, the state pill, the left rail and the stat
-    // numbers all echo that color, so the request's verdict owns the top of
-    // the page. Sections below keep one shared accent rail down the left.
+    // PR card edge. The `#n` chip, the state pill and the left rail echo that
+    // color, so the request's verdict owns the top of the page.
     let (state, state_color) = state_badge(detail);
     out.push(Line::from(vec![Span::styled(
         " ".repeat(width.max(1)),
@@ -354,54 +365,71 @@ pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
             ),
         ],
     ));
-    // The pill row: the filled state badge, the review decision, mergeability.
+    // The pill row: state, review decision, mergeability, checks in one line.
     let mut pills = vec![pill(state, state_color)];
-    if let Some((glyph, label, color)) =
+    let verdicts = [
         review_line(detail.get("reviewDecision").and_then(Value::as_str))
-    {
+            .map(|(glyph, label, color)| (glyph, label.to_string(), color)),
+        mergeability_line(detail).map(|(glyph, label, color)| (glyph, label.to_string(), color)),
+        checks_line(detail.get("statusCheckRollup")),
+    ];
+    for (glyph, label, color) in verdicts.into_iter().flatten() {
         pills.push(Span::raw("  "));
         pills.push(Span::styled(
             format!("{glyph} {label}"),
             Style::default().fg(color),
         ));
     }
-    if let Some((glyph, label, color)) = mergeability_line(detail) {
-        pills.push(Span::styled("  ·  ", Style::default().dim()));
-        pills.push(Span::styled(
-            format!("{glyph} {label}"),
-            Style::default().fg(color),
+    out.push(rail_line(state_color, pills));
+    out.push(rail_line(state_color, vec![]));
+
+    // The meta grid: `Label  value` cells, two columns when the pane is wide
+    // enough, one below. Rows without content (no reviewers, no labels) drop
+    // out rather than reading `—`.
+    let mut changes = vec![
+        Span::styled(format!("+{additions}"), Style::default().fg(palette().untracked)),
+        Span::styled(format!(" −{deletions}"), Style::default().fg(palette().deleted)),
+    ];
+    if let Some(bar) = stat_bar(additions, deletions, width) {
+        changes.push(Span::raw("  "));
+        changes.extend(bar);
+    }
+    changes.push(Span::styled(format!("  {changed} files"), dim));
+    let mut left: Vec<(&str, Vec<Span<'static>>)> = vec![(
+        "Author",
+        vec![Span::styled(format!("@{author}"), Style::default().fg(palette().accent))],
+    )];
+    if let Some(reviewers) = reviewers(detail.get("reviews"), detail.get("reviewRequests")) {
+        left.push(("Reviewers", reviewers));
+    }
+    if let Some(labels) = labels(detail.get("labels")) {
+        left.push(("Labels", labels));
+    }
+    let mut right: Vec<(&str, Vec<Span<'static>>)> = vec![
+        (
+            "Branch",
+            vec![
+                Span::raw(text("headRefName").to_string()),
+                Span::styled(" → ", dim),
+                Span::raw(text("baseRefName").to_string()),
+            ],
+        ),
+        ("Changes", changes),
+    ];
+    if !text("updatedAt").is_empty() {
+        right.push((
+            "Updated",
+            vec![Span::raw(relative_time(text("updatedAt"), now))],
         ));
     }
-    out.push(rail_line(state_color, pills));
-    // Who, where, how big — the numbers first, then the diff gradient.
-    let mut meta = vec![
-        Span::styled(format!("@{author}"), Style::default().fg(palette().accent)),
-        Span::styled(
-            format!("  {} → {} ", text("headRefName"), text("baseRefName")),
-            Style::default().dim(),
-        ),
-    ];
-    meta.push(Span::styled(
-        format!("+{additions}"),
-        Style::default().fg(palette().untracked),
-    ));
-    meta.push(Span::styled(
-        format!(" −{deletions}"),
-        Style::default().fg(palette().deleted),
-    ));
-    if let Some(bar) = stat_bar(additions, deletions, width) {
-        meta.push(Span::raw("  "));
-        meta.extend(bar);
+    out.extend(meta_grid(left, right, width, state_color));
+
+    // The action bar: only keys the viewer actually answers (it binds `m` for
+    // the merge menu; approve/checkout/browser live in the sidebar's menu).
+    if merge_state(detail) == Mergeability::Ready {
+        out.push(Line::default());
+        out.extend(crate::ui::wrap_hints(&[("m", "merge ▾")], width as u16, 0));
     }
-    meta.push(Span::styled(
-        format!("  {changed} files"),
-        Style::default().dim(),
-    ));
-    out.push(rail_line(state_color, meta));
-    out.push(rail_line(state_color, vec![Span::styled(
-        text("url").to_string(),
-        Style::default().dim(),
-    )]));
 
     if let Some(checks) = checks_summary(detail.get("statusCheckRollup"), width) {
         out.extend(checks);
@@ -409,18 +437,237 @@ pub fn render_overview(detail: &Value, width: usize) -> Vec<Line<'static>> {
 
     let body = text("body").trim();
     if !body.is_empty() {
-        out.push(Line::default());
-        out.push(section_head("Description", width));
+        out.extend(section_head("Description", width));
         out.extend(
-            crate::markdown::render(body, width.saturating_sub(3))
+            crate::markdown::render(body, width.saturating_sub(2))
                 .into_iter()
-                .map(section_row),
+                .map(|line| indent_row("  ", line)),
         );
     }
     if let Some(blocks) = conversation(detail.get("comments"), detail.get("reviews"), width) {
         out.extend(blocks);
     }
     out
+}
+
+/// The `Label  value` rows of the hero's meta grid on the card surface: side
+/// by side at `width >= TWO_COLUMN_MIN`, the left column padded to its widest
+/// cell; stacked left-then-right below that.
+fn meta_grid(
+    left: Vec<(&str, Vec<Span<'static>>)>,
+    right: Vec<(&str, Vec<Span<'static>>)>,
+    width: usize,
+    rail: Color,
+) -> Vec<Line<'static>> {
+    const LABEL: usize = 11;
+    let cell = |label: &str, value: &[Span<'static>]| {
+        let mut spans = vec![Span::styled(format!("{label:<LABEL$}"), Style::default().dim())];
+        spans.extend(value.iter().cloned());
+        spans
+    };
+    let plain = |spans: &[Span<'static>]| spans.iter().map(Span::width).sum::<usize>();
+    let left_w = left
+        .iter()
+        .map(|(_, value)| LABEL + plain(value))
+        .max()
+        .unwrap_or(0);
+    let right_w = right
+        .iter()
+        .map(|(_, value)| LABEL + plain(value))
+        .max()
+        .unwrap_or(0);
+    let two_columns = width >= TWO_COLUMN_MIN && 2 + left_w + 4 + right_w <= width;
+    if !two_columns {
+        return left
+            .iter()
+            .chain(right.iter())
+            .map(|(label, value)| rail_line(rail, cell(label, value)))
+            .collect();
+    }
+    let rows = left.len().max(right.len());
+    (0..rows)
+        .map(|i| {
+            let mut spans = Vec::new();
+            let used = match left.get(i) {
+                Some((label, value)) => {
+                    spans.extend(cell(label, value));
+                    LABEL + plain(value)
+                }
+                None => 0,
+            };
+            if let Some((label, value)) = right.get(i) {
+                spans.push(Span::raw(" ".repeat(left_w - used + 4)));
+                spans.extend(cell(label, value));
+            }
+            rail_line(rail, spans)
+        })
+        .collect()
+}
+
+/// Every reviewer's LATEST verdict (a later review supersedes an earlier one
+/// by the same account; bare COMMENTED reviews do not count as a verdict),
+/// then the accounts still asked for one. `None` when nobody is involved.
+fn reviewers(reviews: Option<&Value>, requests: Option<&Value>) -> Option<Vec<Span<'static>>> {
+    let mut latest: Vec<(String, &'static str, Color)> = Vec::new();
+    for item in reviews.and_then(Value::as_array).into_iter().flatten() {
+        let login = item
+            .get("author")
+            .and_then(|author| author.get("login"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let Some((_, label, color)) =
+            review_badge(item.get("state").and_then(Value::as_str).unwrap_or(""))
+        else {
+            continue;
+        };
+        match latest.iter_mut().find(|(who, _, _)| *who == login) {
+            Some(entry) => *entry = (login, label, color),
+            None => latest.push((login, label, color)),
+        }
+    }
+    for item in requests.and_then(Value::as_array).into_iter().flatten() {
+        let login = item
+            .get("login")
+            .or_else(|| item.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !login.is_empty() && !latest.iter().any(|(who, _, _)| *who == login) {
+            latest.push((login, "pending", palette().modified));
+        }
+    }
+    if latest.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (i, (login, label, color)) in latest.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(format!("@{login}"), Style::default().fg(palette().accent)));
+        spans.push(Span::styled(format!(" ({label})"), Style::default().fg(color)));
+    }
+    Some(spans)
+}
+
+/// GitHub labels as small pills in their own hex color. The text color
+/// follows the fill's luminance, so the pill reads on any theme without
+/// touching the palette: the fill IS the label's color.
+fn labels(labels: Option<&Value>) -> Option<Vec<Span<'static>>> {
+    let mut spans = Vec::new();
+    for item in labels.and_then(Value::as_array).into_iter().flatten() {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        if name.is_empty() {
+            continue;
+        }
+        let bg = item
+            .get("color")
+            .and_then(Value::as_str)
+            .and_then(hex_color)
+            .unwrap_or(palette().keycap_bg);
+        let fg = match bg {
+            Color::Rgb(r, g, b)
+                if 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+                    < 128.0 =>
+            {
+                Color::Rgb(240, 240, 240)
+            }
+            Color::Rgb(..) => Color::Black,
+            _ => palette().keycap_fg,
+        };
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!(" {name} "),
+            Style::default().fg(fg).bg(bg),
+        ));
+    }
+    (!spans.is_empty()).then_some(spans)
+}
+
+/// `rrggbb` (GitHub's label color, no `#`) as an RGB color.
+fn hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// An ISO-8601 UTC stamp (`2026-09-21T09:44:22Z`) as "N days ago" against
+/// `now`. Unparseable input falls back to the raw text.
+pub fn relative_time(stamp: &str, now: SystemTime) -> String {
+    let Some(then) = parse_utc(stamp) else {
+        return stamp.to_string();
+    };
+    let now = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let secs = (now - then).max(0);
+    let unit = |n: i64, name: &str| format!("{n} {name}{} ago", if n == 1 { "" } else { "s" });
+    match secs {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => unit(s / 60, "minute"),
+        s if s < 86_400 => unit(s / 3600, "hour"),
+        s if s < 30 * 86_400 => unit(s / 86_400, "day"),
+        s if s < 365 * 86_400 => unit(s / (30 * 86_400), "month"),
+        s => unit(s / (365 * 86_400), "year"),
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` to unix seconds — enough for GitHub's stamps
+/// without a date crate.
+fn parse_utc(stamp: &str) -> Option<i64> {
+    let (date, time) = stamp.split_once('T')?;
+    let mut ymd = date.split('-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (ymd.next()??, ymd.next()??, ymd.next()??);
+    let mut hms = time
+        .trim_end_matches('Z')
+        .split(':')
+        .map(|p| p.parse::<i64>().ok());
+    let (h, min, s) = (hms.next()??, hms.next()??, hms.next()??);
+    // Howard Hinnant's days_from_civil.
+    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + h * 3600 + min * 60 + s)
+}
+
+/// The rollup as one hero verdict: failing first, then pending, else passed.
+fn checks_line(rollup: Option<&Value>) -> Option<(&'static str, String, Color)> {
+    let checks = parse_checks(rollup);
+    if checks.is_empty() {
+        return None;
+    }
+    let count = |status| checks.iter().filter(|c| c.status == status).count();
+    let (failed, pending) = (count(CheckStatus::Failed), count(CheckStatus::Pending));
+    let plural = |n: usize| if n == 1 { "check" } else { "checks" };
+    Some(if failed > 0 {
+        (
+            "✗",
+            format!("{failed} of {} {} failed", checks.len(), plural(checks.len())),
+            palette().deleted,
+        )
+    } else if pending > 0 {
+        (
+            "●",
+            format!("{pending} {} pending", plural(pending)),
+            palette().modified,
+        )
+    } else {
+        (
+            "✓",
+            format!("{} {} passed", checks.len(), plural(checks.len())),
+            palette().untracked,
+        )
+    })
 }
 
 /// A row on a card surface: the 1-cell left "rail" in the card's accent
@@ -438,33 +685,39 @@ fn rail_line(rail: Color, spans: Vec<Span<'static>>) -> Line<'static> {
     out
 }
 
-/// The same surface applied to an already-built line (markdown bodies, the
-/// checks rows, the conversation feed). The rail is fixed to the shared
-/// section accent, so all sections read as one column down the page.
-fn section_row(line: Line<'static>) -> Line<'static> {
-    let mut all = vec![
-        Span::styled("▍", Style::default().fg(palette().accent)),
-        Span::raw(" "),
-    ];
+/// A body row under a section head: `prefix` (an indent, or a rail glyph)
+/// before the content, no card surface. A blank markdown row stays blank so
+/// the wrap's hanging anchor has nothing to re-emit.
+fn indent_row(prefix: &str, line: Line<'static>) -> Line<'static> {
+    if line.spans.is_empty() {
+        return line;
+    }
+    let mut all = vec![Span::raw(prefix.to_string())];
     all.extend(line.spans);
     let mut out = Line::from(all);
-    out.style = line.style.patch(Style::default().bg(palette().card_bg));
+    out.style = line.style;
     out
 }
 
-/// A section header row on its card: a bold title in the rail accent, then
-/// a dim rule filling the rest — the card's spine, not a box around it.
-fn section_head(title: &str, width: usize) -> Line<'static> {
-    let fill = width.saturating_sub(title.chars().count() + 6).max(2);
-    section_row(Line::from(vec![
-        Span::styled(
-            title.to_string(),
+/// A section head: a blank row, the UPPERCASE title in the accent, a dim
+/// full-width rule, a blank row. Three visual levels then read apart —
+/// section head (caps + rule) > markdown heading (bold header accent, one
+/// blank above) > body.
+fn section_head(title: &str, width: usize) -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!("  {}", title.to_uppercase()),
             Style::default()
                 .fg(palette().accent)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {}", "─".repeat(fill)), Style::default().dim()),
-    ]))
+        )),
+        Line::from(Span::styled(
+            format!("  {}", "─".repeat(width.saturating_sub(2).max(2))),
+            Style::default().dim(),
+        )),
+        Line::default(),
+    ]
 }
 
 /// A filled state pill — ` Open `, ` Merged ` — the GitHub look: the fill,
@@ -675,7 +928,10 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
     }
     /// Named rows per group before the "+N more" tail.
     const NAMED: usize = 6;
-    let mut out = vec![Line::default(), section_head("Checks", width)];
+    if checks.iter().all(|check| check.status == CheckStatus::Passed) {
+        return None;
+    }
+    let mut out = section_head("Checks", width);
     for (status, glyph, label, color) in [
         (
             CheckStatus::Failed,
@@ -703,7 +959,7 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
         if group.is_empty() {
             continue;
         }
-        out.push(section_row(Line::from(vec![Span::styled(
+        out.push(indent_row("  ", Line::from(vec![Span::styled(
             format!("{glyph} {} {label}", group.len()),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )])));
@@ -716,19 +972,16 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
             } else {
                 check.name.clone()
             };
-            out.push(section_row(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(name, Style::default().fg(color)),
-            ])));
+            out.push(indent_row("    ", Line::from(Span::styled(name, Style::default().fg(color)))));
         }
         if group.len() > NAMED {
-            out.push(section_row(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
+            out.push(indent_row(
+                "    ",
+                Line::from(Span::styled(
                     format!("…and {} more", group.len() - NAMED),
                     Style::default().dim(),
-                ),
-            ])));
+                )),
+            ));
         }
     }
     Some(out)
@@ -757,8 +1010,8 @@ fn review_badge(state: &str) -> Option<(&'static str, &'static str, ratatui::sty
 
 /// Comments and reviews, oldest first, as a feed: a `●` dot per entry in
 /// the review's color, the `@author · state · time` line beside it, the
-/// body indented under the dot. Gap rows stay card-free so the section
-/// reads as entries, not one continuous slab.
+/// body under it behind a thin `▎` rail in the same color. A blank row
+/// separates entries so the section reads as entries, not one slab.
 fn conversation(
     comments: Option<&Value>,
     reviews: Option<&Value>,
@@ -815,50 +1068,39 @@ fn conversation(
         return None;
     }
     entries.sort_by(|a, b| a.stamp.cmp(&b.stamp));
-    let mut out = vec![Line::default(), section_head("Conversation", width)];
-    for remark in entries.iter() {
+    let mut out = section_head(&format!("Conversation  ({})", entries.len()), width);
+    for (i, remark) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(Line::default());
+        }
         let day = remark.stamp.split('T').next().unwrap_or(&remark.stamp);
         let dot_color = remark.badge.map_or(palette().ignored, |(_, _, color)| color);
-        let mut head: Vec<Span<'static>> = match remark.badge {
-            Some((glyph, label, color)) => vec![
-                Span::styled(
-                    format!("@{}", remark.author),
-                    Style::default().fg(palette().accent),
-                ),
-                Span::styled(" · ", Style::default().dim()),
-                Span::styled(
+        let mut head = vec![
+            Span::styled("● ", Style::default().fg(dot_color)),
+            Span::styled(
+                format!("@{}", remark.author),
+                Style::default().fg(palette().accent),
+            ),
+        ];
+        match remark.badge {
+            Some((glyph, label, color)) => {
+                head.push(Span::styled(" · ", Style::default().dim()));
+                head.push(Span::styled(
                     format!("{glyph} {label}"),
                     Style::default().fg(color),
-                ),
-            ],
-            None => vec![
-                Span::styled(
-                    format!("@{}", remark.author),
-                    Style::default().fg(palette().accent),
-                ),
-                Span::styled(" · commented", Style::default().dim()),
-            ],
-        };
-        head.push(Span::styled(
-            format!(" · {day}"),
-            Style::default().dim(),
-        ));
-        let mut dot = vec![
-            Span::styled("●", Style::default().fg(dot_color)),
-            Span::raw("  "),
-        ];
-        dot.extend(head);
-        out.push(section_row(Line::from(dot)));
-        if !remark.body.is_empty() {
-            for line in crate::markdown::render(&remark.body, width.saturating_sub(4)) {
-                if line.spans.is_empty() {
-                    out.push(section_row(Line::from(vec![Span::raw("   ")])));
-                } else {
-                    let mut row = vec![Span::raw("  ")];
-                    row.extend(line.spans);
-                    out.push(section_row(Line::from(row)));
-                }
+                ));
             }
+            None => head.push(Span::styled(" · commented", Style::default().dim())),
+        }
+        head.push(Span::styled(format!(" · {day}"), Style::default().dim()));
+        out.push(indent_row("  ", Line::from(head)));
+        let rail = Span::styled("  ▎ ", Style::default().fg(dot_color));
+        for line in crate::markdown::render(&remark.body, width.saturating_sub(4)) {
+            let mut row = vec![rail.clone()];
+            row.extend(line.spans);
+            let mut row = Line::from(row);
+            row.style = line.style;
+            out.push(row);
         }
     }
     Some(out)
@@ -1359,7 +1601,8 @@ index 555..666 100644
         assert!(all.contains("3 files"), "{all}");
         assert!(all.contains("████"), "the diff stat bar: {all}");
         assert!(all.contains("✓ approved"), "{all}");
-        assert!(all.contains("Checks"), "{all}");
+        assert!(all.contains("✗ 1 of 4 checks failed"), "the hero checks verdict: {all}");
+        assert!(all.contains("CHECKS"), "{all}");
         assert!(all.contains("✗ 1 failed"), "{all}");
         assert!(all.contains("build"), "failing checks are named: {all}");
         assert!(all.contains("● 1 pending"), "{all}");
@@ -1369,7 +1612,7 @@ index 555..666 100644
             all.find("✗ 1 failed").unwrap() < all.find("● 1 pending").unwrap(),
             "failing checks come first: {all}"
         );
-        assert!(all.contains("Description"), "{all}");
+        assert!(all.contains("DESCRIPTION"), "{all}");
         assert!(all.contains("Adds full-resolution previews."), "{all}");
         assert!(all.contains("docs"), "{all}");
         assert!(
@@ -1377,14 +1620,19 @@ index 555..666 100644
             "link syntax never reaches the pane: {all}"
         );
         assert!(!all.contains("**"), "markdown markers are gone: {all}");
-        assert!(all.contains("Conversation"), "{all}");
+        assert!(all.contains("CONVERSATION  (3)"), "{all}");
         assert!(all.contains("@ann · ✗ requested changes · 2026-09-19"), "{all}");
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
         assert!(all.contains("@cid · ✓ approved · 2026-09-21"), "{all}");
         assert!(all.contains('●'), "the timeline dots: {all}");
-        assert!(all.contains('▍'), "the card rails: {all}");
+        assert!(all.contains('▍'), "the hero rail: {all}");
         assert!(!all.contains('┌'), "nothing is boxed: {all}");
         assert!(all.contains("✓ mergeable"), "the merge verdict: {all}");
+        assert!(all.contains("Reviewers"), "{all}");
+        assert!(all.contains("@ann (requested changes)"), "{all}");
+        assert!(all.contains("@cid (approved)"), "{all}");
+        assert!(all.contains(" merge ▾"), "the action bar: {all}");
+        assert!(!all.contains("https://github.com/o/r/pull/74"), "the URL row is gone: {all}");
         let changes = all.find("requested changes").unwrap();
         let nit = all.find("nit: rename this").unwrap();
         let approved = all.find("· ✓ approved · 2026-09-21").unwrap();
@@ -1446,13 +1694,15 @@ index 555..666 100644
         )
         .unwrap();
         let all = joined(&render_overview(&detail, 60));
-        assert!(!all.contains("Conversation"), "{all}");
+        assert!(!all.contains("CONVERSATION"), "{all}");
         assert!(
-            !all.contains("Checks"),
+            !all.contains("CHECKS"),
             "no rollup adds no checks section: {all}"
         );
         assert!(!all.contains("approved"), "{all}");
-        assert!(!all.contains("Description"), "{all}");
+        assert!(!all.contains("DESCRIPTION"), "{all}");
+        assert!(!all.contains("Reviewers"), "{all}");
+        assert!(!all.contains("Labels"), "{all}");
         assert!(all.contains("#1"), "{all}");
         assert!(all.contains(" Open "), "the state pill is always there: {all}");
         assert!(!all.contains('┌'), "nothing is boxed: {all}");
@@ -1529,11 +1779,98 @@ index 555..666 100644
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
         assert!(all.contains("☐ todo"), "bodies are kept: {all}");
         assert!(all.contains('●'), "one dot per entry: {all}");
-        assert!(all.contains('▍'), "the section rail: {all}");
+        assert!(all.contains("▎ ☐ todo"), "body rows sit behind the thin rail: {all}");
+        assert!(!all.contains('▍'), "no card rail in the conversation: {all}");
         assert!(!all.contains("- [ ]"), "task syntax is gone: {all}");
         assert!(!all.contains('`'), "code ticks are gone: {all}");
         assert!(!all.contains('┌'), "entries are not boxed: {all}");
         assert!(conversation(None, None, 60).is_none());
+    }
+
+    #[test]
+    fn overview_sections_are_ordered_and_body_rows_carry_no_rail() {
+        let detail: Value = serde_json::from_str(
+            r###"{"number":9,"title":"t","author":{"login":"me"},"state":"OPEN",
+                "headRefName":"a","baseRefName":"b",
+                "body":"## What\n\n\nfirst para\n## Why\nsecond para",
+                "labels":[{"name":"bug","color":"d73a4a"},{"name":"ui","color":"fef2c0"}],
+                "reviewRequests":[{"login":"dan"}],
+                "updatedAt":"2026-09-20T00:00:00Z",
+                "statusCheckRollup":[{"conclusion":"SUCCESS","name":"ci"}],
+                "comments":[{"author":{"login":"bob"},"body":"hi\nthere",
+                             "createdAt":"2026-09-20T10:00:00Z"}]}"###,
+        )
+        .unwrap();
+        let lines = render_overview(&detail, 90);
+        let all = joined(&lines);
+        let pos = |needle: &str| all.find(needle).unwrap_or_else(|| panic!("{needle}: {all}"));
+        assert!(pos("#9") < pos("Author") && pos("Author") < pos("DESCRIPTION"));
+        assert!(pos("DESCRIPTION") < pos("What") && pos("What") < pos("CONVERSATION  (1)"));
+        assert!(!all.contains("CHECKS"), "all-passing checks stay in the hero: {all}");
+        assert!(all.contains("✓ 1 check passed"), "{all}");
+        assert!(all.contains("@dan (pending)"), "{all}");
+        assert!(all.contains(" bug "), "{all}");
+        assert!(all.contains("Updated"), "{all}");
+        // Rails: the hero rows only. Description rows have none; the comment
+        // body rows carry the thin `▎`.
+        let rows: Vec<String> = all.lines().map(str::to_string).collect();
+        let desc = rows.iter().position(|r| r.contains("DESCRIPTION")).unwrap();
+        let conv = rows.iter().position(|r| r.contains("CONVERSATION")).unwrap();
+        assert!(rows[..desc].iter().any(|r| r.starts_with('▍')), "{all}");
+        assert!(
+            rows[desc..conv].iter().all(|r| !r.contains('▍') && !r.contains('▎')),
+            "description rows carry no rail: {all}"
+        );
+        assert!(rows[conv..].iter().any(|r| r.starts_with("  ▎ hi")), "{all}");
+        assert!(rows[conv..].iter().all(|r| !r.contains('▍')), "{all}");
+        // A section head is blank / TITLE / rule / blank; a markdown heading
+        // has exactly one blank above and none below.
+        assert_eq!(rows[desc - 1], "");
+        assert!(rows[desc + 1].starts_with("  ──"), "{}", rows[desc + 1]);
+        assert_eq!(rows[desc + 2], "");
+        assert_eq!(rows[desc + 3], "  What");
+        assert_eq!(rows[desc + 4], "  first para");
+        assert_eq!(rows[desc + 5], "");
+        assert_eq!(rows[desc + 6], "  Why");
+        assert_eq!(rows[desc + 7], "  second para");
+        // Label pills pick their text color from the fill.
+        let spans: Vec<&Span<'static>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let bug = spans.iter().find(|s| s.content == " bug ").unwrap();
+        assert_eq!(bug.style.bg, Some(Color::Rgb(0xd7, 0x3a, 0x4a)));
+        assert_eq!(bug.style.fg, Some(Color::Rgb(240, 240, 240)));
+        let ui = spans.iter().find(|s| s.content == " ui ").unwrap();
+        assert_eq!(ui.style.fg, Some(Color::Black));
+    }
+
+    #[test]
+    fn meta_grid_collapses_to_one_column_in_narrow_panes() {
+        let detail: Value = serde_json::from_str(
+            r#"{"number":9,"title":"t","author":{"login":"me"},"state":"OPEN",
+                "headRefName":"feat/x","baseRefName":"main","updatedAt":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let wide = joined(&render_overview(&detail, 90));
+        let author = wide.lines().find(|r| r.contains("Author")).unwrap();
+        assert!(author.contains("Branch"), "two columns share a row: {author}");
+        let narrow = joined(&render_overview(&detail, 50));
+        let author = narrow.lines().find(|r| r.contains("Author")).unwrap();
+        assert!(!author.contains("Branch"), "one column: {author}");
+        assert!(narrow.lines().any(|r| r.starts_with("▍ Branch")), "{narrow}");
+        assert!(narrow.lines().any(|r| r.starts_with("▍ Updated")), "{narrow}");
+    }
+
+    #[test]
+    fn relative_time_counts_back_from_now() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(parse_utc("2026-09-22T12:00:00Z").unwrap() as u64);
+        assert_eq!(relative_time("2026-09-22T11:59:30Z", now), "just now");
+        assert_eq!(relative_time("2026-09-22T11:15:00Z", now), "45 minutes ago");
+        assert_eq!(relative_time("2026-09-22T11:00:00Z", now), "1 hour ago");
+        assert_eq!(relative_time("2026-09-20T12:00:00Z", now), "2 days ago");
+        assert_eq!(relative_time("2026-07-01T12:00:00Z", now), "2 months ago");
+        assert_eq!(relative_time("2024-09-22T12:00:00Z", now), "2 years ago");
+        assert_eq!(relative_time("2027-01-01T00:00:00Z", now), "just now", "the future clamps");
+        assert_eq!(relative_time("yesterday", now), "yesterday", "unparseable stays raw");
+        assert_eq!(parse_utc("1970-01-02T00:00:00Z"), Some(86_400));
     }
 
     #[test]
@@ -1556,3 +1893,4 @@ index 555..666 100644
         assert_eq!(state(r#"{"state":"CLOSED"}"#), Mergeability::Closed);
     }
 }
+

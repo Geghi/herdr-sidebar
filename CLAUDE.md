@@ -798,6 +798,23 @@ HACKING.md — budget time for that before promising a patched build.
   **Inline code is foreground-only** (`Palette::code_fg`, a soft violet on dark / dark violet
   on light / cyan in the terminal theme): file paths appear in every PR body, and a filled
   `keycap_bg` block over the card read as a smear (user-reported).
+  **Hierarchy (2026-09 relayout)**: the `▍` card rail is HERO-ONLY — applied to every body row
+  it turned an 80-row description into one slab. Section heads are UPPERCASE `accent` bold
+  over a full-width dim `─` rule (blank above and below), markdown h1/h2 are bold
+  `header_accent` with exactly one blank above and NONE below (`markdown::render` swallows
+  the blanks after a heading), description rows are plain two-space indents, and only
+  conversation bodies keep a thin `▎` in the entry's dot color. The hero drops the URL row
+  for a `Label  value` meta grid (Author/Reviewers/Labels | Branch/Changes/Updated; two
+  columns at ≥60 cols, stacked below, recomputed from `width` per render — note `load_pr`
+  renders once at load, only the wrap re-flows on resize). Reviewers = latest non-COMMENTED
+  review per author + `reviewRequests` as `(pending)`; labels are pills in GitHub's own hex
+  with the text color picked from the fill's luminance (no palette entry, the fill IS the
+  label). `updatedAt` renders through `relative_time` (hand-rolled days_from_civil, no date
+  crate). All-passing checks collapse into the hero pill row; the CHECKS section only appears
+  when something failed or is pending. The action bar lists ONLY keys the viewer binds
+  (`m merge ▾`, and only while mergeable) — approve/checkout/browser live in the sidebar
+  menu, so they are not advertised there. Test gotcha: a JSON body containing `"## ` ends an
+  `r#"…"#` raw string — use `r###"`.
   Markdown is also the FALLBACK for markdown FILES when `glow` is missing, because a raw
   `#`/`**` dump is not a preview.
   **Merging from the overview**: a ready open request (`pr::merge_state` reads
