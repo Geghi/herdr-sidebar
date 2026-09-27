@@ -3276,7 +3276,22 @@ impl App {
                     self.open_diff(r, &entry, false);
                 }
             }
+            Row::CommitFile(f) => self.open_commit_file_in_vscode(f),
             _ => {}
+        }
+    }
+
+    /// `o` on an expanded commit's file: open VS Code on the repo root with
+    /// that file, rather than the ordinary diff-preview `o` behavior.
+    fn open_commit_file_in_vscode(&mut self, index: usize) {
+        let Some(entry) = self.commit_files.get(index) else {
+            return;
+        };
+        let Some(repo) = self.repos.get(self.active) else {
+            return;
+        };
+        if let Err(e) = herdr_sidebar::actions::open_in_vscode(repo.git.root(), &entry.path) {
+            self.flash = Some((format!("code: {e}"), true));
         }
     }
 

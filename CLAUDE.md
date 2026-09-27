@@ -863,6 +863,11 @@ HACKING.md — budget time for that before promising a patched build.
   `show --first-parent --format= --patch` and hands it to `diffview::render`, so it looks
   exactly like the Changes section's diff (the whole-commit view keeps git's colored
   `--stat --patch`).
+- **`o` on a `Row::CommitFile` opens VS Code instead of the diff preview**: it runs
+  `code <repo_root> <repo_root>/<path>` (`actions::open_in_vscode`, spawned detached, no
+  shell), the equivalent of `code .` plus opening that one file. Every other row's `o` keeps
+  opening the diff preview (`open_selected_diff` matches on `Row`); the footer's `o: diff`
+  hint is unchanged since it's the common case.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

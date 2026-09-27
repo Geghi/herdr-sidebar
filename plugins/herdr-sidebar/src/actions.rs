@@ -314,6 +314,20 @@ pub fn open_external(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// Open VS Code on `root` with `file` (repo-root-relative) also opened, the
+/// equivalent of `code .` plus opening one file. Spawned detached, never
+/// through a shell.
+pub fn open_in_vscode(root: &Path, file: &str) -> io::Result<()> {
+    std::process::Command::new("code")
+        .arg(root)
+        .arg(root.join(file))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
 const EDITOR_FILE_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE";
 const EDITOR_FILE_TOKEN_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE_TOKEN";
