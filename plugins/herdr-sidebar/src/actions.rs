@@ -314,13 +314,15 @@ pub fn open_external(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// Open VS Code on `root` with `file` (repo-root-relative) also opened, the
-/// equivalent of `code .` plus opening one file. Spawned detached, never
-/// through a shell.
-pub fn open_in_vscode(root: &Path, file: &str) -> io::Result<()> {
-    std::process::Command::new("code")
+/// Open VS Code on `root` with `file` (root-relative or absolute) also opened,
+/// the equivalent of `code .` plus opening one file. Spawned detached, never
+/// through a shell. On Windows `code` is a `code.cmd` shim, which
+/// `Command` does not resolve from a bare `code`.
+pub fn open_in_vscode(root: &Path, file: impl AsRef<Path>) -> io::Result<()> {
+    let program = if cfg!(windows) { "code.cmd" } else { "code" };
+    std::process::Command::new(program)
         .arg(root)
-        .arg(root.join(file))
+        .arg(root.join(file.as_ref()))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

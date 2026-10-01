@@ -511,10 +511,10 @@ HACKING.md — budget time for that before promising a patched build.
   the shared cwd follower as manually overridden before rebuilding either view.
 - "Open with Default App" (`actions::open_external`, in the Explorer menu for FILE rows
   only and in the SCM file menu unless the entry's status letter is `D`) hands the path to
-  the OS shell association. The Explorer list's `o` key is its keyboard twin but
-  deliberately wider: on a folder the association (xdg-open / `open` / explorer.exe)
-  opens the file manager INSIDE it (the tree keymap runs only with no overlay, so
-  Search never sees a bare `o`, and the SCM app keeps its own `o` — open diff).
+  the OS shell association. The Explorer list's `o` key on a FILE opens VS Code instead
+  (see "`o` opens VS Code" below); on a FOLDER it still hands off to the association
+  (xdg-open / `open` / explorer.exe), opening the file manager INSIDE it (the tree keymap
+  runs only with no overlay, so Search never sees a bare `o`).
   Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer
   is GUI-subsystem, so no console is created and Windows 11 never flashes a Windows Terminal
   window; it resolves the association exactly like a double click (verified live — a .html
@@ -863,11 +863,14 @@ HACKING.md — budget time for that before promising a patched build.
   `show --first-parent --format= --patch` and hands it to `diffview::render`, so it looks
   exactly like the Changes section's diff (the whole-commit view keeps git's colored
   `--stat --patch`).
-- **`o` on a `Row::CommitFile` opens VS Code instead of the diff preview**: it runs
-  `code <repo_root> <repo_root>/<path>` (`actions::open_in_vscode`, spawned detached, no
-  shell), the equivalent of `code .` plus opening that one file. Every other row's `o` keeps
-  opening the diff preview (`open_selected_diff` matches on `Row`); the footer's `o: diff`
-  hint is unchanged since it's the common case.
+- **`o` opens VS Code on every file row**: Explorer files, SCM Staged/Changes rows and GRAPH
+  `Row::CommitFile` rows all run `code <root> <root>/<path>` through the ONE helper
+  `actions::open_in_vscode` (spawned detached, no shell) — the equivalent of `code .` plus
+  that file. Root = Explorer root / the row's repo root. cb84b3f wired ONLY CommitFile, so
+  Explorer `o` stayed xdg-open and Changes `o` stayed the diff — that was the "o doesn't
+  open VS Code" bug. On Windows `code` is a `code.cmd` shim that `Command::new("code")`
+  cannot resolve, so the helper spawns `code.cmd` there. Spawn errors surface as a
+  `code failed: …` flash / `open failed: …` notice. Enter/click still open the diff preview.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

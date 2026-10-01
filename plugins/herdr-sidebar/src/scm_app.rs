@@ -1564,7 +1564,7 @@ impl App {
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
-            KeyCode::Char('o') => self.open_selected_diff(),
+            KeyCode::Char('o') => self.open_selected_in_vscode(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Left | KeyCode::Char('h') => self.list_left(),
@@ -3261,37 +3261,34 @@ impl App {
     }
 
     /// `o`: open the diff for the currently selected file row.
-    fn open_selected_diff(&mut self) {
+    fn open_selected_in_vscode(&mut self) {
         let Some(&row) = self.selected.and_then(|i| self.rows.get(i)) else {
             return;
         };
         match row {
             Row::Staged(r, i) => {
-                if let Some(entry) = self.repos[r].status.staged.get(i).cloned() {
-                    self.open_diff(r, &entry, true);
-                }
+                let path = self.repos[r].status.staged.get(i).map(|e| e.path.clone());
+                self.open_in_vscode(r, path);
             }
             Row::Unstaged(r, i) => {
-                if let Some(entry) = self.repos[r].status.unstaged.get(i).cloned() {
-                    self.open_diff(r, &entry, false);
-                }
+                let path = self.repos[r].status.unstaged.get(i).map(|e| e.path.clone());
+                self.open_in_vscode(r, path);
             }
-            Row::CommitFile(f) => self.open_commit_file_in_vscode(f),
+            Row::CommitFile(f) => {
+                let path = self.commit_files.get(f).map(|e| e.path.clone());
+                self.open_in_vscode(self.active, path);
+            }
             _ => {}
         }
     }
 
-    /// `o` on an expanded commit's file: open VS Code on the repo root with
-    /// that file, rather than the ordinary diff-preview `o` behavior.
-    fn open_commit_file_in_vscode(&mut self, index: usize) {
-        let Some(entry) = self.commit_files.get(index) else {
+    /// `o` on a file row: open VS Code on the repo root with that file.
+    fn open_in_vscode(&mut self, repo: usize, path: Option<String>) {
+        let (Some(path), Some(repo)) = (path, self.repos.get(repo)) else {
             return;
         };
-        let Some(repo) = self.repos.get(self.active) else {
-            return;
-        };
-        if let Err(e) = herdr_sidebar::actions::open_in_vscode(repo.git.root(), &entry.path) {
-            self.flash = Some((format!("code: {e}"), true));
+        if let Err(e) = herdr_sidebar::actions::open_in_vscode(repo.git.root(), &path) {
+            self.flash = Some((format!("code failed: {e}"), true));
         }
     }
 
@@ -4458,7 +4455,7 @@ impl App {
             ("u", "none"),
             ("c", "msg"),
             ("A", "suggest"),
-            ("o", "diff"),
+            ("o", "code"),
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),

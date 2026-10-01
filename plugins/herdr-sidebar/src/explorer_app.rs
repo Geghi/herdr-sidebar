@@ -1491,6 +1491,7 @@ impl App {
     /// `open` / explorer.exe) — the keyboard twin of the menu's "Open with
     /// Default App", but wider: on a folder the association opens the file
     /// manager inside it.
+    /// A file instead opens in VS Code on the explorer root (`code <root> <file>`).
     fn open_selected_external(&mut self) {
         let Some(path) = external_open_path(self.selected_row()) else {
             return;
@@ -1499,7 +1500,13 @@ impl App {
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
-        self.notice = Some(match actions::open_external(&path) {
+        let is_dir = self.selected_row().is_some_and(|r| r.is_dir);
+        let result = if is_dir {
+            actions::open_external(&path)
+        } else {
+            actions::open_in_vscode(&self.tree.root_path(), &path)
+        };
+        self.notice = Some(match result {
             Ok(()) => format!("opened: {name}"),
             Err(err) => format!("open failed: {err}"),
         });
