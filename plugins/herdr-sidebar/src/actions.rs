@@ -283,7 +283,7 @@ pub fn reveal(path: &Path, directory: bool) {
     {
         let target = if directory { Some(path) } else { path.parent() };
         if let Some(target) = target {
-            let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+            let _ = gui_command("xdg-open").arg(target).spawn();
         }
     }
 }
@@ -305,7 +305,7 @@ pub fn open_external(path: &Path) -> io::Result<()> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let program = "xdg-open";
 
-    std::process::Command::new(program)
+    gui_command(program)
         .arg(path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -320,7 +320,7 @@ pub fn open_external(path: &Path) -> io::Result<()> {
 /// `Command` does not resolve from a bare `code`.
 pub fn open_in_vscode(root: &Path, file: impl AsRef<Path>) -> io::Result<()> {
     let program = if cfg!(windows) { "code.cmd" } else { "code" };
-    std::process::Command::new(program)
+    gui_command(program)
         .arg(root)
         .arg(root.join(file.as_ref()))
         .stdin(std::process::Stdio::null())
@@ -328,6 +328,38 @@ pub fn open_in_vscode(root: &Path, file: impl AsRef<Path>) -> io::Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// A `Command` for a GUI program. On Linux the herdr server may run without
+/// DISPLAY/WAYLAND_DISPLAY (started from a non-graphical session), so panes
+/// inherit none and GUI launches die with "Missing X server". Borrow the
+/// session's graphical env from `systemctl --user show-environment`, on the
+/// child only.
+fn gui_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if std::env::var_os("DISPLAY").is_none()
+        && std::env::var_os("WAYLAND_DISPLAY").is_none()
+        && let Ok(out) = std::process::Command::new("systemctl")
+            .args(["--user", "show-environment"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+    {
+        command.envs(graphical_env(&String::from_utf8_lossy(&out.stdout)));
+    }
+    command
+}
+
+#[cfg(any(test, all(unix, not(target_os = "macos"))))]
+fn graphical_env(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(k, v)| {
+            matches!(*k, "DISPLAY" | "WAYLAND_DISPLAY" | "XAUTHORITY") && !v.is_empty()
+        })
+        .collect()
 }
 
 const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
@@ -705,6 +737,21 @@ pub fn pick_folder(start: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphical_env_picks_display_vars() {
+        let env = graphical_env(
+            "HOME=/h\nDISPLAY=:0\nWAYLAND_DISPLAY=wayland-0\nXAUTHORITY=/run/x\nPATH=/bin\n",
+        );
+        assert_eq!(
+            env,
+            [
+                ("DISPLAY", ":0"),
+                ("WAYLAND_DISPLAY", "wayland-0"),
+                ("XAUTHORITY", "/run/x")
+            ]
+        );
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("aa-ft-actions-{}-{tag}", std::process::id()));

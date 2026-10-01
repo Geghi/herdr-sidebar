@@ -871,6 +871,10 @@ HACKING.md — budget time for that before promising a patched build.
   open VS Code" bug. On Windows `code` is a `code.cmd` shim that `Command::new("code")`
   cannot resolve, so the helper spawns `code.cmd` there. Spawn errors surface as a
   `code failed: …` flash / `open failed: …` notice. Enter/click still open the diff preview.
+  On Linux a herdr server started outside the graphical session leaves panes with no
+  DISPLAY/WAYLAND_DISPLAY, and `code` exits "Missing X server" (silently: stderr is null).
+  `actions::gui_command` (code, xdg-open) then copies DISPLAY/WAYLAND_DISPLAY/XAUTHORITY from
+  `systemctl --user show-environment` onto the CHILD only.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
