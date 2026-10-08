@@ -354,6 +354,18 @@ impl Default for State {
     }
 }
 
+/// Per-repo gh account overrides from state.json `gh_accounts`
+/// (`{"<ssh host alias or owner>": "<gh account>"}`), default empty.
+pub fn gh_accounts() -> std::collections::HashMap<String, String> {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}')).ok()
+        })
+        .and_then(|v| serde_json::from_value(v.get("gh_accounts")?.clone()).ok())
+        .unwrap_or_default()
+}
+
 pub fn follow_cwd_setting_value(enabled: bool) -> String {
     let value = if enabled { "on" } else { "off" };
     if cfg!(windows) {
@@ -534,6 +546,15 @@ fn write_state(path: &Path, state: State) {
         state.preview_placement.label(),
         state.custom_editor_on_click
     );
+    // `gh_accounts` is not part of the Copy `State`; carry it through rewrites.
+    let json = match std::fs::read_to_string(path)
+        .ok()
+        .and_then(|old| serde_json::from_str::<serde_json::Value>(&old).ok())
+        .and_then(|old| old.get("gh_accounts").cloned())
+    {
+        Some(accounts) => format!("{},\"gh_accounts\":{accounts}}}", &json[..json.len() - 1]),
+        None => json,
+    };
     let _ = std::fs::write(path, json);
 }
 
@@ -1230,5 +1251,21 @@ mod tests {
             .next()
             .unwrap();
         assert_eq!(first, std::env::current_exe().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn write_state_keeps_gh_accounts() {
+        let path = std::env::temp_dir().join(format!("hs-gh-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"merged":true,"gh_accounts":{"github-mokka":"acct"}}"#,
+        )
+        .unwrap();
+        write_state(&path, State::default());
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(json["gh_accounts"]["github-mokka"], "acct");
+        assert_eq!(json["merged"], true);
     }
 }

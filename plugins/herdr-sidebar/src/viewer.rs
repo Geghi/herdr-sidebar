@@ -894,7 +894,11 @@ fn start_pr_merge(
     rx
 }
 
-const MERGE_METHODS: [MergeMethod; 3] = [MergeMethod::Commit, MergeMethod::Squash, MergeMethod::Rebase];
+const MERGE_METHODS: [MergeMethod; 3] = [
+    MergeMethod::Commit,
+    MergeMethod::Squash,
+    MergeMethod::Rebase,
+];
 
 /// Whether a mouse click (0-based, like crossterm reports) lands in `rect`.
 fn rect_hits(rect: Rect, mouse: &MouseEvent) -> bool {
@@ -2156,8 +2160,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 continue;
                             }
                             if merge_ui.menu_open && in_menu {
-                                let row =
-                                    usize::from(mouse.row.wrapping_sub(merge_ui.menu_rect.y));
+                                let row = usize::from(mouse.row.wrapping_sub(merge_ui.menu_rect.y));
                                 if row < MERGE_METHODS.len() {
                                     merge_ui.menu_open = false;
                                     merge_ui.current = MERGE_METHODS[row];
@@ -2433,7 +2436,10 @@ fn draw_doc(
                         .bg(palette().button_bg)
                         .bold(),
                 ),
-                Span::styled(format!(" {} ", merge.current.short()), Style::default().dim()),
+                Span::styled(
+                    format!(" {} ", merge.current.short()),
+                    Style::default().dim(),
+                ),
             ];
             if !hint.is_empty() {
                 let used: usize = line.iter().map(Span::width).sum();
@@ -3561,11 +3567,9 @@ mod tests {
         let dirty: serde_json::Value =
             serde_json::from_str(r#"{"state":"OPEN","mergeStateStatus":"DIRTY"}"#).unwrap();
         assert_eq!(merge_state(&dirty), Mergeability::Conflicts);
-        let merged: serde_json::Value =
-            serde_json::from_str(r#"{"state":"MERGED"}"#).unwrap();
+        let merged: serde_json::Value = serde_json::from_str(r#"{"state":"MERGED"}"#).unwrap();
         assert_eq!(merge_state(&merged), Mergeability::Merged);
-        let closed: serde_json::Value =
-            serde_json::from_str(r#"{"state":"CLOSED"}"#).unwrap();
+        let closed: serde_json::Value = serde_json::from_str(r#"{"state":"CLOSED"}"#).unwrap();
         assert_eq!(merge_state(&closed), Mergeability::Closed);
     }
 
@@ -3760,7 +3764,10 @@ mod tests {
         // The tab's indent is the hanging anchor: each wrapped row carries it.
         assert_eq!(wrapped.len(), 4);
         assert!(
-            wrapped[0].line.spans[0].content.as_ref().starts_with("    "),
+            wrapped[0].line.spans[0]
+                .content
+                .as_ref()
+                .starts_with("    "),
             "the tab renders as a 4-wide indent"
         );
         let unwrapped = build_rows(&[line], false, false, 4);
@@ -3830,7 +3837,14 @@ mod tests {
         let render = |terminal: &mut Terminal<TestBackend>, doc: &mut Doc| -> Vec<String> {
             terminal
                 .draw(|f| {
-                    draw_doc(f, doc, IconTheme::Emoji, false, None, &mut MergeUi::default());
+                    draw_doc(
+                        f,
+                        doc,
+                        IconTheme::Emoji,
+                        false,
+                        None,
+                        &mut MergeUi::default(),
+                    );
                 })
                 .unwrap();
             terminal
@@ -3875,7 +3889,14 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(16, 6)).unwrap();
         terminal
             .draw(|f| {
-                draw_doc(f, &mut doc, IconTheme::Emoji, false, None, &mut MergeUi::default());
+                draw_doc(
+                    f,
+                    &mut doc,
+                    IconTheme::Emoji,
+                    false,
+                    None,
+                    &mut MergeUi::default(),
+                );
             })
             .unwrap();
         assert_eq!(doc.rows.len(), 1);

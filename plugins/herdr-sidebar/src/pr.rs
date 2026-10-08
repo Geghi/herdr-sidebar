@@ -332,14 +332,8 @@ fn render_overview_at(detail: &Value, width: usize, now: SystemTime) -> Vec<Line
         .and_then(Value::as_str)
         .unwrap_or("");
     let number = detail.get("number").and_then(Value::as_u64).unwrap_or(0);
-    let additions = detail
-        .get("additions")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let deletions = detail
-        .get("deletions")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let additions = detail.get("additions").and_then(Value::as_u64).unwrap_or(0);
+    let deletions = detail.get("deletions").and_then(Value::as_u64).unwrap_or(0);
     let changed = detail
         .get("changedFiles")
         .and_then(Value::as_u64)
@@ -387,8 +381,14 @@ fn render_overview_at(detail: &Value, width: usize, now: SystemTime) -> Vec<Line
     // enough, one below. Rows without content (no reviewers, no labels) drop
     // out rather than reading `—`.
     let mut changes = vec![
-        Span::styled(format!("+{additions}"), Style::default().fg(palette().untracked)),
-        Span::styled(format!(" −{deletions}"), Style::default().fg(palette().deleted)),
+        Span::styled(
+            format!("+{additions}"),
+            Style::default().fg(palette().untracked),
+        ),
+        Span::styled(
+            format!(" −{deletions}"),
+            Style::default().fg(palette().deleted),
+        ),
     ];
     if let Some(bar) = stat_bar(additions, deletions, width) {
         changes.push(Span::raw("  "));
@@ -397,7 +397,10 @@ fn render_overview_at(detail: &Value, width: usize, now: SystemTime) -> Vec<Line
     changes.push(Span::styled(format!("  {changed} files"), dim));
     let mut left: Vec<(&str, Vec<Span<'static>>)> = vec![(
         "Author",
-        vec![Span::styled(format!("@{author}"), Style::default().fg(palette().accent))],
+        vec![Span::styled(
+            format!("@{author}"),
+            Style::default().fg(palette().accent),
+        )],
     )];
     if let Some(reviewers) = reviewers(detail.get("reviews"), detail.get("reviewRequests")) {
         left.push(("Reviewers", reviewers));
@@ -461,7 +464,10 @@ fn meta_grid(
 ) -> Vec<Line<'static>> {
     const LABEL: usize = 11;
     let cell = |label: &str, value: &[Span<'static>]| {
-        let mut spans = vec![Span::styled(format!("{label:<LABEL$}"), Style::default().dim())];
+        let mut spans = vec![Span::styled(
+            format!("{label:<LABEL$}"),
+            Style::default().dim(),
+        )];
         spans.extend(value.iter().cloned());
         spans
     };
@@ -545,8 +551,14 @@ fn reviewers(reviews: Option<&Value>, requests: Option<&Value>) -> Option<Vec<Sp
         if i > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(format!("@{login}"), Style::default().fg(palette().accent)));
-        spans.push(Span::styled(format!(" ({label})"), Style::default().fg(color)));
+        spans.push(Span::styled(
+            format!("@{login}"),
+            Style::default().fg(palette().accent),
+        ));
+        spans.push(Span::styled(
+            format!(" ({label})"),
+            Style::default().fg(color),
+        ));
     }
     Some(spans)
 }
@@ -557,7 +569,11 @@ fn reviewers(reviews: Option<&Value>, requests: Option<&Value>) -> Option<Vec<Sp
 fn labels(labels: Option<&Value>) -> Option<Vec<Span<'static>>> {
     let mut spans = Vec::new();
     for item in labels.and_then(Value::as_array).into_iter().flatten() {
-        let name = item.get("name").and_then(Value::as_str).unwrap_or("").trim();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if name.is_empty() {
             continue;
         }
@@ -652,7 +668,11 @@ fn checks_line(rollup: Option<&Value>) -> Option<(&'static str, String, Color)> 
     Some(if failed > 0 {
         (
             "✗",
-            format!("{failed} of {} {} failed", checks.len(), plural(checks.len())),
+            format!(
+                "{failed} of {} {} failed",
+                checks.len(),
+                plural(checks.len())
+            ),
             palette().deleted,
         )
     } else if pending > 0 {
@@ -675,10 +695,7 @@ fn checks_line(rollup: Option<&Value>) -> Option<(&'static str, String, Color)> 
 /// rows whose line style carries a background out to the full pane width,
 /// so every card reads as a full-bleed band, never a box.
 fn rail_line(rail: Color, spans: Vec<Span<'static>>) -> Line<'static> {
-    let mut all = vec![
-        Span::styled("▍", Style::default().fg(rail)),
-        Span::raw(" "),
-    ];
+    let mut all = vec![Span::styled("▍", Style::default().fg(rail)), Span::raw(" ")];
     all.extend(spans);
     let mut out = Line::from(all);
     out.style = Style::default().bg(palette().card_bg);
@@ -928,29 +945,17 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
     }
     /// Named rows per group before the "+N more" tail.
     const NAMED: usize = 6;
-    if checks.iter().all(|check| check.status == CheckStatus::Passed) {
+    if checks
+        .iter()
+        .all(|check| check.status == CheckStatus::Passed)
+    {
         return None;
     }
     let mut out = section_head("Checks", width);
     for (status, glyph, label, color) in [
-        (
-            CheckStatus::Failed,
-            "✗",
-            "failed",
-            palette().deleted,
-        ),
-        (
-            CheckStatus::Pending,
-            "●",
-            "pending",
-            palette().modified,
-        ),
-        (
-            CheckStatus::Passed,
-            "✓",
-            "passed",
-            palette().untracked,
-        ),
+        (CheckStatus::Failed, "✗", "failed", palette().deleted),
+        (CheckStatus::Pending, "●", "pending", palette().modified),
+        (CheckStatus::Passed, "✓", "passed", palette().untracked),
     ] {
         let group: Vec<&Check> = checks
             .iter()
@@ -959,10 +964,13 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
         if group.is_empty() {
             continue;
         }
-        out.push(indent_row("  ", Line::from(vec![Span::styled(
-            format!("{glyph} {} {label}", group.len()),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )])));
+        out.push(indent_row(
+            "  ",
+            Line::from(vec![Span::styled(
+                format!("{glyph} {} {label}", group.len()),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )]),
+        ));
         if status == CheckStatus::Passed {
             continue;
         }
@@ -972,7 +980,10 @@ fn checks_summary(rollup: Option<&Value>, width: usize) -> Option<Vec<Line<'stat
             } else {
                 check.name.clone()
             };
-            out.push(indent_row("    ", Line::from(Span::styled(name, Style::default().fg(color)))));
+            out.push(indent_row(
+                "    ",
+                Line::from(Span::styled(name, Style::default().fg(color))),
+            ));
         }
         if group.len() > NAMED {
             out.push(indent_row(
@@ -1074,7 +1085,9 @@ fn conversation(
             out.push(Line::default());
         }
         let day = remark.stamp.split('T').next().unwrap_or(&remark.stamp);
-        let dot_color = remark.badge.map_or(palette().ignored, |(_, _, color)| color);
+        let dot_color = remark
+            .badge
+            .map_or(palette().ignored, |(_, _, color)| color);
         let mut head = vec![
             Span::styled("● ", Style::default().fg(dot_color)),
             Span::styled(
@@ -1362,9 +1375,8 @@ fn repo_slug(root: &Path) -> Result<(String, String), String> {
 
 /// Run `gh` in `root`, returning stdout, with stderr's first line as the error.
 fn run(root: &Path, args: &[String]) -> Result<String, String> {
-    let out = Command::new("gh")
+    let out = gh_command(root)
         .args(args)
-        .current_dir(root)
         .output()
         .map_err(|e| format!("gh: {e}"))?;
     if !out.status.success() {
@@ -1378,9 +1390,98 @@ fn run(root: &Path, args: &[String]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Every `gh` child for a repo is built here. When `gh_accounts` in
+/// state.json maps the origin's SSH host alias or owner to a gh account, the
+/// child gets that account's token via `GH_TOKEN` — gh's global active
+/// account is never touched. Lookup failures fall back to no override.
+pub fn gh_command(root: &Path) -> Command {
+    let mut cmd = Command::new("gh");
+    cmd.current_dir(root);
+    if let Some(token) = account_for(root).and_then(|a| token_for(&a)) {
+        cmd.env("GH_TOKEN", token);
+    }
+    cmd
+}
+
+fn account_for(root: &Path) -> Option<String> {
+    let accounts = crate::state::gh_accounts();
+    if accounts.is_empty() {
+        return None;
+    }
+    let out = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    let (host, owner, _) = parse_remote(String::from_utf8_lossy(&out.stdout).trim())?;
+    accounts
+        .get(&host)
+        .or_else(|| accounts.get(&owner))
+        .cloned()
+}
+
+fn token_for(account: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().ok()?;
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if let Some(token) = cache.get(account) {
+        return Some(token.clone());
+    }
+    let out = Command::new("gh")
+        .args(["auth", "token", "-u", account])
+        .output()
+        .ok()?;
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || token.is_empty() {
+        return None;
+    }
+    cache.insert(account.to_string(), token.clone());
+    Some(token)
+}
+
+/// `git@alias:owner/repo.git`, `ssh://git@alias/owner/repo`,
+/// `https://host/owner/repo.git` → (host, owner, repo).
+pub fn parse_remote(url: &str) -> Option<(String, String, String)> {
+    let (authority, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        None => url.split_once(':')?,
+    };
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, repo) = path.rsplit_once('/')?;
+    let owner = owner.rsplit('/').next()?;
+    (!host.is_empty() && !owner.is_empty() && !repo.is_empty())
+        .then(|| (host.to_string(), owner.to_string(), repo.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_remote_urls() {
+        let t = |h: &str, o: &str, r: &str| Some((h.into(), o.into(), r.into()));
+        assert_eq!(
+            parse_remote("git@github-mokka:mokkastudios/content-engine.git"),
+            t("github-mokka", "mokkastudios", "content-engine")
+        );
+        assert_eq!(
+            parse_remote("https://github.com/Geghi/herdr-sidebar.git"),
+            t("github.com", "Geghi", "herdr-sidebar")
+        );
+        assert_eq!(
+            parse_remote("ssh://git@github-mokka:22/o/r"),
+            t("github-mokka", "o", "r")
+        );
+        assert_eq!(
+            parse_remote("https://user@github.com/o/r/"),
+            t("github.com", "o", "r")
+        );
+        assert_eq!(parse_remote("/local/path"), None);
+    }
 
     const LIST: &str = r#"[
       {"number":74,"title":"feat: previews","author":{"login":"FacuVCanale"},
@@ -1601,7 +1702,10 @@ index 555..666 100644
         assert!(all.contains("3 files"), "{all}");
         assert!(all.contains("████"), "the diff stat bar: {all}");
         assert!(all.contains("✓ approved"), "{all}");
-        assert!(all.contains("✗ 1 of 4 checks failed"), "the hero checks verdict: {all}");
+        assert!(
+            all.contains("✗ 1 of 4 checks failed"),
+            "the hero checks verdict: {all}"
+        );
         assert!(all.contains("CHECKS"), "{all}");
         assert!(all.contains("✗ 1 failed"), "{all}");
         assert!(all.contains("build"), "failing checks are named: {all}");
@@ -1621,7 +1725,10 @@ index 555..666 100644
         );
         assert!(!all.contains("**"), "markdown markers are gone: {all}");
         assert!(all.contains("CONVERSATION  (3)"), "{all}");
-        assert!(all.contains("@ann · ✗ requested changes · 2026-09-19"), "{all}");
+        assert!(
+            all.contains("@ann · ✗ requested changes · 2026-09-19"),
+            "{all}"
+        );
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
         assert!(all.contains("@cid · ✓ approved · 2026-09-21"), "{all}");
         assert!(all.contains('●'), "the timeline dots: {all}");
@@ -1632,7 +1739,10 @@ index 555..666 100644
         assert!(all.contains("@ann (requested changes)"), "{all}");
         assert!(all.contains("@cid (approved)"), "{all}");
         assert!(all.contains(" merge ▾"), "the action bar: {all}");
-        assert!(!all.contains("https://github.com/o/r/pull/74"), "the URL row is gone: {all}");
+        assert!(
+            !all.contains("https://github.com/o/r/pull/74"),
+            "the URL row is gone: {all}"
+        );
         let changes = all.find("requested changes").unwrap();
         let nit = all.find("nit: rename this").unwrap();
         let approved = all.find("· ✓ approved · 2026-09-21").unwrap();
@@ -1672,7 +1782,11 @@ index 555..666 100644
         assert_eq!(bar.len(), 10, "{text}");
         let green = expect(10, 2, 80).unwrap() as usize;
         assert_eq!(green, 8, "10 of 12 changes are additions");
-        assert_eq!(bar[0].style.fg, Some(palette().untracked), "the outer edge is the full green");
+        assert_eq!(
+            bar[0].style.fg,
+            Some(palette().untracked),
+            "the outer edge is the full green"
+        );
         // The tail joins dark: not the full red, a shade of it.
         assert_ne!(bar[green].style.fg, Some(palette().deleted));
         assert_eq!(bar[bar.len() - 1].style.fg, Some(palette().deleted));
@@ -1704,7 +1818,10 @@ index 555..666 100644
         assert!(!all.contains("Reviewers"), "{all}");
         assert!(!all.contains("Labels"), "{all}");
         assert!(all.contains("#1"), "{all}");
-        assert!(all.contains(" Open "), "the state pill is always there: {all}");
+        assert!(
+            all.contains(" Open "),
+            "the state pill is always there: {all}"
+        );
         assert!(!all.contains('┌'), "nothing is boxed: {all}");
     }
 
@@ -1779,8 +1896,14 @@ index 555..666 100644
         assert!(all.contains("@bob · commented · 2026-09-20"), "{all}");
         assert!(all.contains("☐ todo"), "bodies are kept: {all}");
         assert!(all.contains('●'), "one dot per entry: {all}");
-        assert!(all.contains("▎ ☐ todo"), "body rows sit behind the thin rail: {all}");
-        assert!(!all.contains('▍'), "no card rail in the conversation: {all}");
+        assert!(
+            all.contains("▎ ☐ todo"),
+            "body rows sit behind the thin rail: {all}"
+        );
+        assert!(
+            !all.contains('▍'),
+            "no card rail in the conversation: {all}"
+        );
         assert!(!all.contains("- [ ]"), "task syntax is gone: {all}");
         assert!(!all.contains('`'), "code ticks are gone: {all}");
         assert!(!all.contains('┌'), "entries are not boxed: {all}");
@@ -1803,10 +1926,16 @@ index 555..666 100644
         .unwrap();
         let lines = render_overview(&detail, 90);
         let all = joined(&lines);
-        let pos = |needle: &str| all.find(needle).unwrap_or_else(|| panic!("{needle}: {all}"));
+        let pos = |needle: &str| {
+            all.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {all}"))
+        };
         assert!(pos("#9") < pos("Author") && pos("Author") < pos("DESCRIPTION"));
         assert!(pos("DESCRIPTION") < pos("What") && pos("What") < pos("CONVERSATION  (1)"));
-        assert!(!all.contains("CHECKS"), "all-passing checks stay in the hero: {all}");
+        assert!(
+            !all.contains("CHECKS"),
+            "all-passing checks stay in the hero: {all}"
+        );
         assert!(all.contains("✓ 1 check passed"), "{all}");
         assert!(all.contains("@dan (pending)"), "{all}");
         assert!(all.contains(" bug "), "{all}");
@@ -1815,13 +1944,21 @@ index 555..666 100644
         // body rows carry the thin `▎`.
         let rows: Vec<String> = all.lines().map(str::to_string).collect();
         let desc = rows.iter().position(|r| r.contains("DESCRIPTION")).unwrap();
-        let conv = rows.iter().position(|r| r.contains("CONVERSATION")).unwrap();
+        let conv = rows
+            .iter()
+            .position(|r| r.contains("CONVERSATION"))
+            .unwrap();
         assert!(rows[..desc].iter().any(|r| r.starts_with('▍')), "{all}");
         assert!(
-            rows[desc..conv].iter().all(|r| !r.contains('▍') && !r.contains('▎')),
+            rows[desc..conv]
+                .iter()
+                .all(|r| !r.contains('▍') && !r.contains('▎')),
             "description rows carry no rail: {all}"
         );
-        assert!(rows[conv..].iter().any(|r| r.starts_with("  ▎ hi")), "{all}");
+        assert!(
+            rows[conv..].iter().any(|r| r.starts_with("  ▎ hi")),
+            "{all}"
+        );
         assert!(rows[conv..].iter().all(|r| !r.contains('▍')), "{all}");
         // A section head is blank / TITLE / rule / blank; a markdown heading
         // has exactly one blank above and none below.
@@ -1851,25 +1988,43 @@ index 555..666 100644
         .unwrap();
         let wide = joined(&render_overview(&detail, 90));
         let author = wide.lines().find(|r| r.contains("Author")).unwrap();
-        assert!(author.contains("Branch"), "two columns share a row: {author}");
+        assert!(
+            author.contains("Branch"),
+            "two columns share a row: {author}"
+        );
         let narrow = joined(&render_overview(&detail, 50));
         let author = narrow.lines().find(|r| r.contains("Author")).unwrap();
         assert!(!author.contains("Branch"), "one column: {author}");
-        assert!(narrow.lines().any(|r| r.starts_with("▍ Branch")), "{narrow}");
-        assert!(narrow.lines().any(|r| r.starts_with("▍ Updated")), "{narrow}");
+        assert!(
+            narrow.lines().any(|r| r.starts_with("▍ Branch")),
+            "{narrow}"
+        );
+        assert!(
+            narrow.lines().any(|r| r.starts_with("▍ Updated")),
+            "{narrow}"
+        );
     }
 
     #[test]
     fn relative_time_counts_back_from_now() {
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(parse_utc("2026-09-22T12:00:00Z").unwrap() as u64);
+        let now = SystemTime::UNIX_EPOCH
+            + std::time::Duration::from_secs(parse_utc("2026-09-22T12:00:00Z").unwrap() as u64);
         assert_eq!(relative_time("2026-09-22T11:59:30Z", now), "just now");
         assert_eq!(relative_time("2026-09-22T11:15:00Z", now), "45 minutes ago");
         assert_eq!(relative_time("2026-09-22T11:00:00Z", now), "1 hour ago");
         assert_eq!(relative_time("2026-09-20T12:00:00Z", now), "2 days ago");
         assert_eq!(relative_time("2026-07-01T12:00:00Z", now), "2 months ago");
         assert_eq!(relative_time("2024-09-22T12:00:00Z", now), "2 years ago");
-        assert_eq!(relative_time("2027-01-01T00:00:00Z", now), "just now", "the future clamps");
-        assert_eq!(relative_time("yesterday", now), "yesterday", "unparseable stays raw");
+        assert_eq!(
+            relative_time("2027-01-01T00:00:00Z", now),
+            "just now",
+            "the future clamps"
+        );
+        assert_eq!(
+            relative_time("yesterday", now),
+            "yesterday",
+            "unparseable stays raw"
+        );
         assert_eq!(parse_utc("1970-01-02T00:00:00Z"), Some(86_400));
     }
 
@@ -1893,4 +2048,3 @@ index 555..666 100644
         assert_eq!(state(r#"{"state":"CLOSED"}"#), Mergeability::Closed);
     }
 }
-

@@ -227,7 +227,10 @@ mod tests {
         assert!(rows.iter().all(|row| row.width() <= 5));
         // The tab hangs its indent; the flow still carries every digit.
         assert_eq!(
-            texts(&rows).iter().map(|r| r.trim_start()).collect::<String>(),
+            texts(&rows)
+                .iter()
+                .map(|r| r.trim_start())
+                .collect::<String>(),
             "1234"
         );
     }
@@ -238,11 +241,7 @@ mod tests {
         let rows = wrap_line(&line, 12);
         assert!(rows.len() > 1);
         for row in &rows {
-            assert!(
-                row.spans[0].content.starts_with("▍ "),
-                "{:?}",
-                texts(&rows)
-            );
+            assert!(row.spans[0].content.starts_with("▍ "), "{:?}", texts(&rows));
         }
         let body: String = texts(&rows)
             .iter()

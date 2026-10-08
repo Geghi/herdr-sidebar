@@ -1674,8 +1674,7 @@ fn build_rows(
                 continue;
             }
             if tree {
-                let entries: Vec<FileEntry> =
-                    files.iter().map(|file| file.entry.clone()).collect();
+                let entries: Vec<FileEntry> = files.iter().map(|file| file.entry.clone()).collect();
                 // Collapse keys are `N:path`; strip this request's prefix so
                 // the shared SCM tree builder sees plain repo paths.
                 let prefix = format!("{}:", pr.number);
@@ -1787,14 +1786,22 @@ fn pr_spans(pr: &PullRequest, expanded: bool, width: usize) -> Vec<Span<'static>
     ];
     if tail > 0 {
         spans.push(Span::styled(lead, Style::default().dim()));
-        spans.push(Span::styled(pr.base.clone(), Style::default().fg(palette().header_accent)));
+        spans.push(Span::styled(
+            pr.base.clone(),
+            Style::default().fg(palette().header_accent),
+        ));
         spans.push(Span::styled(trail, Style::default().dim()));
     }
     spans
 }
 
 /// A file row of the expanded pull request.
-fn file_item(file: &PrFile, depth: Option<usize>, width: usize, theme: IconTheme) -> ListItem<'static> {
+fn file_item(
+    file: &PrFile,
+    depth: Option<usize>,
+    width: usize,
+    theme: IconTheme,
+) -> ListItem<'static> {
     ListItem::new(Line::from(file_spans(file, depth, width, theme)))
 }
 
@@ -2024,14 +2031,8 @@ mod tests {
             pr_file("CLAUDE.md", 'M'),
         ];
         let mut nodes = Vec::new();
-        let (rows, depths) = build_rows(
-            &panels,
-            Some(7),
-            &files,
-            true,
-            &BTreeSet::new(),
-            &mut nodes,
-        );
+        let (rows, depths) =
+            build_rows(&panels, Some(7), &files, true, &BTreeSet::new(), &mut nodes);
         assert_eq!(
             rows,
             [
@@ -2075,16 +2076,20 @@ mod tests {
         );
         assert_eq!(
             rows,
-            [Row::Header(0), Row::Pr(0, 0), Row::FileFolder(0), Row::Header(1), Row::Header(2)],
+            [
+                Row::Header(0),
+                Row::Pr(0, 0),
+                Row::FileFolder(0),
+                Row::Header(1),
+                Row::Header(2)
+            ],
         );
     }
 
     #[test]
     fn selection_survives_folds_step_outs_and_the_tree_toggle() {
         fn test_app() -> App {
-            let follower = Rc::new(RefCell::new(
-                herdr_sidebar::launch::CwdFollower::default(),
-            ));
+            let follower = Rc::new(RefCell::new(herdr_sidebar::launch::CwdFollower::default()));
             App::new(std::env::temp_dir(), follower)
         }
         let mut app = test_app();
@@ -2269,9 +2274,7 @@ mod tests {
 
     #[test]
     fn clicking_a_menu_entry_runs_it() {
-        let follower = Rc::new(RefCell::new(
-            herdr_sidebar::launch::CwdFollower::default(),
-        ));
+        let follower = Rc::new(RefCell::new(herdr_sidebar::launch::CwdFollower::default()));
         let mut app = App::new(std::env::temp_dir(), follower);
         let entries = menu_entries(&pull(7, ReviewState::Pending));
         let merge_row = entries

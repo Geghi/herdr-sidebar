@@ -838,6 +838,14 @@ HACKING.md — budget time for that before promising a patched build.
   at `PR_TICK` (250ms) while the App throttles its own refresh to `REFRESH_EVERY` (120s).
   `launch_decision_for` generalises the git pane decision over a view's token/label, so the
   PR view keeps the ensure hook's focus/open/close behaviour.
+- **Per-repo gh account**: every `gh` child is built by `pr::gh_command(root)` (never
+  `Command::new("gh")` directly). state.json `gh_accounts` (`{"<ssh host alias or owner>":
+  "<gh account>"}`, default absent/empty) is matched against origin's host alias first, then
+  owner (`pr::parse_remote`); a hit sets `GH_TOKEN=$(gh auth token -u <account>)` on that child
+  only (token cached per process; failure = no override), so gh's global active account is
+  untouched. gh resolves SSH host aliases (`git@github-mokka:o/r`) itself — no `-R` needed
+  (verified live). `State` is `Copy`, so `gh_accounts` lives outside it: `state::gh_accounts()`
+  reads the raw key and `write_state` carries it through every rewrite. Edit it by hand.
 - **The GRAPH drawer draws lanes, not git's ASCII art**: `Git::graph` fetches
   `--topo-order --pretty=format:%h%x1f%p%x1f%D%x1f%s` (unit separators keep subjects with
   `|` or `(` intact; `--topo-order` is required — a parent must never precede its child) and
