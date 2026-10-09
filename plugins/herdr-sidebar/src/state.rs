@@ -327,6 +327,10 @@ pub struct State {
     /// Group the Source Control changes into a collapsible folder tree (VS
     /// Code's "View as Tree") instead of the flat file list.
     pub scm_tree: bool,
+    /// Diff previews show the whole file with the changes inline (`f` in
+    /// the viewer toggles to hunks only). Remembered so every diff opens in
+    /// the last mode.
+    pub diff_full: bool,
 }
 
 impl Default for State {
@@ -350,6 +354,7 @@ impl Default for State {
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
             scm_tree: false,
+            diff_full: true,
         }
     }
 }
@@ -527,7 +532,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"scm_tree\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"scm_tree\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"diff_full\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -544,7 +549,8 @@ fn write_state(path: &Path, state: State) {
         clamp_sidebar_width(state.sidebar_width),
         state.color_theme.label(),
         state.preview_placement.label(),
-        state.custom_editor_on_click
+        state.custom_editor_on_click,
+        state.diff_full
     );
     // `gh_accounts` is not part of the Copy `State`; carry it through rewrites.
     let json = match std::fs::read_to_string(path)
@@ -988,12 +994,22 @@ pub fn parse_state(json: &str) -> State {
             .get("custom_editor_on_click")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.custom_editor_on_click),
+        diff_full: value
+            .get("diff_full")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.diff_full),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_full_defaults_on_and_round_trips() {
+        assert!(parse_state("{}").diff_full);
+        assert!(!parse_state(r#"{"diff_full":false}"#).diff_full);
+    }
 
     /// A workspace can hold several unrelated project tabs. The caller
     /// combines its workspace label and normalized spawn cwd so a volatile tab
@@ -1133,6 +1149,7 @@ mod tests {
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
             scm_tree: true,
+            diff_full: true,
         };
         let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"scm_tree\":true,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);

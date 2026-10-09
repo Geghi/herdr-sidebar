@@ -969,6 +969,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
                 "--format=",
                 "--patch",
                 "--no-ext-diff",
+                context_arg(),
                 spec,
                 "--",
                 &rel,
@@ -1416,6 +1417,26 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     }
 }
 
+/// Diff context for the persisted `diff_full` mode: a huge `-U` makes git
+/// emit the whole file as one hunk; `-U3` is git's default hunks-only view.
+fn context_arg() -> &'static str {
+    if crate::state::load_state().diff_full {
+        "-U999999"
+    } else {
+        "-U3"
+    }
+}
+
+/// Requests the `f` full-file/hunks toggle applies to. PR diffs are
+/// excluded: only the patch exists there, so they always show hunks.
+fn is_git_diff(request: &Request) -> bool {
+    match request {
+        Request::Diff { kind, .. } => !kind.starts_with("pr:"),
+        Request::Show { path, .. } => path.is_some(),
+        _ => false,
+    }
+}
+
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
     // A file inside a PULL REQUEST: `gh pr diff` prints the whole patch, and
@@ -1446,7 +1467,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     }
     // Plain (uncolored) diff: crate::diffview parses it and renders the
     // VS Code look — dual gutters, tinted rows, syntax-highlighted code.
-    let mut args: Vec<String> = vec!["diff".into(), "--no-ext-diff".into()];
+    let mut args: Vec<String> = vec!["diff".into(), "--no-ext-diff".into(), context_arg().into()];
     match kind {
         "staged" => args.push("--cached".into()),
         // An untracked file has no diff; --no-index against the null device
@@ -1799,6 +1820,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_external_check = Instant::now();
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
+    let mut diff_full = crate::state::load_state().diff_full;
+    let mut force_diff_refresh = false;
     let mut identity_pending = false;
     let result = loop {
         let loaded =
@@ -1827,6 +1850,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     doc,
                     theme,
                     matches!(current, Some(Request::File { .. })),
+                    current
+                        .as_ref()
+                        .filter(|r| is_git_diff(r))
+                        .map(|_| diff_full),
                     notice.as_deref(),
                     &mut merge_ui,
                 );
@@ -2095,6 +2122,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    KeyCode::Char('f')
+                                        if current.as_ref().is_some_and(is_git_diff) =>
+                                    {
+                                        diff_full = crate::state::update_state(|s| {
+                                            s.diff_full = !s.diff_full
+                                        })
+                                        .diff_full;
+                                        force_diff_refresh = true;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2272,12 +2308,16 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 apply_diff_refresh(doc, refreshed);
             }
         }
-        if last_diff_refresh.elapsed() >= Duration::from_secs(2) {
+        if force_diff_refresh || last_diff_refresh.elapsed() >= Duration::from_secs(2) {
+            // A `git show` diff is immutable: it only reloads on an `f` toggle.
             if preview_load.is_none()
                 && diff_refresh.is_none()
                 && matches!(mode, ViewMode::Preview(_))
-                && let Some(request @ Request::Diff { .. }) = current.clone()
+                && let Some(request) = current.clone()
+                && (matches!(request, Request::Diff { .. })
+                    || (force_diff_refresh && is_git_diff(&request)))
             {
+                force_diff_refresh = false;
                 let worker_request = request.clone();
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
@@ -2300,6 +2340,7 @@ fn draw_doc(
     doc: &mut Doc,
     theme: IconTheme,
     editable: bool,
+    diff_full: Option<bool>,
     notice: Option<&str>,
     merge: &mut MergeUi,
 ) -> (usize, Rect) {
@@ -2363,10 +2404,13 @@ fn draw_doc(
         .collect();
     frame.render_widget(Paragraph::new(text), body);
 
-    let wrap_hint = if doc.wrap {
-        "w: wrap on"
-    } else {
-        "w: wrap off"
+    let wrap_hint = match (doc.wrap, diff_full) {
+        (true, None) => "w: wrap on",
+        (false, None) => "w: wrap off",
+        (true, Some(true)) => "f: full file  w: wrap on",
+        (false, Some(true)) => "f: full file  w: wrap off",
+        (true, Some(false)) => "f: hunks  w: wrap on",
+        (false, Some(false)) => "f: hunks  w: wrap off",
     };
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
@@ -3435,6 +3479,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_file_toggle_skips_pr_and_whole_commit_views() {
+        let root = PathBuf::from("/r");
+        let diff = |kind: &str| Request::Diff {
+            root: root.clone(),
+            rel: "a".into(),
+            kind: kind.into(),
+        };
+        assert!(is_git_diff(&diff("worktree")));
+        assert!(is_git_diff(&diff("staged")));
+        assert!(!is_git_diff(&diff("pr:7")));
+        let show = |path: Option<&str>| Request::Show {
+            root: root.clone(),
+            spec: "HEAD".into(),
+            path: path.map(str::to_string),
+        };
+        assert!(is_git_diff(&show(Some("a"))));
+        assert!(!is_git_diff(&show(None)));
+    }
+
+    #[test]
     fn a_file_inside_a_commit_renders_as_a_diff_not_a_show() {
         let root = std::env::temp_dir().join(format!(
             "herdr-viewer-commit-file-{}-{}",
@@ -3843,6 +3907,7 @@ mod tests {
                         IconTheme::Emoji,
                         false,
                         None,
+                        None,
                         &mut MergeUi::default(),
                     );
                 })
@@ -3894,6 +3959,7 @@ mod tests {
                     &mut doc,
                     IconTheme::Emoji,
                     false,
+                    None,
                     None,
                     &mut MergeUi::default(),
                 );

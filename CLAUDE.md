@@ -1026,6 +1026,13 @@ setting are all gone.
   The refresh runs on a worker thread so a slow Git process cannot starve the viewer heartbeat;
   unchanged output is left in place so a mouse selection is not erased every two seconds.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+- `f` toggles full file (default) vs hunks only, persisted globally as `diff_full` in
+  state.json (`update_state`, so `gh_accounts` survives). Full = `-U999999` on both `git diff`
+  and the graph's per-file `git show` (`context_arg`); the toggle re-runs the load through the
+  ~2s refresh channel, so `apply_diff_refresh` keeps wrap and re-anchors by source line (the
+  anchor is approximate across a mode switch, since the line set itself changes). PR file diffs
+  (`pr:<n>`) and whole-commit `git show` are excluded (`is_git_diff`): only the patch exists, so
+  they always show hunks and the footer omits the `f` hint.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
