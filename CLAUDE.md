@@ -1036,9 +1036,9 @@ setting are all gone.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
-- Long lines WRAP by default; `w` toggles wrapping off for the current document
-  (per-document — a newly loaded doc starts wrapped again), and the footer shows which
-  state you are in.
+- Files, diffs and `git show` docs start UNWRAPPED (horizontal scroll); `w` toggles wrapping on
+  for the current document (per-document — a newly loaded doc starts unwrapped again), and the
+  footer shows which state you are in. The PR overview and placeholder docs stay wrapped.
 - Tabs always expand to 4-column stops through `wrap_line`, even with wrapping off or when
   ratatui's raw Unicode width says the line fits (it counts C0 tab as width zero).
 - **Do NOT wrap with ratatui's `Paragraph::wrap`** here. The viewer slices the visible
