@@ -1438,6 +1438,9 @@ fn is_git_diff(request: &Request) -> bool {
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
+    if let Some(spec) = kind.strip_prefix("base:") {
+        return load_base_diff(root, rel, spec);
+    }
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
     // A file inside a PULL REQUEST: `gh pr diff` prints the whole patch, and
     // the slice for this file renders through the same renderer as any other
@@ -1514,6 +1517,40 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     Doc {
         name: name.clone(),
         context: format!("{} — {what} diff", root.join(rel).display()),
+        lines,
+        numbered: false,
+        media: None,
+        scroll: 0,
+        wrap: false,
+        rows: Vec::new(),
+        rows_key: None,
+        pending_src: None,
+        pr_target: None,
+        selection: PreviewSelection::default(),
+    }
+}
+
+/// `vs base`: everything the branch changed since it left its base, as one
+/// multi-file diff of the merge-base against the working tree. `spec` is
+/// `<merge-base>:<base name>`; untracked files are excluded, like git diff.
+fn load_base_diff(root: &Path, rel: &str, spec: &str) -> Doc {
+    let (mb, base) = spec.split_once(':').unwrap_or((spec, spec));
+    let out = std::process::Command::new("git")
+        .args(["diff", "--no-ext-diff", context_arg(), mb])
+        .current_dir(root)
+        .output();
+    let lines = match out {
+        Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
+        Ok(out) if !out.status.success() => vec![Line::raw(format!(
+            "({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))],
+        Ok(out) if out.stdout.is_empty() => vec![Line::raw(format!("(no changes vs {base})"))],
+        Ok(out) => crate::diffview::render_files(&String::from_utf8_lossy(&out.stdout)),
+    };
+    Doc {
+        name: rel.to_string(),
+        context: format!("{} — changes since {base}", root.display()),
         lines,
         numbered: false,
         media: None,

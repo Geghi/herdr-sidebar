@@ -43,7 +43,7 @@ use herdr_sidebar::ui::{
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
-const REPO_HEADER_ACTIONS: &str = " ⇅  ✓ ";
+const REPO_HEADER_ACTIONS: &str = " ⇄  ⇅  ✓ ";
 
 /// How long two clicks on the same row still count as a double click (to pin
 /// a diff/show tab), matching the file explorer.
@@ -406,12 +406,17 @@ enum MenuTarget {
         kind: Drawer,
         index: usize,
     },
+    /// The Changes section header.
+    Changes {
+        repo: usize,
+    },
 }
 
 /// Context-menu actions for file rows and drawer lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     OpenDiff,
+    DiffVsBase,
     StageOrUnstage,
     Discard,
     AddToGitignore,
@@ -587,6 +592,8 @@ struct ClickZones {
     sync: Rect,
     /// Branch text in the Source Control header.
     header_branch: Rect,
+    /// The ⇄ `vs base` button beside it.
+    header_base: Rect,
     git_footer: FooterZones,
 }
 
@@ -1564,6 +1571,7 @@ impl App {
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
+            KeyCode::Char('B') => self.open_base_diff(self.active),
             KeyCode::Char('o') => self.open_selected_in_vscode(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('t') => self.toggle_tree_view(),
@@ -1656,6 +1664,10 @@ impl App {
         }
         if hits(z.sync, x, y) {
             self.sync_changes();
+            return None;
+        }
+        if hits(z.header_base, x, y) {
+            self.open_base_diff(self.active);
             return None;
         }
         if hits(z.header_branch, x, y) || hits(z.git_footer.branch, x, y) {
@@ -1765,8 +1777,10 @@ impl App {
                     // Right-side action icons: ⟳ sync · ✓ commit (fixed
                     // offsets from the right edge, see repo_header_item).
                     let w = self.last_width;
-                    let (sync_zone, commit_zone) = repo_header_action_zones(w);
-                    if within(x, commit_zone) {
+                    let (base_zone, sync_zone, commit_zone) = repo_header_action_zones(w);
+                    if within(x, base_zone) {
+                        self.open_base_diff(r);
+                    } else if within(x, commit_zone) {
                         self.commit_repo(r);
                     } else if within(x, sync_zone) {
                         self.sync_repo(r);
@@ -1866,7 +1880,21 @@ impl App {
                 self.open_drawer_menu(x, y, kind, i);
                 return;
             }
-            _ => return, // section headers have no menu
+            Row::ChangesHeader(r) => {
+                self.overlay = Some(Overlay::Menu {
+                    x,
+                    y,
+                    target: MenuTarget::Changes { repo: r },
+                    entries: vec![MenuEntry::Action(
+                        MenuAction::DiffVsBase,
+                        "Open Diff vs Base Branch",
+                    )],
+                    selected: 0,
+                    rect: Rect::default(),
+                });
+                return;
+            }
+            _ => return, // other section headers have no menu
         };
         let Some(entry) = entry.cloned() else { return };
         let entries = file_menu_entries(entry.letter, staged);
@@ -2685,6 +2713,7 @@ impl App {
             } => self.file_menu_action(action, repo, entry, staged),
             MenuTarget::Folder { repo, path } => self.folder_menu_action(action, repo, path),
             MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
+            MenuTarget::Changes { repo } => self.open_base_diff(repo),
         }
     }
 
@@ -3051,6 +3080,33 @@ impl App {
             Err(e) => {
                 self.flash = Some((e, true));
             }
+        }
+    }
+
+    /// `vs base`: one diff of everything this branch changed since it left
+    /// the repo's default branch (merge-base vs working tree).
+    fn open_base_diff(&mut self, repo: usize) {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            self.flash = Some(("diff preview needs a herdr pane".into(), true));
+            return;
+        };
+        let Some(repo) = self.repos.get(repo) else {
+            return;
+        };
+        let (base, mb) = match repo.git.vs_base(&repo.status.branch) {
+            Ok(found) => found,
+            Err(e) => {
+                self.flash = Some((e, false));
+                return;
+            }
+        };
+        let root = repo.git.root();
+        let (rel, kind) = (format!("vs {base}"), format!("base:{mb}:{base}"));
+        let payload = herdr_sidebar::viewer::diff_request(root, &rel, &kind);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_diff(root, &rel, &kind);
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, root, &doc_key, &payload) {
+            Ok(target) => self.last_preview = Some((doc_key, target)),
+            Err(e) => self.flash = Some((e, true)),
         }
     }
 
@@ -4021,14 +4077,16 @@ impl App {
         } else {
             (Vec::new(), 0)
         };
+        // ⇄ `vs base` sits right after the branch label it diffs against.
+        let base_w = if right_text.is_empty() { 0 } else { 2 };
         // The branch text yields to the buttons and gear in narrow panes.
         let avail = (area.width as usize)
-            .saturating_sub(left.width() + actions_w + gear_w)
+            .saturating_sub(left.width() + base_w + actions_w + gear_w)
             .saturating_sub(1);
         let branch_text = truncate_to(right_text, avail);
         let branch_width = Span::raw(branch_text.as_str()).width();
         let pad = (area.width as usize)
-            .saturating_sub(left.width() + branch_width + actions_w + gear_w)
+            .saturating_sub(left.width() + branch_width + base_w + actions_w + gear_w)
             .max(1);
         let branch_x = area.x + left.width() as u16 + pad as u16;
         self.zones.header_branch = Rect::new(branch_x, area.y, branch_width as u16, 1);
@@ -4044,6 +4102,21 @@ impl App {
             },
         );
         let mut spans = vec![left, Span::raw(" ".repeat(pad)), branch];
+        self.zones.header_base =
+            Rect::new(branch_x + branch_width as u16, area.y, base_w as u16, 1);
+        if base_w > 0 {
+            let hovered = self
+                .mouse_pos
+                .is_some_and(|(x, y)| hits(self.zones.header_base, x, y));
+            spans.push(Span::styled(
+                "⇄ ",
+                if hovered {
+                    hover_style()
+                } else {
+                    Style::default().dim()
+                },
+            ));
+        }
         spans.extend(action_spans);
         if let Some(gear) = gear {
             let gx = area.x + area.width.saturating_sub(gear_w as u16);
@@ -4459,6 +4532,7 @@ impl App {
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),
+            ("B", "vs base"),
             ("s", "settings"),
             ("r", "refresh"),
             ("q", "quit"),
@@ -4690,14 +4764,19 @@ fn repo_header_branch_zone(repo: &Repo, theme: IconTheme, width: u16) -> (u16, u
     (start, start + branch_width as u16)
 }
 
-fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16)) {
+/// ⇄ vs base · ⟳ sync · ✓ commit, three equal cells at the right edge.
+fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16), (u16, u16)) {
     let actions_width = Span::raw(REPO_HEADER_ACTIONS).width() as u16;
     if width < actions_width {
-        return ((0, 0), (0, 0));
+        return ((0, 0), (0, 0), (0, 0));
     }
     let start = width - actions_width;
-    let midpoint = start + actions_width / 2;
-    ((start, midpoint), (midpoint, width))
+    let third = actions_width / 3;
+    (
+        (start, start + third),
+        (start + third, start + 2 * third),
+        (start + 2 * third, width),
+    )
 }
 
 fn changes_header_action_zones(
@@ -5421,8 +5500,8 @@ mod tests {
 
     #[test]
     fn narrow_repo_headers_disable_hidden_action_zones() {
-        assert_eq!(repo_header_action_zones(4), ((0, 0), (0, 0)));
-        assert_eq!(repo_header_action_zones(6), ((0, 3), (3, 6)));
+        assert_eq!(repo_header_action_zones(8), ((0, 0), (0, 0), (0, 0)));
+        assert_eq!(repo_header_action_zones(9), ((0, 3), (3, 6), (6, 9)));
     }
 
     #[test]

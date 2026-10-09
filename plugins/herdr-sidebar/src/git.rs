@@ -493,6 +493,43 @@ impl Git {
     pub fn raw(&self, args: &[&str]) -> Result<String, String> {
         run_in(&self.root, args)
     }
+
+    /// The default branch this one left, and the merge-base with it: the
+    /// `vs base` diff is `git diff <merge-base>` (committed + uncommitted).
+    /// Errors read as user-facing flashes ("already on main").
+    pub fn vs_base(&self, branch: &str) -> Result<(String, String), String> {
+        let origin_head = run_in(
+            &self.root,
+            &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
+        )
+        .ok();
+        let base = pick_base(origin_head.as_deref(), |r| {
+            run_in(&self.root, &["rev-parse", "--verify", "-q", r]).is_ok()
+        })
+        .ok_or("no base branch (origin/HEAD, main, master)")?;
+        if on_base(branch, &base) {
+            return Err(format!("already on {base}"));
+        }
+        let mb = run_in(&self.root, &["merge-base", &base, "HEAD"])?;
+        Ok((base, mb.trim().to_string()))
+    }
+}
+
+/// The repo's default branch: origin/HEAD's target, else the first existing
+/// of origin/main, origin/master, main, master.
+fn pick_base(origin_head: Option<&str>, exists: impl Fn(&str) -> bool) -> Option<String> {
+    let head = origin_head.map(str::trim).filter(|h| !h.is_empty());
+    head.map(str::to_string).or_else(|| {
+        ["origin/main", "origin/master", "main", "master"]
+            .into_iter()
+            .find(|r| exists(r))
+            .map(str::to_string)
+    })
+}
+
+/// True when the checked-out branch IS the base (`main` vs `origin/main`).
+fn on_base(branch: &str, base: &str) -> bool {
+    branch == base || base.split_once('/').is_some_and(|(_, b)| b == branch)
 }
 
 fn lines(out: String) -> Result<Vec<String>, String> {
@@ -1091,6 +1128,27 @@ fn child_dirs(dir: &Path, depth: usize) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base_resolution_order() {
+        use super::{on_base, pick_base};
+        assert_eq!(
+            pick_base(Some("origin/dev\n"), |_| true).as_deref(),
+            Some("origin/dev")
+        );
+        assert_eq!(
+            pick_base(None, |r| r == "master" || r == "main").as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            pick_base(Some(""), |r| r == "origin/master").as_deref(),
+            Some("origin/master")
+        );
+        assert_eq!(pick_base(None, |_| false), None);
+        assert!(on_base("main", "origin/main"));
+        assert!(on_base("main", "main"));
+        assert!(!on_base("feat/x", "origin/main"));
+    }
+
     use super::*;
 
     fn entry(path: &str, letter: char, orig: Option<&str>) -> FileEntry {

@@ -883,6 +883,15 @@ HACKING.md — budget time for that before promising a patched build.
   DISPLAY/WAYLAND_DISPLAY, and `code` exits "Missing X server" (silently: stderr is null).
   `actions::gui_command` (code, xdg-open) then copies DISPLAY/WAYLAND_DISPLAY/XAUTHORITY from
   `systemctl --user show-environment` onto the CHILD only.
+- **vs base** (`B`, the ⇄ button after the panel header's branch label, the first of the
+  multi-repo header's three right-edge icons `⇄ ⇅ ✓` — now 9 cols, not 6 — or the Changes
+  header's menu): one multi-file diff of `git diff <merge-base>` (committed + uncommitted
+  tracked changes, untracked excluded) against the default branch. `Git::vs_base` resolves the
+  base via pure `pick_base` (origin/HEAD target, else origin/main, origin/master, main, master);
+  being ON the base only flashes `already on <base>`. It rides the ordinary diff request as kind
+  `base:<merge-base>:<base>` (`viewer::load_base_diff`), so `f`/live refresh work unchanged;
+  `diffview::render_files` gives each file its own `▍ path` header. The merge-base is computed
+  once at open, so a later rebase needs a fresh `B`.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.
