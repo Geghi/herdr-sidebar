@@ -1172,6 +1172,10 @@ setting are all gone.
 
 ### Find, edit colors, hunk navigation (viewer)
 
+- `z` in the read-only preview (not edit mode; find-box keys are consumed earlier) sends
+  `pane.zoom {pane_id: $HERDR_PANE_ID}` — mode defaults to `toggle`, so no zoom state needs
+  tracking. Fired from a throwaway thread so the heartbeat never waits on the socket.
+
 - Find: `Ctrl+F` / `/` in a preview (files, diffs, show, PR overview), `Ctrl+F` in edit
   mode. The matcher is ONE function, `editor::find_matches` (case-insensitive, char-wise
   fold, char-column ranges); the preview runs it over RENDERED rows minus the gutter

@@ -2304,6 +2304,17 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
+                                    KeyCode::Char('z') => {
+                                        // One request off the UI thread: zoom is herdr's own toggle.
+                                        if let Ok(id) = std::env::var("HERDR_PANE_ID") {
+                                            std::thread::spawn(move || {
+                                                let _ = crate::ipc::call_text(
+                                                    "pane.zoom",
+                                                    serde_json::json!({ "pane_id": id }),
+                                                );
+                                            });
+                                        }
+                                    }
                                     KeyCode::Char('w') if doc.media.is_none() => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
@@ -2641,9 +2652,9 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom  {wrap_hint}  q close")
     } else {
-        format!(" Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
+        format!(" Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom  {wrap_hint}  q close")
     };
     merge.button = Rect::default();
     merge.menu_rect = Rect::default();
