@@ -914,6 +914,13 @@ HACKING.md — budget time for that before promising a patched build.
   Local choices use a normal checkout; a remote choice creates its local tracking branch.
   Symbolic `<remote>/HEAD` aliases are omitted. Dirty-worktree checkout failures surface intact
   and never force, stash, discard, or otherwise mutate work to make the switch succeed.
+- `BranchPicker` (every entry point: SCM header, multi-repo header, Git footers, Branch Changes
+  `B`) is a quick-pick: a focused filter row on top, case-insensitive SUBSEQUENCE match
+  (`filter_branches`, substrings included). EVERY printable key is text — no `j`/`k`/space
+  shortcuts; navigation is Up/Down, Ctrl+N/Ctrl+P, PageUp/PageDown, wheel. CONTROL+ALT chars are
+  text (AltGr). Esc clears a non-empty query, then closes. `selected` indexes the filtered
+  `matches`, not `branches`, and resets to 0 on every keystroke. Popup height follows the
+  UNFILTERED count so it does not jump while typing.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
   hidden pane never strands completed background work.
