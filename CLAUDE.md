@@ -1187,9 +1187,13 @@ setting are all gone.
   from the first line whose text differs from the cached copy (a plain string compare —
   no edit hooks to forget), then `advance` highlights only up to the last visible line
   within a 12ms budget; anything beyond draws plain and catches up next frame.
-- `]` / `[` jump to the next/previous change hunk: `hunk_starts` = first line of each run
-  whose line bg is `diff_add_bg`/`diff_del_bg`, landed two rows below the top. The footer
-  shows `]/[ change` only when the doc has hunks.
+- `.` / `,` (and `]` / `[`, any modifiers) jump to the next/previous change hunk: brackets
+  need AltGr on IT/DE/FR layouts and could never be typed there (user-reported on Linux/IT),
+  so the footer advertises `, . change`. `hunk_starts` = first line of each run whose LINE
+  bg (diffview sets it on the Line, not only spans) is ANY theme's `diff_add_bg`/`diff_del_bg`
+  — matching all themes keeps docs rendered before a live theme switch navigable. Every
+  palette uses concrete RGB tints there (terminal shares vscode's); a test pins that. Landed
+  two rows below the top; the hint shows only when the doc has hunks.
 
 ### Verifying a plugin TUI end-to-end
 

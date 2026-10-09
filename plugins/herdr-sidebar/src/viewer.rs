@@ -544,10 +544,20 @@ fn find_rows(rows: &[Row], gutter: usize, query: &str) -> Vec<(usize, usize, usi
 }
 
 /// Source lines that START a run of tinted +/− diff rows (a change hunk).
+/// Matches every theme's tints, so a doc rendered before a theme switch still navigates.
 fn hunk_starts(lines: &[Line<'static>]) -> Vec<usize> {
-    let p = palette();
-    let changed =
-        |l: &Line| matches!(l.style.bg, Some(bg) if bg == p.diff_add_bg || bg == p.diff_del_bg);
+    let tints: Vec<_> = [
+        crate::state::ColorTheme::VsCode,
+        crate::state::ColorTheme::Light,
+        crate::state::ColorTheme::Terminal,
+    ]
+    .into_iter()
+    .flat_map(|t| {
+        let p = crate::ui::palette_for(t);
+        [p.diff_add_bg, p.diff_del_bg]
+    })
+    .collect();
+    let changed = |l: &Line| matches!(l.style.bg, Some(bg) if tints.contains(&bg));
     (0..lines.len())
         .filter(|&i| changed(&lines[i]) && (i == 0 || !changed(&lines[i - 1])))
         .collect()
@@ -2220,7 +2230,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             current: 0,
                                         });
                                     }
-                                    KeyCode::Char(']') | KeyCode::Char('[') => {
+                                    // `.`/`,` need no AltGr on IT/DE/FR layouts; `]`/`[` accept any modifiers.
+                                    KeyCode::Char(c @ (']' | '[' | '.' | ',')) => {
                                         // Land each hunk two rows below the top edge.
                                         let targets: Vec<usize> = hunk_starts(&doc.lines)
                                             .into_iter()
@@ -2229,7 +2240,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             })
                                             .map(|row| row.saturating_sub(2))
                                             .collect();
-                                        let next = if key.code == KeyCode::Char(']') {
+                                        let next = if c == ']' || c == '.' {
                                             targets.iter().find(|t| **t > doc.scroll)
                                         } else {
                                             targets.iter().rev().find(|t| **t < doc.scroll)
@@ -2611,7 +2622,7 @@ fn draw_doc(
     let hunk_hint = if hunk_starts(&doc.lines).is_empty() {
         ""
     } else {
-        "]/[ change  "
+        ", . change  "
     };
     let wrap_hint = match (doc.wrap, diff_full) {
         (true, None) => "w: wrap on",
@@ -4019,6 +4030,25 @@ mod tests {
         ];
         assert_eq!(hunk_starts(&lines), vec![1, 4]);
         assert!(hunk_starts(&[Line::raw("plain")]).is_empty());
+    }
+
+    #[test]
+    fn hunk_starts_finds_hunks_in_rendered_diffs_for_every_theme() {
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n";
+        let lines = crate::diffview::render("x.rs", diff);
+        assert_eq!(hunk_starts(&lines).len(), 1);
+        // Every theme must tint changed rows with distinct, concrete colors.
+        for t in [
+            crate::state::ColorTheme::VsCode,
+            crate::state::ColorTheme::Light,
+            crate::state::ColorTheme::Terminal,
+        ] {
+            let p = crate::ui::palette_for(t);
+            assert_ne!(p.diff_add_bg, p.diff_del_bg);
+            assert!(!matches!(p.diff_add_bg, Color::Reset));
+            assert!(!matches!(p.diff_del_bg, Color::Reset));
+        }
     }
 
     #[test]

@@ -366,7 +366,9 @@ impl Editor {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => self.search = None,
-            KeyCode::Enter | KeyCode::F(3) | KeyCode::Down => self.find(shift && key.code != KeyCode::Down),
+            KeyCode::Enter | KeyCode::F(3) | KeyCode::Down => {
+                self.find(shift && key.code != KeyCode::Down)
+            }
             KeyCode::Up => self.find(true),
             KeyCode::Backspace => {
                 if let Some(search) = &mut self.search {
