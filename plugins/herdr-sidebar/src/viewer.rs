@@ -520,6 +520,127 @@ fn row_text_without_gutter(row: &Row, gutter: usize) -> String {
         .collect()
 }
 
+/// The viewer's find box: query, whether keys go to it, and which match is
+/// current (an index into [`find_rows`]' result, clamped on use).
+struct FindBox {
+    query: String,
+    focused: bool,
+    current: usize,
+}
+
+/// Case-insensitive matches over the RENDERED rows (gutter excluded), as
+/// `(row, start_col, end_col)` — so wrap on/off both work and a match's row is
+/// directly a scroll target. A match never spans a visual wrap break.
+fn find_rows(rows: &[Row], gutter: usize, query: &str) -> Vec<(usize, usize, usize)> {
+    rows.iter()
+        .enumerate()
+        .flat_map(|(i, row)| {
+            crate::editor::find_matches(&row_text_without_gutter(row, gutter), query)
+                .into_iter()
+                .map(move |(s, e)| (i, s, e))
+        })
+        .collect()
+}
+
+/// Source lines that START a run of tinted +/− diff rows (a change hunk).
+fn hunk_starts(lines: &[Line<'static>]) -> Vec<usize> {
+    let p = palette();
+    let changed =
+        |l: &Line| matches!(l.style.bg, Some(bg) if bg == p.diff_add_bg || bg == p.diff_del_bg);
+    (0..lines.len())
+        .filter(|&i| changed(&lines[i]) && (i == 0 || !changed(&lines[i - 1])))
+        .collect()
+}
+
+/// Scroll so `row` is visible, a third down the pane, if it is not already.
+fn reveal_row(doc: &mut Doc, row: usize, height: u16) {
+    let height = usize::from(height).max(1);
+    if row < doc.scroll || row >= doc.scroll + height {
+        doc.scroll = row.saturating_sub(height / 3);
+    }
+}
+
+/// Keys for an open find box. Returns whether the key was consumed.
+fn on_find_key(
+    find: &mut Option<FindBox>,
+    doc: &mut Doc,
+    key: crossterm::event::KeyEvent,
+    height: u16,
+) -> bool {
+    let Some(fb) = find.as_mut() else {
+        return false;
+    };
+    let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT))
+        || key.modifiers.contains(KeyModifiers::SUPER);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let step = match key.code {
+        KeyCode::Esc => {
+            *find = None;
+            return true;
+        }
+        KeyCode::Enter if fb.focused => Some(!shift),
+        KeyCode::F(3) => Some(!shift),
+        KeyCode::Char('n') if !fb.focused && !shortcut => Some(true),
+        KeyCode::Char('N') if !fb.focused && !shortcut => Some(false),
+        KeyCode::Backspace if fb.focused => {
+            fb.query.pop();
+            None
+        }
+        KeyCode::Char('v') if fb.focused && shortcut => {
+            if let Ok(text) = crate::actions::paste_from_clipboard() {
+                fb.query.push_str(text.lines().next().unwrap_or(""));
+            }
+            None
+        }
+        KeyCode::Char(c) if fb.focused && !shortcut => {
+            fb.query.push(c);
+            None
+        }
+        _ => return fb.focused,
+    };
+    let matches = find_rows(&doc.rows, doc.gutter(), &fb.query);
+    if matches.is_empty() {
+        return true;
+    }
+    fb.current = match step {
+        Some(true) => (fb.current + 1) % matches.len(),
+        Some(false) => (fb.current + matches.len() - 1) % matches.len(),
+        // The query changed: the first hit from the top of the view.
+        None => matches.iter().position(|m| m.0 >= doc.scroll).unwrap_or(0),
+    };
+    reveal_row(doc, matches[fb.current].0, height);
+    true
+}
+
+/// Re-style the char ranges `(start, end, bg)` of a row (gutter excluded).
+fn mark_ranges(
+    line: Line<'static>,
+    gutter: usize,
+    ranges: &[(usize, usize, Color)],
+) -> Line<'static> {
+    if ranges.is_empty() {
+        return line;
+    }
+    let mut out = Line {
+        style: line.style,
+        ..Line::default()
+    };
+    let mut col = 0usize;
+    for span in line.spans {
+        for ch in span.content.chars() {
+            let bg = col
+                .checked_sub(gutter)
+                .and_then(|c| ranges.iter().find(|(s, e, _)| c >= *s && c < *e))
+                .map(|r| r.2);
+            let style = bg.map_or(span.style, |bg| span.style.bg(bg));
+            out.spans.push(Span::styled(ch.to_string(), style));
+            col += 1;
+        }
+    }
+    out
+}
+
 fn col_at_display_x(text: &str, wanted: usize) -> usize {
     let mut x = 0;
     for (col, ch) in text.chars().enumerate() {
@@ -1852,6 +1973,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut prompt: Option<Prompt> = None;
     let mut notice: Option<String> = None;
     let mut merge_ui = MergeUi::default();
+    let mut find: Option<FindBox> = None;
     let mut merge_worker: Option<std::sync::mpsc::Receiver<Result<String, String>>> = None;
     let mut last_heartbeat = Instant::now();
     let mut last_external_check = Instant::now();
@@ -1893,6 +2015,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         .map(|_| diff_full),
                     notice.as_deref(),
                     &mut merge_ui,
+                    find.as_ref(),
                 );
             }
             ViewMode::Edit(editor) => {
@@ -2037,7 +2160,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             (active, _) => prompt = Some(active),
                         }
                     } else {
+                        let find_ate = match &mut mode {
+                            ViewMode::Preview(doc) => {
+                                on_find_key(&mut find, doc, key, preview_body.height)
+                            }
+                            ViewMode::Edit(_) => false,
+                        };
                         match &mut mode {
+                            ViewMode::Preview(_) if find_ate => {}
                             ViewMode::Preview(doc) => {
                                 if doc.pr_target.is_some()
                                     && (merge_ui.confirm.is_some()
@@ -2100,6 +2230,38 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     && !key.modifiers.contains(KeyModifiers::ALT))
                                     || key.modifiers.contains(KeyModifiers::SUPER);
                                 match key.code {
+                                    KeyCode::Char('f') if shortcut && doc.media.is_none() => {
+                                        find = Some(FindBox {
+                                            query: find.take().map(|f| f.query).unwrap_or_default(),
+                                            focused: true,
+                                            current: 0,
+                                        });
+                                    }
+                                    KeyCode::Char('/') if doc.media.is_none() => {
+                                        find = Some(FindBox {
+                                            query: find.take().map(|f| f.query).unwrap_or_default(),
+                                            focused: true,
+                                            current: 0,
+                                        });
+                                    }
+                                    KeyCode::Char(']') | KeyCode::Char('[') => {
+                                        // Land each hunk two rows below the top edge.
+                                        let targets: Vec<usize> = hunk_starts(&doc.lines)
+                                            .into_iter()
+                                            .filter_map(|src| {
+                                                doc.rows.iter().position(|r| r.src == src)
+                                            })
+                                            .map(|row| row.saturating_sub(2))
+                                            .collect();
+                                        let next = if key.code == KeyCode::Char(']') {
+                                            targets.iter().find(|t| **t > doc.scroll)
+                                        } else {
+                                            targets.iter().rev().find(|t| **t < doc.scroll)
+                                        };
+                                        if let Some(target) = next {
+                                            doc.scroll = (*target).min(max);
+                                        }
+                                    }
                                     KeyCode::Char('a') if shortcut => doc.select_all(),
                                     KeyCode::Char('c') if shortcut => {
                                         notice = Some(match doc.selected_text() {
@@ -2254,7 +2416,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             {
                                 should_close = close_own_pane(control);
                             }
-                            _ => doc.on_mouse(&mouse, preview_body),
+                            _ => {
+                                if let Some(f) = find.as_mut()
+                                    && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                                {
+                                    f.focused = false;
+                                }
+                                doc.on_mouse(&mouse, preview_body)
+                            }
                         }
                     }
                     ViewMode::Edit(editor) => match mouse.kind {
@@ -2372,6 +2541,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
 
 /// Header (✕ close + name + context), body, hint footer. Returns the page
 /// stride for PageUp/Down.
+#[allow(clippy::too_many_arguments)]
 fn draw_doc(
     frame: &mut Frame,
     doc: &mut Doc,
@@ -2380,6 +2550,7 @@ fn draw_doc(
     diff_full: Option<bool>,
     notice: Option<&str>,
     merge: &mut MergeUi,
+    find: Option<&FindBox>,
 ) -> (usize, Rect) {
     let area = frame.area();
     let [header, body, footer] = Layout::vertical([
@@ -2431,16 +2602,41 @@ fn draw_doc(
     // amount of scrolling could reach them.
     let selection = doc.selection_range();
     let gutter = doc.gutter();
+    let matches = find.map_or_else(Vec::new, |f| find_rows(&doc.rows, gutter, &f.query));
+    let current = find.and_then(|f| matches.get(f.current.min(matches.len().saturating_sub(1))));
     let text: Vec<Line> = doc
         .rows
         .iter()
         .enumerate()
         .skip(doc.scroll)
         .take(usize::from(body.height))
-        .map(|(row, rendered)| selected_row(&rendered.line, gutter, row, selection))
+        .map(|(row, rendered)| {
+            let ranges: Vec<(usize, usize, Color)> = matches
+                .iter()
+                .filter(|m| m.0 == row)
+                .map(|m| {
+                    let bg = if Some(m) == current {
+                        palette().find_current_bg
+                    } else {
+                        palette().find_match_bg
+                    };
+                    (m.1, m.2, bg)
+                })
+                .collect();
+            mark_ranges(
+                selected_row(&rendered.line, gutter, row, selection),
+                gutter,
+                &ranges,
+            )
+        })
         .collect();
     frame.render_widget(Paragraph::new(text), body);
 
+    let hunk_hint = if hunk_starts(&doc.lines).is_empty() {
+        ""
+    } else {
+        "]/[ change  "
+    };
     let wrap_hint = match (doc.wrap, diff_full) {
         (true, None) => "w: wrap on",
         (false, None) => "w: wrap off",
@@ -2458,12 +2654,37 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" drag select  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
+        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  {wrap_hint}  q close")
     } else {
-        format!(" drag select  Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
+        format!(" Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  {wrap_hint}  q close")
     };
     merge.button = Rect::default();
     merge.menu_rect = Rect::default();
+
+    if let Some(f) = find
+        && merge.confirm.is_none()
+        && merge.running.is_none()
+    {
+        let k = current.map_or_else(
+            || "-".to_string(),
+            |m| (matches.iter().position(|x| x == m).unwrap_or(0) + 1).to_string(),
+        );
+        let (caret, keys) = if f.focused {
+            ("▏", "Enter/F3 next  Shift+Enter/F3 prev  Esc close")
+        } else {
+            ("", "n/N next/prev  / edit  Esc close")
+        };
+        let line = Line::from(vec![
+            Span::styled(" Find: ", Style::default().fg(palette().accent).bold()),
+            Span::raw(format!("{}{caret}", f.query)),
+            Span::styled(
+                format!("  {k}/{}  {keys}", matches.len()),
+                Style::default().dim(),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), footer);
+        return (usize::from(body.height).saturating_sub(1).max(1), body);
+    }
 
     // A pull request overview gets a merge button in the footer: shown as
     // a filled chip, it opens a method dropdown that pops up over the body
@@ -3786,6 +4007,45 @@ mod tests {
     }
 
     #[test]
+    fn find_matches_rendered_rows_with_wrap_on_and_off() {
+        let lines = vec![Line::raw("alpha beta"), Line::raw("Beta gamma beta")];
+        let flat = build_rows(&lines, true, false, 40);
+        let gutter = 2;
+        assert_eq!(
+            find_rows(&flat, gutter, "BETA"),
+            vec![(0, 6, 10), (1, 0, 4), (1, 11, 15)]
+        );
+        // Wrapped at 12 content cols: line 2 becomes two rows, and the second
+        // hit lands on its continuation row — the row IS the scroll target.
+        let wrapped = build_rows(&lines, true, true, 14);
+        let hits = find_rows(&wrapped, gutter, "beta");
+        assert_eq!(hits.len(), 3);
+        assert_eq!(wrapped[hits[2].0].src, 1);
+        assert!(hits[2].0 > hits[1].0);
+        let mut doc = doc_of(lines, true);
+        doc.rows = wrapped;
+        doc.scroll = 0;
+        reveal_row(&mut doc, 9, 3);
+        assert_eq!(doc.scroll, 8, "a third down the pane");
+    }
+
+    #[test]
+    fn hunk_starts_mark_the_first_row_of_each_change_run() {
+        let p = palette();
+        let add = Style::default().bg(p.diff_add_bg);
+        let del = Style::default().bg(p.diff_del_bg);
+        let lines = vec![
+            Line::raw("ctx"),
+            Line::raw("-a").style(del),
+            Line::raw("+a").style(add),
+            Line::raw("ctx"),
+            Line::raw("+b").style(add),
+        ];
+        assert_eq!(hunk_starts(&lines), vec![1, 4]);
+        assert!(hunk_starts(&[Line::raw("plain")]).is_empty());
+    }
+
+    #[test]
     fn wrap_off_keeps_one_row_per_source_line() {
         let mut doc = doc_of(vec![Line::raw("a".repeat(120)), Line::raw("b")], false);
         doc.wrap = false;
@@ -3946,6 +4206,7 @@ mod tests {
                         None,
                         None,
                         &mut MergeUi::default(),
+                        None,
                     );
                 })
                 .unwrap();
@@ -3999,6 +4260,7 @@ mod tests {
                     None,
                     None,
                     &mut MergeUi::default(),
+                    None,
                 );
             })
             .unwrap();

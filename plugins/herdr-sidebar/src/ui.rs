@@ -55,6 +55,9 @@ pub struct Palette {
     /// Mouse text selection in the preview / editor. Unlike the list rows this
     /// sits UNDER syntax-colored spans, so it must not fight their foreground.
     pub text_selection_bg: Color,
+    /// Find-in-preview/editor: every match, and the current one on top.
+    pub find_match_bg: Color,
+    pub find_current_bg: Color,
     /// The soft fill behind the overview's cards (PR header, description,
     /// conversation): a surface a shade off the pane background, so blocks
     /// group without box borders. The viewer pads rows whose line style has
@@ -110,6 +113,8 @@ const VSCODE_PALETTE: Palette = Palette {
     selection_unfocused_fg: Color::Reset,
     hover_fg: Color::Reset,
     text_selection_bg: Color::DarkGray,
+    find_match_bg: Color::Rgb(0x5c, 0x4a, 0x1e),
+    find_current_bg: Color::Rgb(0x9e, 0x6a, 0x03),
     diff_del_bg: Color::Rgb(0x42, 0x22, 0x26),
     diff_del_word_bg: Color::Rgb(0x6f, 0x30, 0x36),
     diff_add_bg: Color::Rgb(0x20, 0x39, 0x28),
@@ -159,6 +164,8 @@ const LIGHT_PALETTE: Palette = Palette {
     selection_unfocused_fg: Color::Rgb(0x1f, 0x1f, 0x1f),
     hover_fg: Color::Reset,
     text_selection_bg: Color::Rgb(0xad, 0xd6, 0xff),
+    find_match_bg: Color::Rgb(0xff, 0xf1, 0xa8),
+    find_current_bg: Color::Rgb(0xff, 0xc8, 0x5c),
     diff_del_bg: Color::Rgb(0xff, 0xeb, 0xe9),
     diff_del_word_bg: Color::Rgb(0xff, 0xc1, 0xbc),
     diff_add_bg: Color::Rgb(0xe6, 0xff, 0xec),
@@ -200,6 +207,8 @@ const TERMINAL_PALETTE: Palette = Palette {
     selection_unfocused_fg: Color::White,
     hover_fg: Color::Gray,
     text_selection_bg: Color::DarkGray,
+    find_match_bg: Color::Rgb(0x5c, 0x4a, 0x1e),
+    find_current_bg: Color::Rgb(0x9e, 0x6a, 0x03),
     // Diff tints stay RGB in every dark theme: an ANSI background here would
     // collide with the syntax foregrounds the terminal profile also remaps.
     diff_del_bg: Color::Rgb(0x42, 0x22, 0x26),
@@ -759,6 +768,8 @@ mod tests {
             light.hover_bg,
             light.keycap_bg,
             light.text_selection_bg,
+            light.find_match_bg,
+            light.find_current_bg,
             light.diff_del_bg,
             light.diff_add_bg,
             light.diff_del_word_bg,

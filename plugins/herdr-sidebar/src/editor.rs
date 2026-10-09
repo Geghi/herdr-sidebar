@@ -77,6 +77,9 @@ pub enum EditAction {
 #[derive(Clone, Debug, Default)]
 struct Search {
     query: String,
+    /// Keys go to the box; a click in the text moves focus to the buffer
+    /// while the matches stay highlighted.
+    focused: bool,
 }
 
 pub struct Editor {
@@ -94,6 +97,7 @@ pub struct Editor {
     status: Option<String>,
     search: Option<Search>,
     mouse_anchor: Option<TextPos>,
+    highlight: crate::syntax::Incremental,
 }
 
 impl Editor {
@@ -128,6 +132,12 @@ impl Editor {
             return Err(OpenError::TooManyLines(lines.len()));
         }
         Ok(Self {
+            highlight: crate::syntax::Incremental::new(
+                &path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
             path,
             lines,
             cursor: TextPos::default(),
@@ -186,8 +196,21 @@ impl Editor {
 
     pub fn on_key(&mut self, key: KeyEvent, wrap_width: usize, page: usize) -> EditAction {
         self.mouse_anchor = None;
-        if self.search.is_some() {
+        if self.search.as_ref().is_some_and(|s| s.focused) {
             return self.on_search_key(key);
+        }
+        if self.search.is_some() {
+            match key.code {
+                KeyCode::F(3) => {
+                    self.find(key.modifiers.contains(KeyModifiers::SHIFT));
+                    return EditAction::None;
+                }
+                KeyCode::Esc => {
+                    self.search = None;
+                    return EditAction::None;
+                }
+                _ => {}
+            }
         }
         let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT))
@@ -197,7 +220,11 @@ impl Editor {
                 KeyCode::Char('s') => return EditAction::Save,
                 KeyCode::Char('q') => return EditAction::Close,
                 KeyCode::Char('f') => {
-                    self.search = Some(Search::default());
+                    let query = self.search.take().map(|s| s.query).unwrap_or_default();
+                    self.search = Some(Search {
+                        query,
+                        focused: true,
+                    });
                     self.status = None;
                     return EditAction::None;
                 }
@@ -336,19 +363,22 @@ impl Editor {
         let shortcut = (key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT))
             || key.modifiers.contains(KeyModifiers::SUPER);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => self.search = None,
-            KeyCode::Enter => self.find(key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::Enter | KeyCode::F(3) => self.find(shift),
             KeyCode::Backspace => {
                 if let Some(search) = &mut self.search {
                     search.query.pop();
                 }
+                self.find_live();
             }
             KeyCode::Char('v') if shortcut => match paste_from_clipboard() {
                 Ok(text) => {
                     if let Some(search) = &mut self.search {
                         search.query.push_str(text.trim_end_matches(['\r', '\n']));
                     }
+                    self.find_live();
                 }
                 Err(e) => self.status = Some(format!("clipboard unavailable: {e}")),
             },
@@ -356,91 +386,78 @@ impl Editor {
                 if let Some(search) = &mut self.search {
                     search.query.push(c);
                 }
+                self.find_live();
             }
             _ => {}
         }
         EditAction::None
     }
 
+    /// Every case-insensitive match of the search query, in document order.
+    fn matches(&self) -> Vec<(TextPos, TextPos)> {
+        let Some(search) = self.search.as_ref().filter(|s| !s.query.is_empty()) else {
+            return Vec::new();
+        };
+        self.lines
+            .iter()
+            .enumerate()
+            .flat_map(|(line, text)| {
+                find_matches(text, &search.query)
+                    .into_iter()
+                    .map(move |(s, e)| (TextPos { line, col: s }, TextPos { line, col: e }))
+            })
+            .collect()
+    }
+
+    /// `k/N` for the footer: which match is selected, out of how many.
+    fn match_counter(&self) -> String {
+        let matches = self.matches();
+        let k = self
+            .selection()
+            .and_then(|sel| matches.iter().position(|m| *m == sel))
+            .map_or_else(|| "-".to_string(), |i| (i + 1).to_string());
+        format!("{k}/{}", matches.len())
+    }
+
+    /// Typing re-searches from where the current match STARTS, so extending
+    /// the query keeps the same hit when it still matches.
+    fn find_live(&mut self) {
+        let from = self.selection().map_or(self.cursor, |(start, _)| start);
+        self.jump(false, from);
+    }
+
     fn find(&mut self, reverse: bool) {
-        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else {
-            return;
+        let from = match self.selection() {
+            Some((start, _)) if reverse => start,
+            _ => self.cursor,
         };
-        if query.is_empty() {
-            return;
-        }
+        self.jump(reverse, from);
+    }
+
+    fn jump(&mut self, reverse: bool, from: TextPos) {
+        let matches = self.matches();
         let found = if reverse {
-            self.find_reverse(&query)
+            matches
+                .iter()
+                .rev()
+                .find(|(start, _)| *start < from)
+                .or(matches.last())
         } else {
-            self.find_forward(&query)
+            matches
+                .iter()
+                .find(|(start, _)| *start >= from)
+                .or(matches.first())
         };
-        if let Some((start, end)) = found {
+        if let Some(&(start, end)) = found {
             self.anchor = Some(start);
             self.cursor = end;
             self.preferred_x = None;
             self.status = None;
-        } else {
-            self.status = Some(format!("no match for {query:?}"));
+        } else if let Some(search) = &self.search
+            && !search.query.is_empty()
+        {
+            self.status = Some(format!("no match for {:?}", search.query));
         }
-    }
-
-    fn find_forward(&self, query: &str) -> Option<(TextPos, TextPos)> {
-        let mut order = (self.cursor.line..self.lines.len()).chain(0..self.cursor.line);
-        order
-            .find_map(|line| {
-                let start_col = if line == self.cursor.line {
-                    self.cursor.col.min(char_len(&self.lines[line]))
-                } else {
-                    0
-                };
-                find_from(&self.lines[line], query, start_col).map(|col| {
-                    (
-                        TextPos { line, col },
-                        TextPos {
-                            line,
-                            col: col + char_len(query),
-                        },
-                    )
-                })
-            })
-            .or_else(|| {
-                find_from(&self.lines[self.cursor.line], query, 0)
-                    .filter(|col| *col <= self.cursor.col)
-                    .map(|col| {
-                        (
-                            TextPos {
-                                line: self.cursor.line,
-                                col,
-                            },
-                            TextPos {
-                                line: self.cursor.line,
-                                col: col + char_len(query),
-                            },
-                        )
-                    })
-            })
-    }
-
-    fn find_reverse(&self, query: &str) -> Option<(TextPos, TextPos)> {
-        let mut order = (0..=self.cursor.line)
-            .rev()
-            .chain((self.cursor.line + 1..self.lines.len()).rev());
-        order.find_map(|line| {
-            let before = if line == self.cursor.line {
-                self.cursor.col
-            } else {
-                char_len(&self.lines[line])
-            };
-            rfind_before(&self.lines[line], query, before).map(|col| {
-                (
-                    TextPos { line, col },
-                    TextPos {
-                        line,
-                        col: col + char_len(query),
-                    },
-                )
-            })
-        })
     }
 
     fn prepare_move(&mut self, modifiers: KeyModifiers) {
@@ -717,6 +734,9 @@ impl Editor {
     pub fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(search) = &mut self.search {
+                    search.focused = false;
+                }
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
                     return;
                 };
@@ -788,6 +808,20 @@ impl Editor {
         }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         let selection = self.selection();
+        let last_visible = rows
+            .get(self.scroll + height - 1)
+            .or(rows.last())
+            .map_or(0, |r| r.line + 1);
+        self.highlight.invalidate(&self.lines);
+        // ponytail: time budget per frame; lines past it draw plain and
+        // catch up on the next frame (~250ms idle tick).
+        self.highlight.advance(
+            &self.lines,
+            last_visible,
+            std::time::Duration::from_millis(12),
+        );
+        let matches = self.matches();
+        let palette = crate::ui::palette();
         let rendered: Vec<Line> = rows
             .iter()
             .skip(self.scroll)
@@ -816,10 +850,20 @@ impl Editor {
                                 col,
                             } < end
                     });
-                    let style = if selected {
-                        Style::default().bg(crate::ui::palette().text_selection_bg)
+                    let pos = TextPos {
+                        line: row.line,
+                        col,
+                    };
+                    let base = self.highlight.style_at(row.line, col);
+                    let hit = matches.iter().find(|(s, e)| pos >= *s && pos < *e);
+                    let style = if hit.is_some_and(|m| Some(*m) == selection) {
+                        base.bg(palette.find_current_bg)
+                    } else if hit.is_some() {
+                        base.bg(palette.find_match_bg)
+                    } else if selected {
+                        base.bg(palette.text_selection_bg)
                     } else {
-                        Style::default()
+                        base
                     };
                     if ch == '\t' {
                         let spaces = TAB_WIDTH - (x % TAB_WIDTH);
@@ -838,9 +882,11 @@ impl Editor {
         let footer_text = if let Some(prompt) = prompt {
             prompt.to_string()
         } else if let Some(search) = &self.search {
+            let caret = if search.focused { "▏" } else { "" };
             format!(
-                " Find: {}  Enter next  Shift+Enter previous  Esc done",
-                search.query
+                " Find: {}{caret}  {}  Enter/F3 next  Shift+Enter/F3 previous  Esc close",
+                search.query,
+                self.match_counter()
             )
         } else if let Some(status) = &self.status {
             format!(" {status}")
@@ -849,7 +895,10 @@ impl Editor {
         };
         frame.render_widget(Paragraph::new(Line::from(footer_text).dim()), footer);
 
-        if prompt.is_none() && self.search.is_none() && body.width > gutter as u16 {
+        if prompt.is_none()
+            && !self.search.as_ref().is_some_and(|s| s.focused)
+            && body.width > gutter as u16
+        {
             let row = &rows[cursor_row];
             let x = display_width_range(&self.lines[row.line], row.start, self.cursor.col);
             let screen_y =
@@ -967,18 +1016,27 @@ fn char_slice(s: &str, start: usize, end: usize) -> String {
     s[byte_at(s, start)..byte_at(s, end)].to_string()
 }
 
-fn find_from(haystack: &str, needle: &str, start_col: usize) -> Option<usize> {
-    let start = byte_at(haystack, start_col);
-    haystack[start..]
-        .find(needle)
-        .map(|offset| start_col + haystack[start..start + offset].chars().count())
-}
-
-fn rfind_before(haystack: &str, needle: &str, before_col: usize) -> Option<usize> {
-    let end = byte_at(haystack, before_col);
-    haystack[..end]
-        .rfind(needle)
-        .map(|offset| haystack[..offset].chars().count())
+/// Case-insensitive, non-overlapping matches of `query` in `text`, as
+/// char-column ranges. Compared char by char, so a lowercase mapping that
+/// changes length (e.g. `İ`) can never shift the columns.
+pub fn find_matches(text: &str, query: &str) -> Vec<(usize, usize)> {
+    let fold = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let hay: Vec<char> = text.chars().map(fold).collect();
+    let needle: Vec<char> = query.chars().map(fold).collect();
+    let mut out = Vec::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == needle[..] {
+            out.push((i, i + needle.len()));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1110,7 +1168,8 @@ mod tests {
         let mut e = editor("🙂 first\nsecond 🙂");
         e.cursor = TextPos { line: 1, col: 8 };
         e.search = Some(Search {
-            query: "🙂".into()
+            query: "🙂".into(),
+            focused: true,
         });
         e.find(false);
         assert_eq!(
@@ -1153,5 +1212,33 @@ mod tests {
         assert!(!e.external_changed);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive_and_char_indexed() {
+        assert_eq!(
+            find_matches("Foo fOO 🙂foo", "foo"),
+            vec![(0, 3), (4, 7), (9, 12)]
+        );
+        assert_eq!(find_matches("aaaa", "aa"), vec![(0, 2), (2, 4)]);
+        assert!(find_matches("abc", "").is_empty());
+    }
+
+    #[test]
+    fn find_navigates_wraps_and_counts() {
+        let mut e = editor("x Ab\nab ab");
+        e.search = Some(Search {
+            query: "AB".into(),
+            focused: true,
+        });
+        e.find_live();
+        assert_eq!(e.match_counter(), "1/3");
+        e.find(false);
+        e.find(false);
+        assert_eq!(e.match_counter(), "3/3");
+        e.find(false);
+        assert_eq!(e.match_counter(), "1/3", "wraps to the first");
+        e.find(true);
+        assert_eq!(e.match_counter(), "3/3", "wraps back to the last");
     }
 }

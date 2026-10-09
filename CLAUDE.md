@@ -1149,6 +1149,26 @@ setting are all gone.
   wrapped rows, and Shift+click extends the current selection. Coordinates account for the line
   number gutter, tabs, wide Unicode cells, and the editor's wrapped-row scroll offset.
 
+### Find, edit colors, hunk navigation (viewer)
+
+- Find: `Ctrl+F` / `/` in a preview (files, diffs, show, PR overview), `Ctrl+F` in edit
+  mode. The matcher is ONE function, `editor::find_matches` (case-insensitive, char-wise
+  fold, char-column ranges); the preview runs it over RENDERED rows minus the gutter
+  (`find_rows`), so a hit's row is directly a scroll index with wrap on or off — a hit
+  never spans a visual wrap break. Box focused: keys type, Enter/F3 next, Shift+Enter/
+  Shift+F3 previous. A click in the body unfocuses it but keeps highlights; then `n`/`N`
+  (preview) or F3 (editor — letters are text there) navigate; Esc clears. Colors are
+  `Palette::find_match_bg` / `find_current_bg`. Find keys never `continue` the event loop
+  (the merge-menu code still does — don't copy that; it skips the heartbeat block).
+- Edit mode is syntax-highlighted by `syntax::Incremental`: per-line style runs plus the
+  syntect (ParseState, HighlightState) AFTER each line. Each frame `invalidate` truncates
+  from the first line whose text differs from the cached copy (a plain string compare —
+  no edit hooks to forget), then `advance` highlights only up to the last visible line
+  within a 12ms budget; anything beyond draws plain and catches up next frame.
+- `]` / `[` jump to the next/previous change hunk: `hunk_starts` = first line of each run
+  whose line bg is `diff_add_bg`/`diff_del_bg`, landed two rows below the top. The footer
+  shows `]/[ change` only when the doc has hunks.
+
 ### Verifying a plugin TUI end-to-end
 
 Drive the real binary in a throwaway herdr pane instead of unit-testing rendering:
