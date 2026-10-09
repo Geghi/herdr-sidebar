@@ -1169,8 +1169,9 @@ setting are all gone.
   mode. The matcher is ONE function, `editor::find_matches` (case-insensitive, char-wise
   fold, char-column ranges); the preview runs it over RENDERED rows minus the gutter
   (`find_rows`), so a hit's row is directly a scroll index with wrap on or off — a hit
-  never spans a visual wrap break. Box focused: keys type, Enter/F3 next, Shift+Enter/
-  Shift+F3 previous. A click in the body unfocuses it but keeps highlights; then `n`/`N`
+  never spans a visual wrap break. Box focused: keys type, Enter/F3/Down next, Up
+  previous (Shift+Enter is plain Enter without keyboard enhancement, so it can't be the only
+  way back; Shift+Enter/Shift+F3 still go previous when they arrive; hint `↑↓ match`). A click in the body unfocuses it but keeps highlights; then `n`/`N`
   (preview) or F3 (editor — letters are text there) navigate; Esc clears. Colors are
   `Palette::find_match_bg` / `find_current_bg`. Find keys never `continue` the event loop
   (the merge-menu code still does — don't copy that; it skips the heartbeat block).

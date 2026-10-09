@@ -581,6 +581,8 @@ fn on_find_key(
             return true;
         }
         KeyCode::Enter if fb.focused => Some(!shift),
+        KeyCode::Down if fb.focused => Some(true),
+        KeyCode::Up if fb.focused => Some(false),
         KeyCode::F(3) => Some(!shift),
         KeyCode::Char('n') if !fb.focused && !shortcut => Some(true),
         KeyCode::Char('N') if !fb.focused && !shortcut => Some(false),
@@ -2644,7 +2646,7 @@ fn draw_doc(
             |m| (matches.iter().position(|x| x == m).unwrap_or(0) + 1).to_string(),
         );
         let (caret, keys) = if f.focused {
-            ("▏", "Enter/F3 next  Shift+Enter/F3 prev  Esc close")
+            ("▏", "Enter/F3 next  ↑↓ match  Esc close")
         } else {
             ("", "n/N next/prev  / edit  Esc close")
         };

@@ -366,7 +366,8 @@ impl Editor {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => self.search = None,
-            KeyCode::Enter | KeyCode::F(3) => self.find(shift),
+            KeyCode::Enter | KeyCode::F(3) | KeyCode::Down => self.find(shift && key.code != KeyCode::Down),
+            KeyCode::Up => self.find(true),
             KeyCode::Backspace => {
                 if let Some(search) = &mut self.search {
                     search.query.pop();
@@ -884,7 +885,7 @@ impl Editor {
         } else if let Some(search) = &self.search {
             let caret = if search.focused { "▏" } else { "" };
             format!(
-                " Find: {}{caret}  {}  Enter/F3 next  Shift+Enter/F3 previous  Esc close",
+                " Find: {}{caret}  {}  Enter/F3 next  ↑↓ match  Esc close",
                 search.query,
                 self.match_counter()
             )
