@@ -26,7 +26,7 @@ use herdr_sidebar::actions::{copy_to_clipboard, open_external, reveal};
 use herdr_sidebar::branch_ui::{
     BranchPicker, FooterZones, PickerAction, draw_git_footer, sync_glyph,
 };
-use herdr_sidebar::git::{FileEntry, Git, Status};
+use herdr_sidebar::git::{BranchChanges, FileEntry, Git, Status, on_base};
 use herdr_sidebar::graph::{self as commit_graph, GraphCommit};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::state::Exit;
@@ -43,7 +43,17 @@ use herdr_sidebar::ui::{
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
-const REPO_HEADER_ACTIONS: &str = " ⇄  ⇅  ✓ ";
+const REPO_HEADER_ACTIONS: &str = " ⇅  ✓ ";
+/// BRANCH CHANGES recompute cadence (a worker; several git calls per repo).
+const BRANCH_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+/// scm.json `drawers` entry prefix remembering an expanded BRANCH CHANGES
+/// section, followed by the repo root key.
+const BRANCH_DRAWER: &str = "Branch Changes:";
+
+/// One repo's BRANCH CHANGES worker result: its root, and (branch, base,
+/// changes) — `None` when detached or no base resolves; `changes` is `None`
+/// when the branch IS its base or the merge-base diff failed.
+type BranchResult = (PathBuf, Option<(String, String, Option<BranchChanges>)>);
 
 /// How long two clicks on the same row still count as a double click (to pin
 /// a diff/show tab), matching the file explorer.
@@ -293,6 +303,14 @@ struct Repo {
     staged_tree_collapsed: BTreeSet<String>,
     /// Folders collapsed in the Changes section's tree view.
     changes_tree_collapsed: BTreeSet<String>,
+    /// BRANCH CHANGES vs the base branch; `None` hides the section (detached,
+    /// on the base itself, or not computed yet).
+    branch_changes: Option<BranchChanges>,
+    branch_expanded: bool,
+    branch_tree_collapsed: BTreeSet<String>,
+    /// `(branch, base)` resolved once per branch: the reflog scan and the
+    /// nearest-ancestor walk are too costly to redo every refresh.
+    base_cache: Option<(String, String)>,
     message: Vec<char>,
     cursor: usize,
 }
@@ -308,6 +326,10 @@ impl Repo {
             changes_collapsed: false,
             staged_tree_collapsed: BTreeSet::new(),
             changes_tree_collapsed: BTreeSet::new(),
+            branch_changes: None,
+            branch_expanded: false,
+            branch_tree_collapsed: BTreeSet::new(),
+            base_cache: None,
             message: Vec::new(),
             cursor: 0,
         }
@@ -344,6 +366,11 @@ enum Row {
     /// A folder row of the tree view: (repo, index into [`App::tree_nodes`]).
     StagedFolder(usize, usize),
     ChangesFolder(usize, usize),
+    /// BRANCH CHANGES: header, file (index into the repo's
+    /// `branch_changes.files`), and tree folder rows.
+    BranchHeader(usize),
+    BranchFile(usize, usize),
+    BranchFolder(usize, usize),
     DrawerHeader(Drawer),
     DrawerLine(Drawer, usize),
     /// A changed file of the GRAPH commit expanded inline (index into
@@ -376,8 +403,21 @@ impl Row {
             | Row::Staged(r, _)
             | Row::Unstaged(r, _)
             | Row::StagedFolder(r, _)
-            | Row::ChangesFolder(r, _) => Some(r),
+            | Row::ChangesFolder(r, _)
+            | Row::BranchHeader(r)
+            | Row::BranchFile(r, _)
+            | Row::BranchFolder(r, _) => Some(r),
             Row::DrawerHeader(_) | Row::DrawerLine(..) | Row::CommitFile(_) => None,
+        }
+    }
+
+    /// A tree folder row: (repo, node, section).
+    fn folder(self) -> Option<(usize, usize, Sect)> {
+        match self {
+            Row::StagedFolder(r, n) => Some((r, n, Sect::Staged)),
+            Row::ChangesFolder(r, n) => Some((r, n, Sect::Changes)),
+            Row::BranchFolder(r, n) => Some((r, n, Sect::Branch)),
+            _ => None,
         }
     }
 
@@ -388,6 +428,14 @@ impl Row {
     }
 }
 
+/// The file section a tree folder row belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sect {
+    Staged,
+    Changes,
+    Branch,
+}
+
 /// What a context menu is about.
 #[derive(Clone)]
 enum MenuTarget {
@@ -395,6 +443,11 @@ enum MenuTarget {
         repo: usize,
         entry: FileEntry,
         staged: bool,
+    },
+    /// A BRANCH CHANGES file row.
+    BranchFile {
+        repo: usize,
+        index: usize,
     },
     /// A folder row of the tree view: the folder's repo-relative path is the
     /// whole target (no diff, no per-file status).
@@ -406,17 +459,13 @@ enum MenuTarget {
         kind: Drawer,
         index: usize,
     },
-    /// The Changes section header.
-    Changes {
-        repo: usize,
-    },
 }
 
 /// Context-menu actions for file rows and drawer lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuAction {
     OpenDiff,
-    DiffVsBase,
+    OpenFile,
     StageOrUnstage,
     Discard,
     AddToGitignore,
@@ -592,8 +641,6 @@ struct ClickZones {
     sync: Rect,
     /// Branch text in the Source Control header.
     header_branch: Rect,
-    /// The ⇄ `vs base` button beside it.
-    header_base: Rect,
     git_footer: FooterZones,
 }
 
@@ -721,6 +768,9 @@ pub struct App {
     flash: Option<(String, bool)>,
     /// Pending ✧ commit-message generation, polled from tick().
     suggesting: Option<Receiver<String>>,
+    /// Pending BRANCH CHANGES recompute, polled from tick().
+    branch_job: Option<Receiver<Vec<BranchResult>>>,
+    branch_job_at: Option<std::time::Instant>,
     /// Pending Sync Changes run, polled from tick().
     syncing: Option<(usize, Receiver<Result<String, String>>)>,
     overlay: Option<Overlay>,
@@ -826,6 +876,7 @@ impl App {
         let saved_scroll = saved.scroll;
         for repo in &mut repos {
             let root = sidebar::scm_path_key(repo.git.root());
+            repo.branch_expanded = saved.drawers.contains(&format!("{BRANCH_DRAWER}{root}"));
             if let Some(message) = saved.drafts.get(&root) {
                 repo.message = message.chars().collect();
                 repo.cursor = repo.message.len();
@@ -849,6 +900,8 @@ impl App {
             commit_files: Vec::new(),
             flash: None,
             suggesting: None,
+            branch_job: None,
+            branch_job_at: None,
             syncing: None,
             overlay: None,
             hovered: None,
@@ -970,7 +1023,91 @@ impl App {
             self.flash = Some((e, true));
         }
         self.reload_expanded_drawers();
+        self.start_branch_job(false);
         self.rebuild();
+    }
+
+    /// Recompute BRANCH CHANGES for every repo on a worker thread: base
+    /// resolution and the merge-base diff are several git calls per repo and
+    /// must never run on the UI thread. One job in flight; `force` replaces
+    /// it (the old result is dropped with its receiver).
+    fn start_branch_job(&mut self, force: bool) {
+        if !force
+            && (self.branch_job.is_some()
+                || self
+                    .branch_job_at
+                    .is_some_and(|t| t.elapsed() < BRANCH_EVERY))
+        {
+            return;
+        }
+        let jobs: Vec<_> = self
+            .repos
+            .iter()
+            .map(|r| {
+                let untracked: Vec<FileEntry> = r
+                    .status
+                    .unstaged
+                    .iter()
+                    .filter(|e| e.letter == 'U')
+                    .cloned()
+                    .collect();
+                (
+                    r.git.clone(),
+                    r.status.branch.clone(),
+                    untracked,
+                    r.base_cache.clone(),
+                )
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out: Vec<BranchResult> = jobs
+                .into_iter()
+                .map(|(git, branch, untracked, cache)| {
+                    (
+                        git.root().to_path_buf(),
+                        branch_result(&git, branch, &untracked, cache),
+                    )
+                })
+                .collect();
+            let _ = tx.send(out);
+        });
+        self.branch_job = Some(rx);
+        self.branch_job_at = Some(std::time::Instant::now());
+    }
+
+    fn poll_branch_job(&mut self) {
+        let Some(rx) = &self.branch_job else { return };
+        let results = match rx.try_recv() {
+            Ok(results) => results,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Vec::new(),
+        };
+        self.branch_job = None;
+        let mut changed = false;
+        for (root, result) in results {
+            let Some(repo) = self.repos.iter_mut().find(|r| r.git.root() == root) else {
+                continue;
+            };
+            let changes = match result {
+                Some((branch, base, changes)) => {
+                    repo.base_cache = Some((branch, base));
+                    changes
+                }
+                None => None,
+            };
+            if repo.branch_changes != changes {
+                repo.branch_changes = changes;
+                changed = true;
+            }
+        }
+        if changed {
+            let keep = self.selected.and_then(|i| self.row_stable_id(i));
+            self.rebuild();
+            if let Some(i) = keep.and_then(|id| self.find_row_by_stable_id(&id)) {
+                self.selected = Some(i);
+            }
+        }
     }
 
     /// Re-stamp the identity tokens so launchers know this pane is alive.
@@ -1095,6 +1232,7 @@ impl App {
                 }
             }
         }
+        self.poll_branch_job();
         if let Some((_, rx)) = &self.syncing {
             match rx.try_recv() {
                 Ok(Ok(_)) => {
@@ -1162,6 +1300,7 @@ impl App {
             }
             repo.staged_collapsed = true;
             repo.changes_collapsed = true;
+            repo.branch_expanded = false;
         }
         for drawer in &mut self.drawers {
             drawer.expanded = false;
@@ -1257,78 +1396,42 @@ impl App {
                 self.row_depth.push(0);
             }
             // Like VS Code, the Staged section only exists while something is staged.
+            let (rows, depths, nodes) = (&mut self.rows, &mut self.row_depth, &mut self.tree_nodes);
             if !repo.status.staged.is_empty() {
-                self.rows.push(Row::StagedHeader(r));
-                self.row_depth.push(0);
+                rows.push(Row::StagedHeader(r));
+                depths.push(0);
                 if !repo.staged_collapsed {
-                    if tree {
-                        for node in
-                            changes_tree_rows(&repo.status.staged, &repo.staged_tree_collapsed)
-                        {
-                            match node {
-                                ChangeTreeRow::Folder {
-                                    path,
-                                    label,
-                                    depth,
-                                    expanded,
-                                } => {
-                                    self.rows.push(Row::StagedFolder(r, self.tree_nodes.len()));
-                                    self.row_depth.push(depth);
-                                    self.tree_nodes.push(TreeNode {
-                                        path,
-                                        label,
-                                        depth,
-                                        expanded,
-                                    });
-                                }
-                                ChangeTreeRow::File { index, depth } => {
-                                    self.rows.push(Row::Staged(r, index));
-                                    self.row_depth.push(depth);
-                                }
-                            }
-                        }
-                    } else {
-                        for i in 0..repo.status.staged.len() {
-                            self.rows.push(Row::Staged(r, i));
-                            self.row_depth.push(0);
-                        }
-                    }
+                    push_file_rows(
+                        (rows, depths, nodes),
+                        &repo.status.staged,
+                        tree.then_some(&repo.staged_tree_collapsed),
+                        |i| Row::Staged(r, i),
+                        |n| Row::StagedFolder(r, n),
+                    );
                 }
             }
-            self.rows.push(Row::ChangesHeader(r));
-            self.row_depth.push(0);
+            rows.push(Row::ChangesHeader(r));
+            depths.push(0);
             if !repo.changes_collapsed {
-                if tree {
-                    for node in
-                        changes_tree_rows(&repo.status.unstaged, &repo.changes_tree_collapsed)
-                    {
-                        match node {
-                            ChangeTreeRow::Folder {
-                                path,
-                                label,
-                                depth,
-                                expanded,
-                            } => {
-                                self.rows.push(Row::ChangesFolder(r, self.tree_nodes.len()));
-                                self.row_depth.push(depth);
-                                self.tree_nodes.push(TreeNode {
-                                    path,
-                                    label,
-                                    depth,
-                                    expanded,
-                                });
-                            }
-                            ChangeTreeRow::File { index, depth } => {
-                                self.rows.push(Row::Unstaged(r, index));
-                                self.row_depth.push(depth);
-                            }
-                        }
-                    }
-                } else {
-                    for i in 0..repo.status.unstaged.len() {
-                        self.rows.push(Row::Unstaged(r, i));
-                        self.row_depth.push(0);
-                    }
+                push_file_rows(
+                    (rows, depths, nodes),
+                    &repo.status.unstaged,
+                    tree.then_some(&repo.changes_tree_collapsed),
+                    |i| Row::Unstaged(r, i),
+                    |n| Row::ChangesFolder(r, n),
+                );
+            }
+            if let Some(changes) = &repo.branch_changes {
+                rows.push(Row::BranchHeader(r));
+                depths.push(0);
+                if repo.branch_expanded {
+                    push_file_rows(
+                        (rows, depths, nodes),
+                        &changes.files,
+                        tree.then_some(&repo.branch_tree_collapsed),
+                        |i| Row::BranchFile(r, i),
+                        |n| Row::BranchFolder(r, n),
+                    );
                 }
             }
         }
@@ -1401,6 +1504,9 @@ impl App {
             }
             Some(Row::Unstaged(r, i)) if r == self.active => {
                 self.repos[r].status.unstaged.get(i).map(|e| e.path.clone())
+            }
+            Some(Row::BranchFile(r, i)) if r == self.active => {
+                self.branch_entry(r, i).map(|e| e.path)
             }
             _ => return, // keep the last file while browsing elsewhere
         };
@@ -1571,7 +1677,7 @@ impl App {
             KeyCode::Char('A') => self.suggest_message(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('S') => self.sync_changes(),
-            KeyCode::Char('B') => self.open_base_diff(self.active),
+            KeyCode::Char('B') => self.open_base_picker(self.active),
             KeyCode::Char('o') => self.open_selected_in_vscode(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('t') => self.toggle_tree_view(),
@@ -1666,10 +1772,6 @@ impl App {
             self.sync_changes();
             return None;
         }
-        if hits(z.header_base, x, y) {
-            self.open_base_diff(self.active);
-            return None;
-        }
         if hits(z.header_branch, x, y) || hits(z.git_footer.branch, x, y) {
             self.open_branch_picker();
             return None;
@@ -1741,11 +1843,36 @@ impl App {
                 // Folder rows fold/unfold like the section headers.
                 Row::StagedFolder(r, node) => {
                     self.focus = Focus::List;
-                    self.toggle_tree_folder(r, node, true);
+                    self.toggle_tree_folder(r, node, Sect::Staged);
                 }
                 Row::ChangesFolder(r, node) => {
                     self.focus = Focus::List;
-                    self.toggle_tree_folder(r, node, false);
+                    self.toggle_tree_folder(r, node, Sect::Changes);
+                }
+                Row::BranchFolder(r, node) => {
+                    self.focus = Focus::List;
+                    self.toggle_tree_folder(r, node, Sect::Branch);
+                }
+                Row::BranchHeader(r) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    let zone = self.repos[r].branch_changes.as_ref().map(|c| {
+                        branch_header_base(&c.base, c.files.len(), usize::from(self.last_width)).1
+                    });
+                    if zone.is_some_and(|zone| within(x, zone)) {
+                        self.open_base_picker(r);
+                    } else {
+                        self.activate();
+                    }
+                }
+                Row::BranchFile(r, i) => {
+                    self.focus = Focus::List;
+                    self.select(index);
+                    if double && self.pin_if_open(index) {
+                        // pinned the first click's diff tab
+                    } else {
+                        self.open_branch_diff(r, i);
+                    }
                 }
                 // The inline widgets: click focuses/acts without selecting.
                 Row::Message(r) => {
@@ -1777,10 +1904,8 @@ impl App {
                     // Right-side action icons: ⟳ sync · ✓ commit (fixed
                     // offsets from the right edge, see repo_header_item).
                     let w = self.last_width;
-                    let (base_zone, sync_zone, commit_zone) = repo_header_action_zones(w);
-                    if within(x, base_zone) {
-                        self.open_base_diff(r);
-                    } else if within(x, commit_zone) {
+                    let (sync_zone, commit_zone) = repo_header_action_zones(w);
+                    if within(x, commit_zone) {
                         self.commit_repo(r);
                     } else if within(x, sync_zone) {
                         self.sync_repo(r);
@@ -1864,7 +1989,9 @@ impl App {
             Row::Unstaged(r, i) => (r, self.repos[r].status.unstaged.get(i), false),
             // Tree-view folder rows carry their own path-level menu, so a
             // folder can be ignored or revealed as a whole.
-            Row::StagedFolder(r, node) | Row::ChangesFolder(r, node) => {
+            Row::StagedFolder(r, node)
+            | Row::ChangesFolder(r, node)
+            | Row::BranchFolder(r, node) => {
                 let path = self.tree_nodes[node].path.clone();
                 self.overlay = Some(Overlay::Menu {
                     x,
@@ -1880,21 +2007,21 @@ impl App {
                 self.open_drawer_menu(x, y, kind, i);
                 return;
             }
-            Row::ChangesHeader(r) => {
+            Row::BranchFile(r, i) => {
+                let Some(entry) = self.branch_entry(r, i) else {
+                    return;
+                };
                 self.overlay = Some(Overlay::Menu {
                     x,
                     y,
-                    target: MenuTarget::Changes { repo: r },
-                    entries: vec![MenuEntry::Action(
-                        MenuAction::DiffVsBase,
-                        "Open Diff vs Base Branch",
-                    )],
+                    target: MenuTarget::BranchFile { repo: r, index: i },
+                    entries: branch_file_menu_entries(entry.letter),
                     selected: 0,
                     rect: Rect::default(),
                 });
                 return;
             }
-            _ => return, // other section headers have no menu
+            _ => return, // section headers have no menu
         };
         let Some(entry) = entry.cloned() else { return };
         let entries = file_menu_entries(entry.letter, staged);
@@ -2204,6 +2331,24 @@ impl App {
                 let Some(Overlay::BranchPicker(picker)) = self.overlay.take() else {
                     return;
                 };
+                if let Some(current) = &picker.compare_for {
+                    if on_base(current, &branch.name) {
+                        self.flash = Some(("pick a branch other than this one".into(), true));
+                    } else if sidebar::set_base_override(picker.git.root(), current, &branch.name) {
+                        if let Some(repo) = self
+                            .repos
+                            .iter_mut()
+                            .find(|r| r.git.root() == picker.git.root())
+                        {
+                            repo.base_cache = None;
+                        }
+                        self.flash = Some((format!("comparing with {}", branch.name), false));
+                        self.start_branch_job(true);
+                    } else {
+                        self.flash = Some(("could not save the base branch".into(), true));
+                    }
+                    return;
+                }
                 match picker.git.checkout_branch(&branch) {
                     Ok(()) => {
                         self.flash = Some((format!("switched to {}", branch.name), false));
@@ -2445,30 +2590,27 @@ impl App {
     }
 
     /// Fold/unfold a tree folder, keeping the selection on its row.
-    fn toggle_tree_folder(&mut self, repo: usize, node: usize, staged: bool) {
+    fn toggle_tree_folder(&mut self, repo: usize, node: usize, sect: Sect) {
         let Some(folder) = self.tree_nodes.get(node) else {
             return;
         };
         let path = folder.path.clone();
         {
-            let collapsed = if staged {
-                &mut self.repos[repo].staged_tree_collapsed
-            } else {
-                &mut self.repos[repo].changes_tree_collapsed
+            let r = &mut self.repos[repo];
+            let collapsed = match sect {
+                Sect::Staged => &mut r.staged_tree_collapsed,
+                Sect::Changes => &mut r.changes_tree_collapsed,
+                Sect::Branch => &mut r.branch_tree_collapsed,
             };
             if !collapsed.remove(&path) {
                 collapsed.insert(path.clone());
             }
         }
         self.rebuild();
-        let found = self.rows.iter().position(|row| match row {
-            Row::StagedFolder(r, node) if staged => {
-                *r == repo && self.tree_nodes.get(*node).is_some_and(|n| n.path == path)
-            }
-            Row::ChangesFolder(r, node) if !staged => {
-                *r == repo && self.tree_nodes.get(*node).is_some_and(|n| n.path == path)
-            }
-            _ => false,
+        let found = self.rows.iter().position(|row| {
+            row.folder().is_some_and(|(r, n, s)| {
+                r == repo && s == sect && self.tree_nodes.get(n).is_some_and(|n| n.path == path)
+            })
         });
         if let Some(index) = found {
             self.select(index);
@@ -2518,16 +2660,10 @@ impl App {
         let Some(index) = self.selected else {
             return;
         };
-        if let Some(&Row::StagedFolder(r, node)) = self.rows.get(index)
+        if let Some((r, node, sect)) = self.rows.get(index).and_then(|row| row.folder())
             && self.tree_nodes.get(node).is_some_and(|n| n.expanded)
         {
-            self.toggle_tree_folder(r, node, true);
-            return;
-        }
-        if let Some(&Row::ChangesFolder(r, node)) = self.rows.get(index)
-            && self.tree_nodes.get(node).is_some_and(|n| n.expanded)
-        {
-            self.toggle_tree_folder(r, node, false);
+            self.toggle_tree_folder(r, node, sect);
             return;
         }
         if let Some(parent) = self.parent_row(index) {
@@ -2543,20 +2679,10 @@ impl App {
         let Some(index) = self.selected else {
             return;
         };
-        match self.rows.get(index) {
-            Some(Row::StagedFolder(r, node)) => {
-                let (r, node) = (*r, *node);
-                if self.tree_nodes.get(node).is_some_and(|n| !n.expanded) {
-                    self.toggle_tree_folder(r, node, true);
-                }
-            }
-            Some(Row::ChangesFolder(r, node)) => {
-                let (r, node) = (*r, *node);
-                if self.tree_nodes.get(node).is_some_and(|n| !n.expanded) {
-                    self.toggle_tree_folder(r, node, false);
-                }
-            }
-            _ => {}
+        if let Some((r, node, sect)) = self.rows.get(index).and_then(|row| row.folder())
+            && self.tree_nodes.get(node).is_some_and(|n| !n.expanded)
+        {
+            self.toggle_tree_folder(r, node, sect);
         }
     }
 
@@ -2712,8 +2838,8 @@ impl App {
                 staged,
             } => self.file_menu_action(action, repo, entry, staged),
             MenuTarget::Folder { repo, path } => self.folder_menu_action(action, repo, path),
+            MenuTarget::BranchFile { repo, index } => self.branch_menu_action(action, repo, index),
             MenuTarget::Drawer { kind, index } => self.drawer_menu_action(action, kind, index),
-            MenuTarget::Changes { repo } => self.open_base_diff(repo),
         }
     }
 
@@ -3083,30 +3209,94 @@ impl App {
         }
     }
 
-    /// `vs base`: one diff of everything this branch changed since it left
-    /// the repo's default branch (merge-base vs working tree).
-    fn open_base_diff(&mut self, repo: usize) {
+    fn branch_entry(&self, repo: usize, index: usize) -> Option<FileEntry> {
+        self.repos
+            .get(repo)?
+            .branch_changes
+            .as_ref()?
+            .files
+            .get(index)
+            .cloned()
+    }
+
+    /// A BRANCH CHANGES file: that one file's diff from the merge-base to the
+    /// working tree, through the ordinary diff request (so pinning, `f`,
+    /// find, `]`/`[` and the live refresh all apply).
+    fn open_branch_diff(&mut self, repo: usize, index: usize) {
+        let Some(r) = self.repos.get(repo) else {
+            return;
+        };
+        let Some(changes) = &r.branch_changes else {
+            return;
+        };
+        let Some(entry) = changes.files.get(index) else {
+            return;
+        };
+        let root = r.git.root().to_path_buf();
+        let kind = branch_diff_kind(changes, entry);
+        let payload = herdr_sidebar::viewer::diff_request(&root, &entry.path, &kind);
+        let doc_key = herdr_sidebar::viewer::doc_key_for_diff(&root, &entry.path, &kind);
+        self.open_preview(&root, doc_key, &payload);
+    }
+
+    /// Hand `payload` to the preview pane, remembering where it landed so a
+    /// double click can pin it.
+    fn open_preview(&mut self, root: &Path, doc_key: String, payload: &str) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
             self.flash = Some(("diff preview needs a herdr pane".into(), true));
             return;
         };
-        let Some(repo) = self.repos.get(repo) else {
-            return;
-        };
-        let (base, mb) = match repo.git.vs_base(&repo.status.branch) {
-            Ok(found) => found,
-            Err(e) => {
-                self.flash = Some((e, false));
-                return;
-            }
-        };
-        let root = repo.git.root();
-        let (rel, kind) = (format!("vs {base}"), format!("base:{mb}:{base}"));
-        let payload = herdr_sidebar::viewer::diff_request(root, &rel, &kind);
-        let doc_key = herdr_sidebar::viewer::doc_key_for_diff(root, &rel, &kind);
-        match herdr_sidebar::viewer::open_in_pane(&pane_id, root, &doc_key, &payload) {
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, root, &doc_key, payload) {
             Ok(target) => self.last_preview = Some((doc_key, target)),
             Err(e) => self.flash = Some((e, true)),
+        }
+    }
+
+    fn branch_menu_action(&mut self, action: MenuAction, repo: usize, index: usize) {
+        let Some(entry) = self.branch_entry(repo, index) else {
+            return;
+        };
+        if self.path_menu_action(action, repo, &entry.path) {
+            return;
+        }
+        match action {
+            MenuAction::OpenDiff => self.open_branch_diff(repo, index),
+            MenuAction::OpenFile => {
+                let Some(root) = self.repos.get(repo).map(|r| r.git.root().to_path_buf()) else {
+                    return;
+                };
+                let path = root.join(entry.path.replace('/', std::path::MAIN_SEPARATOR_STR));
+                let payload = herdr_sidebar::viewer::file_request(&path);
+                self.open_preview(
+                    &root,
+                    herdr_sidebar::viewer::doc_key_for_file(&path),
+                    &payload,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// `B` / a click on the BRANCH CHANGES base label: the branch picker in
+    /// "compare with" mode; the choice persists per repo + branch.
+    fn open_base_picker(&mut self, repo: usize) {
+        let Some(r) = self.repos.get(repo) else {
+            return;
+        };
+        let branch = r.status.branch.clone();
+        if branch.is_empty() || branch.starts_with("HEAD") {
+            self.flash = Some(("no branch checked out".into(), true));
+            return;
+        }
+        let base = r.base_cache.as_ref().map(|(_, b)| b.clone());
+        let git = r.git.clone();
+        self.active = repo;
+        match BranchPicker::open(git) {
+            Ok(mut picker) => {
+                picker.compare(branch, base.as_deref());
+                self.overlay = Some(Overlay::BranchPicker(picker));
+            }
+            Err(error) => self.flash = Some((error, true)),
         }
     }
 
@@ -3156,6 +3346,16 @@ impl App {
                     repo.git.root(),
                     &spec,
                     path.as_deref(),
+                ))
+            }
+            Row::BranchFile(r, i) => {
+                let repo = self.repos.get(*r)?;
+                let changes = repo.branch_changes.as_ref()?;
+                let entry = changes.files.get(*i)?;
+                Some(herdr_sidebar::viewer::doc_key_for_diff(
+                    repo.git.root(),
+                    &entry.path,
+                    &branch_diff_kind(changes, entry),
                 ))
             }
             Row::CommitFile(f) => {
@@ -3219,6 +3419,19 @@ impl App {
             }),
             Row::StagedFolder(r, node) => self.tree_node_id(*r, *node, "staged-dir"),
             Row::ChangesFolder(r, node) => self.tree_node_id(*r, *node, "changes-dir"),
+            Row::BranchHeader(r) => self
+                .repos
+                .get(*r)
+                .map(|r| format!("branch-h:{}", r.git.root().display())),
+            Row::BranchFile(r, i) => self.repos.get(*r).and_then(|repo| {
+                let entry = repo.branch_changes.as_ref()?.files.get(*i)?;
+                Some(format!(
+                    "branch:{}:{}",
+                    repo.git.root().display(),
+                    entry.path
+                ))
+            }),
+            Row::BranchFolder(r, node) => self.tree_node_id(*r, *node, "branch-dir"),
             Row::DrawerHeader(kind) => Some(format!("drawer-h:{}", kind.title())),
             Row::CommitFile(f) => self.commit_files.get(*f).map(|entry| {
                 format!(
@@ -3254,6 +3467,12 @@ impl App {
             .iter()
             .filter(|k| self.drawers[k.index()].expanded)
             .map(|k| k.title().to_string())
+            .chain(
+                self.repos
+                    .iter()
+                    .filter(|r| r.branch_expanded)
+                    .map(|r| format!("{BRANCH_DRAWER}{}", sidebar::scm_path_key(r.git.root()))),
+            )
             .collect();
         let active_root = self
             .repos
@@ -3333,6 +3552,10 @@ impl App {
             Row::CommitFile(f) => {
                 let path = self.commit_files.get(f).map(|e| e.path.clone());
                 self.open_in_vscode(self.active, path);
+            }
+            Row::BranchFile(r, i) => {
+                let path = self.branch_entry(r, i).map(|e| e.path);
+                self.open_in_vscode(r, path);
             }
             _ => {}
         }
@@ -3558,8 +3781,14 @@ impl App {
             }
             Row::Staged(r, i) => self.run_op(|git, e| git.unstage(e), r, i, true),
             Row::Unstaged(r, i) => self.run_op(|git, e| git.stage(e), r, i, false),
-            Row::StagedFolder(r, node) => self.toggle_tree_folder(r, node, true),
-            Row::ChangesFolder(r, node) => self.toggle_tree_folder(r, node, false),
+            Row::StagedFolder(r, node) => self.toggle_tree_folder(r, node, Sect::Staged),
+            Row::ChangesFolder(r, node) => self.toggle_tree_folder(r, node, Sect::Changes),
+            Row::BranchHeader(r) => {
+                self.repos[r].branch_expanded = !self.repos[r].branch_expanded;
+                self.rebuild();
+            }
+            Row::BranchFile(r, i) => self.open_branch_diff(r, i),
+            Row::BranchFolder(r, node) => self.toggle_tree_folder(r, node, Sect::Branch),
         }
         self.persist_scm();
     }
@@ -4077,16 +4306,14 @@ impl App {
         } else {
             (Vec::new(), 0)
         };
-        // ⇄ `vs base` sits right after the branch label it diffs against.
-        let base_w = if right_text.is_empty() { 0 } else { 2 };
         // The branch text yields to the buttons and gear in narrow panes.
         let avail = (area.width as usize)
-            .saturating_sub(left.width() + base_w + actions_w + gear_w)
+            .saturating_sub(left.width() + actions_w + gear_w)
             .saturating_sub(1);
         let branch_text = truncate_to(right_text, avail);
         let branch_width = Span::raw(branch_text.as_str()).width();
         let pad = (area.width as usize)
-            .saturating_sub(left.width() + branch_width + base_w + actions_w + gear_w)
+            .saturating_sub(left.width() + branch_width + actions_w + gear_w)
             .max(1);
         let branch_x = area.x + left.width() as u16 + pad as u16;
         self.zones.header_branch = Rect::new(branch_x, area.y, branch_width as u16, 1);
@@ -4102,21 +4329,6 @@ impl App {
             },
         );
         let mut spans = vec![left, Span::raw(" ".repeat(pad)), branch];
-        self.zones.header_base =
-            Rect::new(branch_x + branch_width as u16, area.y, base_w as u16, 1);
-        if base_w > 0 {
-            let hovered = self
-                .mouse_pos
-                .is_some_and(|(x, y)| hits(self.zones.header_base, x, y));
-            spans.push(Span::styled(
-                "⇄ ",
-                if hovered {
-                    hover_style()
-                } else {
-                    Style::default().dim()
-                },
-            ));
-        }
         spans.extend(action_spans);
         if let Some(gear) = gear {
             let gx = area.x + area.width.saturating_sub(gear_w as u16);
@@ -4394,8 +4606,43 @@ impl App {
                         )
                     }
                     Row::StagedFolder(_, node) => folder_item(&self.tree_nodes[node], width, theme),
-                    Row::ChangesFolder(_, node) => {
+                    Row::ChangesFolder(_, node) | Row::BranchFolder(_, node) => {
                         folder_item(&self.tree_nodes[node], width, theme)
+                    }
+                    Row::BranchHeader(r) => match &self.repos[r].branch_changes {
+                        Some(c) => {
+                            let (label, zone) = branch_header_base(&c.base, c.files.len(), width);
+                            let base_hovered =
+                                row_hovered && mouse_pos.is_some_and(|(x, _)| within(x, zone));
+                            branch_header_item(
+                                !self.repos[r].branch_expanded,
+                                &label,
+                                c.files.len(),
+                                width,
+                                base_hovered,
+                            )
+                        }
+                        None => ListItem::new(Line::default()),
+                    },
+                    Row::BranchFile(r, i) => {
+                        match self.repos[r]
+                            .branch_changes
+                            .as_ref()
+                            .and_then(|c| c.files.get(i))
+                        {
+                            Some(entry) => file_item(
+                                entry,
+                                width,
+                                theme,
+                                false,
+                                false,
+                                None,
+                                self.sidebar_state
+                                    .scm_tree
+                                    .then(|| self.row_depth[row_index]),
+                            ),
+                            None => ListItem::new(Line::default()),
+                        }
                     }
                 };
                 if selected == Some(row_index) {
@@ -4532,7 +4779,7 @@ impl App {
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),
-            ("B", "vs base"),
+            ("B", "base"),
             ("s", "settings"),
             ("r", "refresh"),
             ("q", "quit"),
@@ -4764,19 +5011,14 @@ fn repo_header_branch_zone(repo: &Repo, theme: IconTheme, width: u16) -> (u16, u
     (start, start + branch_width as u16)
 }
 
-/// ⇄ vs base · ⟳ sync · ✓ commit, three equal cells at the right edge.
-fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16), (u16, u16)) {
+fn repo_header_action_zones(width: u16) -> ((u16, u16), (u16, u16)) {
     let actions_width = Span::raw(REPO_HEADER_ACTIONS).width() as u16;
     if width < actions_width {
-        return ((0, 0), (0, 0), (0, 0));
+        return ((0, 0), (0, 0));
     }
     let start = width - actions_width;
-    let third = actions_width / 3;
-    (
-        (start, start + third),
-        (start + third, start + 2 * third),
-        (start + 2 * third, width),
-    )
+    let midpoint = start + actions_width / 2;
+    ((start, midpoint), (midpoint, width))
 }
 
 fn changes_header_action_zones(
@@ -5307,6 +5549,137 @@ pub(crate) fn folder_item(node: &TreeNode, width: usize, theme: IconTheme) -> Li
     ListItem::new(Line::from(spans))
 }
 
+/// The diff kind a BRANCH CHANGES file opens: untracked files have no
+/// merge-base side and render as one addition.
+fn branch_diff_kind(changes: &BranchChanges, entry: &FileEntry) -> String {
+    if entry.letter == 'U' {
+        "untracked".into()
+    } else {
+        format!("base:{}:{}", changes.merge_base, changes.base)
+    }
+}
+
+fn branch_file_menu_entries(letter: char) -> Vec<MenuEntry> {
+    let mut entries = vec![MenuEntry::Action(MenuAction::OpenDiff, "Open Diff")];
+    if letter != 'D' {
+        entries.push(MenuEntry::Action(MenuAction::OpenFile, "Open File"));
+    }
+    entries.extend([
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
+        MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
+        MenuEntry::Separator,
+        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+    ]);
+    entries
+}
+
+/// The BRANCH CHANGES header's base label (truncated to fit before the
+/// count badge) and its clickable columns.
+fn branch_header_base(base: &str, count: usize, width: usize) -> (String, (u16, u16)) {
+    let start = Span::raw(" ▸ Branch Changes vs ").width();
+    let badge = format!(" {count} ").len() + 1;
+    let label = truncate_to(base.to_string(), width.saturating_sub(start + badge + 1));
+    let end = start + Span::raw(label.as_str()).width();
+    (label, (start as u16, end as u16))
+}
+
+/// ` ▾ Branch Changes vs <base>` + count badge; the base reads as a link.
+fn branch_header_item(
+    collapsed: bool,
+    base: &str,
+    count: usize,
+    width: usize,
+    base_hovered: bool,
+) -> ListItem<'static> {
+    let arrow = if collapsed { "▸" } else { "▾" };
+    let left = [
+        Span::styled(format!(" {arrow} Branch Changes"), Style::default().bold()),
+        Span::styled(" vs ", Style::default().dim()),
+        Span::styled(
+            base.to_string(),
+            if base_hovered {
+                hover_style().underlined()
+            } else {
+                Style::default().fg(palette().accent)
+            },
+        ),
+    ];
+    let badge = Span::styled(
+        format!(" {count} "),
+        Style::default()
+            .bg(palette().button_bg)
+            .fg(palette().button_fg),
+    );
+    let used: usize = left.iter().map(Span::width).sum();
+    let pad = width.saturating_sub(used + badge.width() + 1).max(1);
+    let mut spans = left.to_vec();
+    spans.extend([Span::raw(" ".repeat(pad)), badge, Span::raw(" ")]);
+    ListItem::new(Line::from(spans))
+}
+
+/// The worker half of [`App::start_branch_job`] for one repo.
+fn branch_result(
+    git: &Git,
+    branch: String,
+    untracked: &[FileEntry],
+    cache: Option<(String, String)>,
+) -> Option<(String, String, Option<BranchChanges>)> {
+    if branch.is_empty() || branch.starts_with("HEAD") {
+        return None; // detached
+    }
+    let base = match (sidebar::base_override(git.root(), &branch), cache) {
+        (Some(base), _) => base,
+        (None, Some((cached, base))) if cached == branch => base,
+        (None, _) => git.resolve_base(&branch, None)?,
+    };
+    let changes = (!on_base(&branch, &base))
+        .then(|| git.branch_changes(&base, untracked).ok())
+        .flatten();
+    Some((branch, base, changes))
+}
+
+/// One file section's rows: flat, or (with `tree_collapsed`) VS Code's tree
+/// with folder rows recorded in `nodes`.
+fn push_file_rows(
+    (rows, depths, nodes): (&mut Vec<Row>, &mut Vec<usize>, &mut Vec<TreeNode>),
+    entries: &[FileEntry],
+    tree_collapsed: Option<&BTreeSet<String>>,
+    file: impl Fn(usize) -> Row,
+    folder: impl Fn(usize) -> Row,
+) {
+    let Some(collapsed) = tree_collapsed else {
+        for i in 0..entries.len() {
+            rows.push(file(i));
+            depths.push(0);
+        }
+        return;
+    };
+    for node in changes_tree_rows(entries, collapsed) {
+        match node {
+            ChangeTreeRow::Folder {
+                path,
+                label,
+                depth,
+                expanded,
+            } => {
+                rows.push(folder(nodes.len()));
+                depths.push(depth);
+                nodes.push(TreeNode {
+                    path,
+                    label,
+                    depth,
+                    expanded,
+                });
+            }
+            ChangeTreeRow::File { index, depth } => {
+                rows.push(file(index));
+                depths.push(depth);
+            }
+        }
+    }
+}
+
 /// A file row: icon, name colored by status, dimmed parent directory, and a
 /// right-aligned status letter — VS Code Source Control's row anatomy.
 fn file_item(
@@ -5449,6 +5822,50 @@ mod tests {
     }
 
     #[test]
+    fn branch_changes_rows_share_the_changes_layout() {
+        let files = herdr_sidebar::git::merge_branch_files(
+            herdr_sidebar::git::parse_name_status("M\tsrc/a.rs\nA\tsrc/b.rs\n"),
+            &[FileEntry {
+                path: "top.md".into(),
+                orig: None,
+                letter: 'U',
+            }],
+        );
+        let shape = |tree: Option<&BTreeSet<String>>| {
+            let (mut rows, mut depths, mut nodes) = (Vec::new(), Vec::new(), Vec::new());
+            push_file_rows(
+                (&mut rows, &mut depths, &mut nodes),
+                &files,
+                tree,
+                |i| Row::BranchFile(0, i),
+                |n| Row::BranchFolder(0, n),
+            );
+            rows.iter()
+                .zip(depths)
+                .map(|(row, depth)| match row {
+                    Row::BranchFile(_, i) => (files[*i].path.clone(), depth),
+                    Row::BranchFolder(_, n) => (format!("{}/", nodes[*n].label), depth),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let flat: Vec<_> = shape(None).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(flat, ["src/a.rs", "src/b.rs", "top.md"]);
+        let tree = shape(Some(&BTreeSet::new()));
+        assert_eq!(
+            tree,
+            [
+                ("src/".to_string(), 0),
+                ("src/a.rs".to_string(), 1),
+                ("src/b.rs".to_string(), 1),
+                ("top.md".to_string(), 0)
+            ]
+        );
+        let collapsed = BTreeSet::from(["src".to_string()]);
+        assert_eq!(shape(Some(&collapsed)).len(), 2);
+    }
+
+    #[test]
     fn changes_tree_collapsed_folder_hides_its_contents() {
         let entries = [change("src/main.rs"), change("src/bin/tool.rs")];
         let collapsed: BTreeSet<String> = ["src".to_string()].into_iter().collect();
@@ -5500,8 +5917,8 @@ mod tests {
 
     #[test]
     fn narrow_repo_headers_disable_hidden_action_zones() {
-        assert_eq!(repo_header_action_zones(8), ((0, 0), (0, 0), (0, 0)));
-        assert_eq!(repo_header_action_zones(9), ((0, 3), (3, 6), (6, 9)));
+        assert_eq!(repo_header_action_zones(4), ((0, 0), (0, 0)));
+        assert_eq!(repo_header_action_zones(6), ((0, 3), (3, 6)));
     }
 
     #[test]

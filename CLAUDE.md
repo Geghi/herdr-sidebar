@@ -883,15 +883,25 @@ HACKING.md — budget time for that before promising a patched build.
   DISPLAY/WAYLAND_DISPLAY, and `code` exits "Missing X server" (silently: stderr is null).
   `actions::gui_command` (code, xdg-open) then copies DISPLAY/WAYLAND_DISPLAY/XAUTHORITY from
   `systemctl --user show-environment` onto the CHILD only.
-- **vs base** (`B`, the ⇄ button after the panel header's branch label, the first of the
-  multi-repo header's three right-edge icons `⇄ ⇅ ✓` — now 9 cols, not 6 — or the Changes
-  header's menu): one multi-file diff of `git diff <merge-base>` (committed + uncommitted
-  tracked changes, untracked excluded) against the default branch. `Git::vs_base` resolves the
-  base via pure `pick_base` (origin/HEAD target, else origin/main, origin/master, main, master);
-  being ON the base only flashes `already on <base>`. It rides the ordinary diff request as kind
-  `base:<merge-base>:<base>` (`viewer::load_base_diff`), so `f`/live refresh work unchanged;
-  `diffview::render_files` gives each file its own `▍ path` header. The merge-base is computed
-  once at open, so a later rebase needs a fresh `B`.
+- **Branch Changes** (PR-style review, file by file — a single concatenated `vs base` diff
+  was tried and user-REJECTED): a per-repo `Branch Changes vs <base>` section under Changes
+  (`Row::BranchHeader/BranchFile/BranchFolder`, collapsed by default, expanded state kept in
+  scm.json `drawers` as `Branch Changes:<root>`). Files = `git diff --name-status -M <mb>`
+  (merge-base → working tree, committed + uncommitted) merged with untracked `U` rows from the
+  last status (`merge_branch_files`); flat/tree via the shared `push_file_rows` /
+  `changes_tree_rows`. Enter/click opens ONE file's diff as kind `base:<mb>:<base>`
+  (`load_diff` adds `<mb>`; untracked rows use `untracked`), so tabs/pinning/`f`/find/`]`/`[`
+  /refresh are the normal diff path; `o` = VS Code; menu = Open Diff / Open File / Copy / Reveal.
+  Base = pure `git::resolve_base`, first hit wins: scm.json `base_overrides[root][branch]` →
+  reflog `branch: Created from <ref>` (`HEAD` resolves via HEAD's oldest `checkout: moving
+  from X to <branch>`, a sha via a local branch pointing there; `remote/x` → local `x`) →
+  `branch.<b>.vscode-merge-base` → upstream (`branch.<b>.merge`, unless it is the branch itself)
+  → nearest local branch by `rev-list --left-right --count` (strict descendants excluded) →
+  origin/HEAD, main, master. Computed on a worker every ≥3s (`start_branch_job`, polled in
+  tick even when unfocused); the resolved base is cached per (repo, branch) so the reflog scan
+  /nearest walk run once. `B` or a click on the base label opens `BranchPicker` in
+  `compare_for` mode; the choice writes `base_overrides` (never touches other scm.json keys).
+  Detached HEAD or being ON the base hides the section.
 - **Sync Changes** (`S` or the ⇅ button, shown only when ahead/behind ≠ 0): `pull --rebase
   --autostash` then `push`, on a background thread polled from tick(). Ahead/behind parse
   from the porcelain `## branch...upstream [ahead N, behind M]` header.

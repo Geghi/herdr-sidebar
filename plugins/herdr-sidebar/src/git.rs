@@ -494,41 +494,221 @@ impl Git {
         run_in(&self.root, args)
     }
 
-    /// The default branch this one left, and the merge-base with it: the
-    /// `vs base` diff is `git diff <merge-base>` (committed + uncommitted).
-    /// Errors read as user-facing flashes ("already on main").
-    pub fn vs_base(&self, branch: &str) -> Result<(String, String), String> {
-        let origin_head = run_in(
-            &self.root,
-            &["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"],
-        )
-        .ok();
-        let base = pick_base(origin_head.as_deref(), |r| {
-            run_in(&self.root, &["rev-parse", "--verify", "-q", r]).is_ok()
+    /// The BRANCH CHANGES section: every file that differs between the
+    /// merge-base with `base` and the working tree (committed + uncommitted
+    /// tracked changes, plus `untracked` from the last status read).
+    pub fn branch_changes(
+        &self,
+        base: &str,
+        untracked: &[FileEntry],
+    ) -> Result<BranchChanges, String> {
+        let mb = run_read_in(&self.root, &["merge-base", base, "HEAD"])?
+            .trim()
+            .to_string();
+        let raw = run_read_in(&self.root, &["diff", "--name-status", "-M", &mb])?;
+        Ok(BranchChanges {
+            base: base.to_string(),
+            merge_base: mb,
+            files: merge_branch_files(parse_name_status(&raw), untracked),
         })
-        .ok_or("no base branch (origin/HEAD, main, master)")?;
-        if on_base(branch, &base) {
-            return Err(format!("already on {base}"));
-        }
-        let mb = run_in(&self.root, &["merge-base", &base, "HEAD"])?;
-        Ok((base, mb.trim().to_string()))
+    }
+
+    /// The branch `branch` should be reviewed against: see [`resolve_base`].
+    pub fn resolve_base(&self, branch: &str, override_base: Option<&str>) -> Option<String> {
+        let read = |args: &[&str]| run_read_in(&self.root, args).unwrap_or_default();
+        let config = |key: String| {
+            let value = read(&["config", "--get", &key]).trim().to_string();
+            (!value.is_empty()).then_some(value)
+        };
+        let tips: Vec<(String, String)> = read(&[
+            "for-each-ref",
+            "--format=%(refname:short)%00%(objectname)",
+            "refs/heads",
+        ])
+        .lines()
+        .filter_map(|l| l.split_once('\0'))
+        .map(|(n, s)| (n.to_string(), s.to_string()))
+        .collect();
+        let branch_reflog = read(&[
+            "reflog",
+            "show",
+            "--format=%H%x00%gs",
+            &format!("refs/heads/{branch}"),
+            "--",
+        ]);
+        let head_reflog = read(&["reflog", "show", "--format=%gs", "HEAD", "--"]);
+        let vscode = config(format!("branch.{branch}.vscode-merge-base"));
+        let merge = config(format!("branch.{branch}.merge"));
+        let remote = config(format!("branch.{branch}.remote"));
+        let origin_head = read(&["symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD"]);
+        let origin_head = Some(origin_head.trim()).filter(|h| !h.is_empty());
+        let hints = BaseHints {
+            override_base,
+            branch_reflog: &branch_reflog,
+            head_reflog: &head_reflog,
+            vscode_merge_base: vscode.as_deref(),
+            merge: merge.as_deref(),
+            remote: remote.as_deref(),
+            origin_head,
+        };
+        let exists = |r: &str| {
+            run_read_in(
+                &self.root,
+                &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")],
+            )
+            .is_ok()
+        };
+        // Commits HEAD has that `l` lacks; `None` when `l` strictly contains
+        // HEAD (a branch started FROM this one is not its base).
+        let distance = |l: &str| {
+            let out = read(&[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("{l}...HEAD"),
+            ]);
+            let (theirs, ours) = out.trim().split_once('\t')?;
+            let (theirs, ours) = (theirs.parse::<usize>().ok()?, ours.parse::<usize>().ok()?);
+            (ours > 0 || theirs == 0).then_some(ours)
+        };
+        resolve_base(branch, &hints, &tips, exists, distance)
     }
 }
 
-/// The repo's default branch: origin/HEAD's target, else the first existing
-/// of origin/main, origin/master, main, master.
-fn pick_base(origin_head: Option<&str>, exists: impl Fn(&str) -> bool) -> Option<String> {
-    let head = origin_head.map(str::trim).filter(|h| !h.is_empty());
-    head.map(str::to_string).or_else(|| {
-        ["origin/main", "origin/master", "main", "master"]
-            .into_iter()
-            .find(|r| exists(r))
-            .map(str::to_string)
-    })
+/// The BRANCH CHANGES section's data for one repo.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchChanges {
+    pub base: String,
+    pub merge_base: String,
+    pub files: Vec<FileEntry>,
+}
+
+/// The tracked diff vs the merge-base, plus untracked files it cannot see,
+/// sorted by path like the Changes list.
+pub fn merge_branch_files(mut files: Vec<FileEntry>, untracked: &[FileEntry]) -> Vec<FileEntry> {
+    for u in untracked.iter().filter(|e| e.letter == 'U') {
+        if !files.iter().any(|f| f.path == u.path) {
+            files.push(u.clone());
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
+/// Everything [`resolve_base`] reads from git, gathered up front so the
+/// resolution order is pure and unit-testable.
+#[derive(Default)]
+pub struct BaseHints<'a> {
+    /// The user's choice from the base picker (per repo + branch).
+    pub override_base: Option<&'a str>,
+    /// `%H\0%gs` lines of the branch's reflog, newest first.
+    pub branch_reflog: &'a str,
+    /// `%gs` lines of HEAD's reflog, newest first.
+    pub head_reflog: &'a str,
+    pub vscode_merge_base: Option<&'a str>,
+    /// `branch.<b>.merge` / `branch.<b>.remote`.
+    pub merge: Option<&'a str>,
+    pub remote: Option<&'a str>,
+    /// The remote default branch (`origin/main`).
+    pub origin_head: Option<&'a str>,
+}
+
+/// The base branch to review `branch` against, first hit wins:
+/// (a) the persisted override; (b) the reflog's `branch: Created from <ref>`
+/// (a `HEAD` start resolves through HEAD's `checkout: moving from X to
+/// <branch>`, a bare sha through a local branch pointing at it); (c) the
+/// configured merge target (`vscode-merge-base`, then upstream when it is
+/// not the branch itself); (d) the nearest local branch by commits since the
+/// merge-base; (e) the default branch (origin/HEAD, main, master).
+/// `remote/x` refs resolve to a local `x` when one exists. `tips` are the
+/// local branches `(name, sha)`.
+pub fn resolve_base(
+    branch: &str,
+    hints: &BaseHints,
+    tips: &[(String, String)],
+    exists: impl Fn(&str) -> bool,
+    distance: impl Fn(&str) -> Option<usize>,
+) -> Option<String> {
+    let local = |name: &str| tips.iter().any(|(n, _)| n == name);
+    let normalize = |raw: &str| -> Option<String> {
+        let r = raw.trim();
+        let r = r.strip_prefix("refs/heads/").unwrap_or(r);
+        let r = r.strip_prefix("refs/remotes/").unwrap_or(r);
+        let name = if r.is_empty() || r == "HEAD" {
+            return None;
+        } else if r.len() >= 7 && r.chars().all(|c| c.is_ascii_hexdigit()) {
+            // A bare sha: only a local branch pointing there names it.
+            tips.iter()
+                .find(|(n, s)| s.starts_with(r) && n != branch)?
+                .0
+                .clone()
+        } else if local(r) {
+            r.to_string()
+        } else if let Some((_, rest)) = r.split_once('/').filter(|(_, rest)| local(rest)) {
+            rest.to_string()
+        } else if exists(r) {
+            r.to_string()
+        } else {
+            return None;
+        };
+        (name != branch).then_some(name)
+    };
+
+    if let Some(base) = hints.override_base.and_then(normalize) {
+        return Some(base);
+    }
+    // The reflog is newest-first: the creation entry is the oldest.
+    if let Some((sha, from)) = hints.branch_reflog.lines().rev().find_map(|l| {
+        let (sha, gs) = l.split_once('\0')?;
+        Some((sha, gs.strip_prefix("branch: Created from ")?))
+    }) {
+        let found = normalize(from).or_else(|| {
+            let moved = format!(" to {branch}");
+            hints
+                .head_reflog
+                .lines()
+                .rev()
+                .filter_map(|l| {
+                    l.strip_prefix("checkout: moving from ")?
+                        .strip_suffix(&moved)
+                })
+                .find_map(normalize)
+        });
+        if let Some(base) = found.or_else(|| normalize(sha)) {
+            return Some(base);
+        }
+    }
+    if let Some(base) = hints.vscode_merge_base.and_then(normalize) {
+        return Some(base);
+    }
+    if let Some(name) = hints.merge.map(|m| m.trim_start_matches("refs/heads/")) {
+        let target = match hints.remote {
+            Some(".") | None => name.to_string(),
+            Some(remote) => format!("{remote}/{name}"),
+        };
+        if let Some(base) = normalize(&target) {
+            return Some(base);
+        }
+    }
+    // ponytail: one rev-list per local branch, capped; fine for normal repos.
+    if let Some((name, _)) = tips
+        .iter()
+        .filter(|(n, _)| n != branch)
+        .take(64)
+        .filter_map(|(n, _)| Some((n, distance(n)?)))
+        .min_by_key(|(_, d)| *d)
+    {
+        return Some(name.clone());
+    }
+    hints
+        .origin_head
+        .into_iter()
+        .chain(["main", "master"])
+        .find_map(normalize)
 }
 
 /// True when the checked-out branch IS the base (`main` vs `origin/main`).
-fn on_base(branch: &str, base: &str) -> bool {
+pub fn on_base(branch: &str, base: &str) -> bool {
     branch == base || base.split_once('/').is_some_and(|(_, b)| b == branch)
 }
 
@@ -1128,28 +1308,114 @@ fn child_dirs(dir: &Path, depth: usize) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn base_resolution_order() {
-        use super::{on_base, pick_base};
-        assert_eq!(
-            pick_base(Some("origin/dev\n"), |_| true).as_deref(),
-            Some("origin/dev")
-        );
-        assert_eq!(
-            pick_base(None, |r| r == "master" || r == "main").as_deref(),
-            Some("main")
-        );
-        assert_eq!(
-            pick_base(Some(""), |r| r == "origin/master").as_deref(),
-            Some("origin/master")
-        );
-        assert_eq!(pick_base(None, |_| false), None);
-        assert!(on_base("main", "origin/main"));
-        assert!(on_base("main", "main"));
-        assert!(!on_base("feat/x", "origin/main"));
+    use super::*;
+
+    fn tips(names: &[(&str, &str)]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|(n, s)| (n.to_string(), s.to_string()))
+            .collect()
     }
 
-    use super::*;
+    #[test]
+    fn base_resolution_order() {
+        let t = tips(&[
+            ("dev", "aaaaaaa1"),
+            ("feat", "bbbbbbb2"),
+            ("main", "ccccccc3"),
+        ]);
+        let none = |_: &str| None;
+        let resolve = |h: &BaseHints| resolve_base("feat", h, &t, |_| false, none);
+        // (a) the override wins over everything.
+        let reflog = "bbbbbbb2\0commit: x\naaaaaaa1\0branch: Created from dev\n";
+        let h = BaseHints {
+            override_base: Some("main"),
+            branch_reflog: reflog,
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("main"));
+        // (b) the reflog's creation entry, origin/ prefixes made local.
+        let h = BaseHints {
+            branch_reflog: reflog,
+            merge: Some("refs/heads/main"),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("dev"));
+        let h = BaseHints {
+            branch_reflog: "aaaaaaa1\0branch: Created from refs/remotes/origin/dev",
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("dev"));
+        // Created from HEAD → HEAD's reflog says where we came from.
+        let h = BaseHints {
+            branch_reflog: "aaaaaaa1\0branch: Created from HEAD",
+            head_reflog: "checkout: moving from feat to main\ncheckout: moving from dev to feat\n",
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("dev"));
+        // ... or, failing that, a branch pointing at the start sha.
+        let h = BaseHints {
+            branch_reflog: "ccccccc3\0branch: Created from HEAD",
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("main"));
+        // (c) the merge target, unless it is the branch itself.
+        let h = BaseHints {
+            merge: Some("refs/heads/main"),
+            remote: Some("origin"),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("main"));
+        let h = BaseHints {
+            vscode_merge_base: Some("origin/dev"),
+            merge: Some("refs/heads/main"),
+            ..Default::default()
+        };
+        assert_eq!(resolve(&h).as_deref(), Some("dev"));
+        let h = BaseHints {
+            merge: Some("refs/heads/feat"),
+            remote: Some("origin"),
+            origin_head: Some("origin/main"),
+            ..Default::default()
+        };
+        // (e) default branch once (c) points at itself and (d) finds nothing.
+        assert_eq!(resolve(&h).as_deref(), Some("main"));
+        // (d) nearest ancestor among the other local branches.
+        let near = |l: &str| match l {
+            "dev" => Some(2),
+            "main" => Some(5),
+            _ => None,
+        };
+        assert_eq!(
+            resolve_base("feat", &h, &t, |_| false, near).as_deref(),
+            Some("dev")
+        );
+        // Nothing at all.
+        assert_eq!(
+            resolve_base("feat", &BaseHints::default(), &[], |_| false, none),
+            None
+        );
+        assert!(on_base("main", "origin/main"));
+        assert!(!on_base("feat/x", "main"));
+    }
+
+    #[test]
+    fn branch_files_merge_tracked_diff_with_untracked() {
+        let diff = parse_name_status("M\tsrc/a.rs\nR087\told.rs\tnew.rs\nD\tgone.md\n");
+        let untracked = [entry("b.txt", 'U', None), entry("src/a.rs", 'U', None)];
+        let files = merge_branch_files(diff, &untracked);
+        let shape: Vec<(&str, char)> = files.iter().map(|f| (f.path.as_str(), f.letter)).collect();
+        assert_eq!(
+            shape,
+            [
+                ("b.txt", 'U'),
+                ("gone.md", 'D'),
+                ("new.rs", 'R'),
+                ("src/a.rs", 'M')
+            ]
+        );
+        assert_eq!(files[2].orig.as_deref(), Some("old.rs"));
+    }
 
     fn entry(path: &str, letter: char, orig: Option<&str>) -> FileEntry {
         FileEntry {
@@ -1267,6 +1533,55 @@ mod tests {
                 .unwrap();
         }
         Git { root }
+    }
+
+    #[test]
+    fn branch_changes_compare_against_the_branch_it_was_created_from() {
+        let git = repo_with_head("branch-base");
+        let main = git.status().unwrap().branch;
+        run_in(&git.root, &["switch", "-q", "-c", "dev"]).unwrap();
+        std::fs::write(git.root.join("dev.txt"), "d").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "dev",
+            ],
+        )
+        .unwrap();
+        run_in(&git.root, &["switch", "-q", "-c", "feat"]).unwrap();
+        std::fs::write(git.root.join("feat.txt"), "f").unwrap();
+        run_in(&git.root, &["add", "-A"]).unwrap();
+        run_in(
+            &git.root,
+            &[
+                "-c",
+                "user.email=t@t.dev",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "feat",
+            ],
+        )
+        .unwrap();
+        std::fs::write(git.root.join("new.txt"), "n").unwrap();
+        assert_eq!(git.resolve_base("feat", None).as_deref(), Some("dev"));
+        assert_eq!(
+            git.resolve_base("feat", Some(&main)).as_deref(),
+            Some(main.as_str())
+        );
+        let untracked = git.status().unwrap().unstaged;
+        let changes = git.branch_changes("dev", &untracked).unwrap();
+        let paths: Vec<&str> = changes.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["feat.txt", "new.txt"]);
+        let _ = std::fs::remove_dir_all(&git.root);
     }
 
     #[test]

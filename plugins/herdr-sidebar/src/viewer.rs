@@ -231,7 +231,8 @@ pub fn file_request_at(path: &Path, line: usize) -> String {
     format!("file\t{}\t{line}", path.display())
 }
 
-/// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
+/// Control-file payload for a git diff (`kind`: staged | worktree | untracked |
+/// `base:<merge-base>:<base>`).
 pub fn diff_request(root: &Path, rel: &str, kind: &str) -> String {
     format!("diff\t{}\t{rel}\t{kind}", root.display())
 }
@@ -1559,9 +1560,6 @@ fn is_git_diff(request: &Request) -> bool {
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
-    if let Some(spec) = kind.strip_prefix("base:") {
-        return load_base_diff(root, rel, spec);
-    }
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
     // A file inside a PULL REQUEST: `gh pr diff` prints the whole patch, and
     // the slice for this file renders through the same renderer as any other
@@ -1592,7 +1590,13 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     // Plain (uncolored) diff: crate::diffview parses it and renders the
     // VS Code look — dual gutters, tinted rows, syntax-highlighted code.
     let mut args: Vec<String> = vec!["diff".into(), "--no-ext-diff".into(), context_arg().into()];
+    // BRANCH CHANGES: `base:<merge-base>:<base>` diffs the merge-base
+    // against the working tree.
+    let base = kind
+        .strip_prefix("base:")
+        .map(|spec| spec.split_once(':').unwrap_or((spec, spec)));
     match kind {
+        _ if base.is_some() => args.extend(base.map(|(mb, _)| mb.to_string())),
         "staged" => args.push("--cached".into()),
         // An untracked file has no diff; --no-index against the null device
         // renders it as one big addition, like VS Code does.
@@ -1631,47 +1635,17 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         }
     };
     let what = match kind {
+        _ if base.is_some() => base.map_or("", |(_, b)| b),
         "staged" => "staged",
         "untracked" => "untracked",
         _ => "working tree",
     };
     Doc {
         name: name.clone(),
-        context: format!("{} — {what} diff", root.join(rel).display()),
-        lines,
-        numbered: false,
-        media: None,
-        scroll: 0,
-        wrap: false,
-        rows: Vec::new(),
-        rows_key: None,
-        pending_src: None,
-        pr_target: None,
-        selection: PreviewSelection::default(),
-    }
-}
-
-/// `vs base`: everything the branch changed since it left its base, as one
-/// multi-file diff of the merge-base against the working tree. `spec` is
-/// `<merge-base>:<base name>`; untracked files are excluded, like git diff.
-fn load_base_diff(root: &Path, rel: &str, spec: &str) -> Doc {
-    let (mb, base) = spec.split_once(':').unwrap_or((spec, spec));
-    let out = std::process::Command::new("git")
-        .args(["diff", "--no-ext-diff", context_arg(), mb])
-        .current_dir(root)
-        .output();
-    let lines = match out {
-        Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
-        Ok(out) if !out.status.success() => vec![Line::raw(format!(
-            "({})",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))],
-        Ok(out) if out.stdout.is_empty() => vec![Line::raw(format!("(no changes vs {base})"))],
-        Ok(out) => crate::diffview::render_files(&String::from_utf8_lossy(&out.stdout)),
-    };
-    Doc {
-        name: rel.to_string(),
-        context: format!("{} — changes since {base}", root.display()),
+        context: match base {
+            Some(_) => format!("{} — changes since {what}", root.join(rel).display()),
+            None => format!("{} — {what} diff", root.join(rel).display()),
+        },
         lines,
         numbered: false,
         media: None,

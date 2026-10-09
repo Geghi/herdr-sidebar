@@ -255,44 +255,9 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Render a multi-file `git diff`: each file under its own path header,
-/// highlighted by its own extension.
-pub fn render_files(diff: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for chunk in diff.split("\ndiff --git ").filter(|c| !c.trim().is_empty()) {
-        let chunk = chunk.strip_prefix("diff --git ").unwrap_or(chunk);
-        // `a/x b/x` header: the new-side path names the file.
-        let rel = chunk
-            .lines()
-            .next()
-            .and_then(|h| h.rsplit_once(" b/"))
-            .map_or("", |(_, b)| b)
-            .to_string();
-        if !lines.is_empty() {
-            lines.push(Line::raw(""));
-        }
-        lines.push(Line::from(Span::styled(
-            format!("▍ {rel}"),
-            Style::default().bold(),
-        )));
-        lines.extend(render(&rel, &format!("diff --git {chunk}\n")));
-    }
-    lines
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn multi_file_diff_gets_one_header_per_file() {
-        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-x\n+y\n\
-                    diff --git a/b.md b/b.md\n--- a/b.md\n+++ b/b.md\n@@ -1 +1 @@\n-p\n+q\n";
-        let text: Vec<String> = render_files(diff).iter().map(|l| l.to_string()).collect();
-        assert!(text[0].contains("a.rs"));
-        assert!(text.iter().any(|l| l.contains("▍ b.md")));
-        assert_eq!(text.iter().filter(|l| l.starts_with("▍")).count(), 2);
-    }
 
     // NOTE: no `\` line continuations — they would eat the leading space
     // that marks context lines.

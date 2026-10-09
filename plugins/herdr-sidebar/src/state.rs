@@ -832,6 +832,59 @@ pub fn save_scm_state(cwd: &Path, state: &ScmState) -> bool {
         .is_some_and(|json| std::fs::write(path, json).is_ok())
 }
 
+/// scm.json's top-level key for BRANCH CHANGES base choices:
+/// `{"base_overrides": {"<repo root>": {"<branch>": "<base>"}}}`. Not a path,
+/// so it never collides with the cwd-keyed view entries.
+const BASE_OVERRIDES: &str = "base_overrides";
+
+/// The base the user picked for `branch` in the repo at `root`, if any.
+pub fn base_override(root: &Path, branch: &str) -> Option<String> {
+    let json = scm_path().and_then(|p| std::fs::read_to_string(p).ok())?;
+    decode_scm_file(&json)
+        .get(BASE_OVERRIDES)?
+        .get(scm_path_key(root))?
+        .get(branch)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Remember `base` for `branch` in the repo at `root`, leaving the rest of
+/// scm.json alone.
+pub fn set_base_override(root: &Path, branch: &str, base: &str) -> bool {
+    let Some(path) = scm_path() else { return false };
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return false;
+    }
+    let Some(_lock) = StateWriteLock::acquire(&path) else {
+        return false;
+    };
+    let mut file = std::fs::read_to_string(&path)
+        .map(|json| decode_scm_file(&json))
+        .unwrap_or_default();
+    let overrides = file
+        .entry(BASE_OVERRIDES)
+        .or_insert_with(|| serde_json::json!({}));
+    if !overrides.is_object() {
+        *overrides = serde_json::json!({});
+    }
+    let repo = overrides
+        .as_object_mut()
+        .expect("object")
+        .entry(scm_path_key(root))
+        .or_insert_with(|| serde_json::json!({}));
+    if !repo.is_object() {
+        *repo = serde_json::json!({});
+    }
+    repo.as_object_mut()
+        .expect("object")
+        .insert(branch.to_string(), serde_json::json!(base));
+    serde_json::to_string(&file)
+        .ok()
+        .is_some_and(|json| std::fs::write(path, json).is_ok())
+}
+
 fn merge_scm_drafts(stored: &mut std::collections::BTreeMap<String, String>, state: &ScmState) {
     for root in &state.cleared_drafts {
         stored.remove(root);

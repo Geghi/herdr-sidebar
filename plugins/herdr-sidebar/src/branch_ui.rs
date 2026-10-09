@@ -33,6 +33,9 @@ pub enum PickerAction {
 
 pub struct BranchPicker {
     pub git: Git,
+    /// "Compare with" mode: the branch whose base is being picked. The
+    /// choice then sets that base instead of checking anything out.
+    pub compare_for: Option<String>,
     branches: Vec<Branch>,
     selected: usize,
     scroll: usize,
@@ -51,11 +54,20 @@ impl BranchPicker {
             .unwrap_or(0);
         Ok(Self {
             git,
+            compare_for: None,
             branches,
             selected,
             scroll: 0,
             rect: Rect::default(),
         })
+    }
+
+    /// Switch to "compare with" mode for `branch`, preselecting `base`.
+    pub fn compare(&mut self, branch: String, base: Option<&str>) {
+        self.compare_for = Some(branch);
+        if let Some(i) = base.and_then(|b| self.branches.iter().position(|br| br.name == b)) {
+            self.selected = i;
+        }
     }
 
     pub fn key(&mut self, key: KeyEvent) -> PickerAction {
@@ -179,7 +191,11 @@ impl BranchPicker {
         frame.render_widget(
             List::new(items).block(
                 Block::bordered()
-                    .title(" Switch Branch ")
+                    .title(if self.compare_for.is_some() {
+                        " Compare With Branch "
+                    } else {
+                        " Switch Branch "
+                    })
                     .border_style(Style::default().fg(palette().accent)),
             ),
             popup,
