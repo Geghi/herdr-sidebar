@@ -376,6 +376,9 @@ enum Row {
     /// A changed file of the GRAPH commit expanded inline (index into
     /// [`App::commit_files`]).
     CommitFile(usize),
+    /// A folder of the expanded commit's file tree (index into
+    /// [`App::tree_nodes`]).
+    CommitFolder(usize),
 }
 
 /// One folder row of the tree view (VS Code's "View as Tree"), rebuilt with
@@ -407,7 +410,10 @@ impl Row {
             | Row::BranchHeader(r)
             | Row::BranchFile(r, _)
             | Row::BranchFolder(r, _) => Some(r),
-            Row::DrawerHeader(_) | Row::DrawerLine(..) | Row::CommitFile(_) => None,
+            Row::DrawerHeader(_)
+            | Row::DrawerLine(..)
+            | Row::CommitFile(_)
+            | Row::CommitFolder(_) => None,
         }
     }
 
@@ -764,6 +770,8 @@ pub struct App {
     expanded_commit: Option<String>,
     /// The expanded commit's changed files, loaded when it expands.
     commit_files: Vec<FileEntry>,
+    /// Folded folders of the expanded commit's tree (reset per commit).
+    commit_tree_collapsed: BTreeSet<String>,
     /// One-shot footer notice: (text, is_error). Cleared on the next key press.
     flash: Option<(String, bool)>,
     /// Pending ✧ commit-message generation, polled from tick().
@@ -898,6 +906,7 @@ impl App {
             history_target,
             expanded_commit: None,
             commit_files: Vec::new(),
+            commit_tree_collapsed: BTreeSet::new(),
             flash: None,
             suggesting: None,
             branch_job: None,
@@ -1446,9 +1455,39 @@ impl App {
                     // push the rest of the graph down instead of opening a
                     // second pane.
                     if self.graph_line_expanded(kind, i) {
-                        for f in 0..self.commit_files.len() {
-                            self.rows.push(Row::CommitFile(f));
-                            self.row_depth.push(0);
+                        if tree {
+                            // depth + 1: Left from a top-level row steps out
+                            // to the commit line itself.
+                            for node in
+                                changes_tree_rows(&self.commit_files, &self.commit_tree_collapsed)
+                            {
+                                match node {
+                                    ChangeTreeRow::Folder {
+                                        path,
+                                        label,
+                                        depth,
+                                        expanded,
+                                    } => {
+                                        self.rows.push(Row::CommitFolder(self.tree_nodes.len()));
+                                        self.row_depth.push(depth + 1);
+                                        self.tree_nodes.push(TreeNode {
+                                            path,
+                                            label,
+                                            depth,
+                                            expanded,
+                                        });
+                                    }
+                                    ChangeTreeRow::File { index, depth } => {
+                                        self.rows.push(Row::CommitFile(index));
+                                        self.row_depth.push(depth + 1);
+                                    }
+                                }
+                            }
+                        } else {
+                            for f in 0..self.commit_files.len() {
+                                self.rows.push(Row::CommitFile(f));
+                                self.row_depth.push(1);
+                            }
                         }
                     }
                 }
@@ -1964,6 +2003,10 @@ impl App {
                     } else {
                         self.open_commit_file(f);
                     }
+                }
+                Row::CommitFolder(node) => {
+                    self.focus = Focus::List;
+                    self.toggle_commit_folder(node);
                 }
             }
         }
@@ -2617,6 +2660,23 @@ impl App {
         }
     }
 
+    /// Fold/unfold a folder of the expanded commit's tree.
+    fn toggle_commit_folder(&mut self, node: usize) {
+        let Some(path) = self.tree_nodes.get(node).map(|n| n.path.clone()) else {
+            return;
+        };
+        if !self.commit_tree_collapsed.remove(&path) {
+            self.commit_tree_collapsed.insert(path.clone());
+        }
+        self.rebuild();
+        let found = self.rows.iter().position(|row| {
+            matches!(row, Row::CommitFolder(n) if self.tree_nodes.get(*n).is_some_and(|t| t.path == path))
+        });
+        if let Some(index) = found {
+            self.select(index);
+        }
+    }
+
     /// The nearest row above `index` with a shallower depth — a file's (or a
     /// collapsed folder's) parent row.
     fn parent_row(&self, index: usize) -> Option<usize> {
@@ -2666,6 +2726,12 @@ impl App {
             self.toggle_tree_folder(r, node, sect);
             return;
         }
+        if let Some(&Row::CommitFolder(node)) = self.rows.get(index)
+            && self.tree_nodes.get(node).is_some_and(|n| n.expanded)
+        {
+            self.toggle_commit_folder(node);
+            return;
+        }
         if let Some(parent) = self.parent_row(index) {
             self.select(parent);
         }
@@ -2683,6 +2749,10 @@ impl App {
             && self.tree_nodes.get(node).is_some_and(|n| !n.expanded)
         {
             self.toggle_tree_folder(r, node, sect);
+        } else if let Some(&Row::CommitFolder(node)) = self.rows.get(index)
+            && self.tree_nodes.get(node).is_some_and(|n| !n.expanded)
+        {
+            self.toggle_commit_folder(node);
         }
     }
 
@@ -3111,6 +3181,7 @@ impl App {
             Ok(files) => {
                 self.expanded_commit = Some(hash);
                 self.commit_files = files;
+                self.commit_tree_collapsed.clear();
                 self.rebuild();
                 self.snap = true;
             }
@@ -3125,6 +3196,7 @@ impl App {
         }
         self.expanded_commit = None;
         self.commit_files.clear();
+        self.commit_tree_collapsed.clear();
         self.rebuild();
     }
 
@@ -3432,6 +3504,13 @@ impl App {
                 ))
             }),
             Row::BranchFolder(r, node) => self.tree_node_id(*r, *node, "branch-dir"),
+            Row::CommitFolder(node) => self.tree_nodes.get(*node).map(|n| {
+                format!(
+                    "commit-dir:{}:{}",
+                    self.expanded_commit.as_deref().unwrap_or(""),
+                    n.path
+                )
+            }),
             Row::DrawerHeader(kind) => Some(format!("drawer-h:{}", kind.title())),
             Row::CommitFile(f) => self.commit_files.get(*f).map(|entry| {
                 format!(
@@ -3789,6 +3868,7 @@ impl App {
             }
             Row::BranchFile(r, i) => self.open_branch_diff(r, i),
             Row::BranchFolder(r, node) => self.toggle_tree_folder(r, node, Sect::Branch),
+            Row::CommitFolder(node) => self.toggle_commit_folder(node),
         }
         self.persist_scm();
     }
@@ -4564,7 +4644,15 @@ impl App {
                     // An expanded commit's files read like the tree's file rows
                     // one level down, so the panel has a single file anatomy.
                     Row::CommitFile(f) => match self.commit_files.get(f) {
-                        Some(entry) => file_item(entry, width, theme, false, false, None, Some(0)),
+                        Some(entry) => file_item(
+                            entry,
+                            width,
+                            theme,
+                            false,
+                            false,
+                            None,
+                            Some(self.row_depth[row_index] - 1),
+                        ),
                         None => ListItem::new(Line::default()),
                     },
                     Row::Staged(r, i) => {
@@ -4606,9 +4694,9 @@ impl App {
                         )
                     }
                     Row::StagedFolder(_, node) => folder_item(&self.tree_nodes[node], width, theme),
-                    Row::ChangesFolder(_, node) | Row::BranchFolder(_, node) => {
-                        folder_item(&self.tree_nodes[node], width, theme)
-                    }
+                    Row::ChangesFolder(_, node)
+                    | Row::BranchFolder(_, node)
+                    | Row::CommitFolder(node) => folder_item(&self.tree_nodes[node], width, theme),
                     Row::BranchHeader(r) => match &self.repos[r].branch_changes {
                         Some(c) => {
                             let (label, zone) = branch_header_base(&c.base, c.files.len(), width);
@@ -5880,6 +5968,68 @@ mod tests {
             }
             other => panic!("expected the collapsed folder, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn expanded_commit_files_render_as_a_foldable_tree() {
+        let dir = std::env::temp_dir().join(format!("hs-commit-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let follower = std::rc::Rc::new(std::cell::RefCell::new(
+            herdr_sidebar::launch::CwdFollower::default(),
+        ));
+        let mut app = App::new(dir.clone(), follower);
+        let graph = &mut app.drawers[Drawer::Graph.index()];
+        graph.expanded = true;
+        graph.lines = vec!["abc1234 subject".into()];
+        graph.refs = vec![DrawerRef::Commit("abc1234".into())];
+        app.expanded_commit = Some("abc1234".into());
+        app.commit_files = vec![change("src/a.rs"), change("src/b.rs"), change("README.md")];
+        app.sidebar_state.scm_tree = true;
+        app.rebuild();
+        let shape = |app: &App| -> Vec<(String, usize)> {
+            app.rows
+                .iter()
+                .zip(&app.row_depth)
+                .filter_map(|(row, depth)| match row {
+                    Row::CommitFolder(n) => Some((app.tree_nodes[*n].label.clone(), *depth)),
+                    Row::CommitFile(f) => Some((app.commit_files[*f].path.clone(), *depth)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape(&app),
+            [
+                ("src".to_string(), 1),
+                ("src/a.rs".to_string(), 2),
+                ("src/b.rs".to_string(), 2),
+                ("README.md".to_string(), 1),
+            ]
+        );
+
+        let folder = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::CommitFolder(_)))
+            .unwrap();
+        let Row::CommitFolder(node) = app.rows[folder] else {
+            unreachable!()
+        };
+        app.toggle_commit_folder(node);
+        assert_eq!(
+            shape(&app),
+            [("src".to_string(), 1), ("README.md".to_string(), 1)]
+        );
+        assert_eq!(
+            app.selected,
+            Some(folder),
+            "the folded folder stays selected"
+        );
+
+        app.sidebar_state.scm_tree = false;
+        app.rebuild();
+        assert_eq!(shape(&app).len(), 3, "flat mode lists every file");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

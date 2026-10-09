@@ -864,7 +864,11 @@ HACKING.md — budget time for that before promising a patched build.
   (`list_left`/`list_right` wrap the tree's fold behaviour). There is NO disclosure chevron on
   graph rows (a leading ▸/▾ column was user-rejected as wasted space): the first lane starts
   at the row's left edge like every other drawer's content, and the inline file rows are the
-  only sign a commit is open. Files come
+  only sign a commit is open. With `scm_tree` on, those files render as the same folder
+  tree as Changes (`Row::CommitFolder` + `changes_tree_rows`, rows at depth+1 so Left from a
+  top-level file steps out to the commit line); folds live in `commit_tree_collapsed`, reset
+  whenever a different commit expands, and folder stable ids are `commit-dir:<hash>:<path>`.
+  Files come
   from `Git::commit_files` — `show --first-parent --name-status` parsed by `parse_name_status`
   (without `--first-parent` a MERGE shows nothing). A file inside a commit is a DIFF, not a
   `git show`: `viewer::load_show` with a path runs a plain
