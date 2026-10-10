@@ -2305,14 +2305,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
                                     KeyCode::Char('z') => {
-                                        // One request off the UI thread: zoom is herdr's own toggle.
                                         if let Ok(id) = std::env::var("HERDR_PANE_ID") {
-                                            std::thread::spawn(move || {
-                                                let _ = crate::ipc::call_text(
-                                                    "pane.zoom",
-                                                    serde_json::json!({ "pane_id": id }),
-                                                );
-                                            });
+                                            viewer_zoom(id);
                                         }
                                     }
                                     KeyCode::Char('w') if doc.media.is_none() => {
@@ -2652,9 +2646,11 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom  {wrap_hint}  q close")
+        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom/back  {wrap_hint}  q close")
     } else {
-        format!(" Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom  {wrap_hint}  q close")
+        format!(
+            " Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom/back  {wrap_hint}  q close"
+        )
     };
     merge.button = Rect::default();
     merge.menu_rect = Rect::default();
@@ -2869,6 +2865,99 @@ fn draw_editor(
 /// control-file switch, not by refusing to route to it (refusing would split
 /// the tab again on every click).
 pub fn open_in_pane(
+    my_pane_id: &str,
+    spawn_cwd: &Path,
+    doc_key: &str,
+    payload: &str,
+) -> Result<PreviewTarget, String> {
+    let target = route_preview(my_pane_id, spawn_cwd, doc_key, payload)?;
+    if REVIEW_ZOOM.get() {
+        review_zoom(&target, my_pane_id);
+    }
+    Ok(target)
+}
+
+thread_local! {
+    static REVIEW_ZOOM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sidebar `z`: run the normal open path (`open`, exactly what Enter does)
+/// and zoom + focus whichever viewer it lands in. The apps' many open sites
+/// stay untouched — the flag rides the thread for the duration of `open`.
+pub fn with_review_zoom(open: impl FnOnce()) {
+    REVIEW_ZOOM.set(true);
+    open();
+    REVIEW_ZOOM.set(false);
+}
+
+/// Stamp the opener on the viewer, then zoom and focus it — off the UI thread
+/// so the sidebar's heartbeat never waits on the socket.
+fn review_zoom(target: &PreviewTarget, origin_pane: &str) {
+    let (viewer, tab, origin) = (
+        target.pane_id.clone(),
+        target.tab_id.clone(),
+        origin_pane.to_string(),
+    );
+    std::thread::spawn(move || {
+        let _ = ipc::call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": viewer,
+                "source": METADATA_SOURCE,
+                "tokens": { TOKEN_ZOOM_ORIGIN: origin },
+            }),
+        );
+        let _ = ipc::call_text(
+            "pane.zoom",
+            serde_json::json!({ "pane_id": viewer, "mode": "on" }),
+        );
+        focus_tab_for_client(&tab, Some(&viewer));
+    });
+}
+
+/// Viewer `z`. Opened by a sidebar `z`: unzoom and hand focus back to that
+/// sidebar pane (across tabs too) so j/k + z reviews the next file. Otherwise
+/// herdr's plain zoom toggle.
+fn viewer_zoom(me: String) {
+    std::thread::spawn(move || {
+        let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+        let Some(origin) = pane_token(&list, &me, TOKEN_ZOOM_ORIGIN) else {
+            let _ = ipc::call_text("pane.zoom", serde_json::json!({ "pane_id": me }));
+            return;
+        };
+        let _ = ipc::call_text(
+            "pane.report_metadata",
+            serde_json::json!({
+                "pane_id": me,
+                "source": METADATA_SOURCE,
+                "tokens": { TOKEN_ZOOM_ORIGIN: null },
+            }),
+        );
+        let _ = ipc::call_text(
+            "pane.zoom",
+            serde_json::json!({ "pane_id": me, "mode": "off" }),
+        );
+        let tab = crate::launch::tab_of(&list, &origin);
+        if !tab.is_empty() {
+            focus_tab_for_client(&tab, Some(&origin));
+        }
+    });
+}
+
+/// A string metadata token of `pane_id` in a `pane.list` response.
+fn pane_token(pane_list_json: &str, pane_id: &str, key: &str) -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(crate::launch::strip_bom(pane_list_json)).ok()?;
+    v["result"]["panes"]
+        .as_array()?
+        .iter()
+        .find(|p| p["pane_id"] == pane_id)?["tokens"][key]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn route_preview(
     my_pane_id: &str,
     spawn_cwd: &Path,
     doc_key: &str,
@@ -3188,6 +3277,8 @@ pub const TOKEN_PINNED: &str = "hs-preview-pinned";
 pub const TOKEN_CONTROL: &str = "hs-preview-control";
 pub const TOKEN_DEDICATED: &str = "hs-preview-dedicated";
 pub const TOKEN_ORIGIN_TAB: &str = "hs-preview-origin-tab";
+/// The sidebar pane whose `z` zoomed this viewer; the viewer's `z` returns there.
+pub const TOKEN_ZOOM_ORIGIN: &str = "hs-preview-zoom-origin";
 /// This viewer shares the sidebar's tab instead of owning one
 /// (`PreviewPlacement::Pane`). Routing needs it on the PANE so flipping the
 /// setting cannot hand a tab-mode click an inline pane, or the reverse.
@@ -3732,6 +3823,23 @@ fn side_neighbor(layout_json: &str, pane_id: &str, on_the_left: bool) -> Option<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pane_token_reads_one_panes_string_token() {
+        let list = r#"{"result":{"panes":[{"pane_id":"p1","tokens":{"hs-preview-zoom-origin":"s9"}},{"pane_id":"p2","tokens":{}}]}}"#;
+        assert_eq!(
+            super::pane_token(list, "p1", super::TOKEN_ZOOM_ORIGIN).as_deref(),
+            Some("s9")
+        );
+        assert_eq!(
+            super::pane_token(list, "p2", super::TOKEN_ZOOM_ORIGIN),
+            None
+        );
+        assert_eq!(
+            super::pane_token(list, "nope", super::TOKEN_ZOOM_ORIGIN),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

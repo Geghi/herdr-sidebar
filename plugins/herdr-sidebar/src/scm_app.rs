@@ -1718,6 +1718,7 @@ impl App {
             KeyCode::Char('S') => self.sync_changes(),
             KeyCode::Char('B') => self.open_base_picker(self.active),
             KeyCode::Char('o') => self.open_selected_in_vscode(),
+            KeyCode::Char('z') => self.review_selected(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Left | KeyCode::Char('h') => self.list_left(),
@@ -3873,6 +3874,33 @@ impl App {
         self.persist_scm();
     }
 
+    /// `z`: open the selected file's diff (Staged/Changes rows open their diff
+    /// as a click does — Enter stages there) zoomed for review.
+    fn review_selected(&mut self) {
+        let Some(&row) = self.selected.and_then(|i| self.rows.get(i)) else {
+            return;
+        };
+        herdr_sidebar::viewer::with_review_zoom(|| match row {
+            Row::Staged(r, i) | Row::Unstaged(r, i) => {
+                let staged = matches!(row, Row::Staged(..));
+                let entry = self.repos.get(r).and_then(|repo| {
+                    if staged {
+                        repo.status.staged.get(i)
+                    } else {
+                        repo.status.unstaged.get(i)
+                    }
+                    .cloned()
+                });
+                if let Some(entry) = entry {
+                    self.open_diff(r, &entry, staged);
+                }
+            }
+            Row::BranchFile(r, i) => self.open_branch_diff(r, i),
+            Row::CommitFile(f) => self.open_commit_file(f),
+            _ => {}
+        });
+    }
+
     fn run_op(
         &mut self,
         op: impl Fn(&Git, &FileEntry) -> Result<(), String>,
@@ -4864,6 +4892,7 @@ impl App {
             ("c", "msg"),
             ("A", "suggest"),
             ("o", "code"),
+            ("z", "review"),
             ("m", "menu"),
             ("b", "hide"),
             ("S", "sync"),

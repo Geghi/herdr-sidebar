@@ -1090,6 +1090,11 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate(),
             KeyCode::Char('m') => self.open_menu(),
+            KeyCode::Char('z') => {
+                if let Some(&Row::File(index)) = self.selected.and_then(|i| self.rows.get(i)) {
+                    herdr_sidebar::viewer::with_review_zoom(|| self.open_file_diff(index));
+                }
+            }
             KeyCode::Char('t') => self.toggle_tree_view(),
             KeyCode::Right | KeyCode::Char('l') => self.expand(),
             KeyCode::Left | KeyCode::Char('h') => self.collapse(),
@@ -1490,6 +1495,7 @@ impl App {
                 ("l", "files"),
                 ("t", "tree"),
                 ("m", "menu"),
+                ("z", "review"),
                 ("r", "refresh"),
             ],
             width,

@@ -1285,6 +1285,7 @@ impl App {
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('f') => self.open_filter(),
             KeyCode::Char('o') => self.open_selected_external(),
+            KeyCode::Char('z') => self.review_selected(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
@@ -3347,6 +3348,18 @@ impl App {
         }
     }
 
+    /// `z`: open the selected FILE like Enter, zoomed for review.
+    fn review_selected(&mut self) {
+        let Some(path) = self
+            .selected_row()
+            .filter(|r| !r.is_dir)
+            .map(|r| r.path.clone())
+        else {
+            return;
+        };
+        herdr_sidebar::viewer::with_review_zoom(|| self.open_preview(&path));
+    }
+
     fn toggle(&mut self) {
         let Some(row) = self.selected_row() else {
             return;
@@ -3875,6 +3888,7 @@ impl App {
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),
+            ("z", "review"),
             ("s", "settings"),
             ("b", "hide"),
             ("q", "quit"),
