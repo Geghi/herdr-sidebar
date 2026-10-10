@@ -1135,6 +1135,9 @@ setting are all gone.
   (`two_face::syntax::extra_newlines()`), themes still from syntect's `ThemeSet` (theme
   data is grammar-independent). Foreground colors only: the terminal owns the background.
   See `src/syntax.rs`; unknown extensions fall back to plain lines.
+- Grammar lookup is ONE fn, `syntax::find_syntax` (preview, diff `LineHighlighter`, editor
+  `Incremental`). Neither grammar set maps `.mjs`/`.cjs`/`.mts`/`.cts`, so it aliases them to
+  `js`/`ts` first — add new aliases there, never per call site.
 
 ### Experimental in-pane editor (issue #22)
 

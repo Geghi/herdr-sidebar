@@ -50,19 +50,29 @@ fn syntaxes_and_theme() -> (&'static SyntaxSet, &'static Theme) {
     (syntaxes, if crate::ui::is_light() { light } else { dark })
 }
 
+/// Grammar for a file called `name`: by extension (module aliases like
+/// `.mjs`/`.mts` mapped to their base language), then by whole name
+/// (`Dockerfile`, `Makefile`).
+fn find_syntax<'a>(syntaxes: &'a SyntaxSet, name: &str) -> Option<&'a SyntaxReference> {
+    let ext = match name.rsplit('.').next().unwrap_or("") {
+        "mjs" | "cjs" => "js",
+        "mts" | "cts" => "ts",
+        e => e,
+    };
+    syntaxes
+        .find_syntax_by_extension(ext)
+        .or_else(|| syntaxes.find_syntax_by_extension(name))
+}
+
 /// Highlight `text` for a file called `name`, up to `max` lines. `None` when
 /// no grammar matches (caller falls back to plain lines).
 pub fn highlight(name: &str, text: &str, max: usize) -> Option<Vec<Line<'static>>> {
     let (syntaxes, theme) = syntaxes_and_theme();
-    let ext = name.rsplit('.').next().unwrap_or("");
-    let syntax = syntaxes
-        .find_syntax_by_extension(ext)
-        .or_else(|| syntaxes.find_syntax_by_extension(name))
-        .or_else(|| {
-            text.lines()
-                .next()
-                .and_then(|l| syntaxes.find_syntax_by_first_line(l))
-        })?;
+    let syntax = find_syntax(syntaxes, name).or_else(|| {
+        text.lines()
+            .next()
+            .and_then(|l| syntaxes.find_syntax_by_first_line(l))
+    })?;
 
     let mut highlighter = HighlightLines::new(syntax, theme);
     let mut lines = Vec::new();
@@ -107,10 +117,7 @@ pub struct LineHighlighter {
 impl LineHighlighter {
     pub fn new(name: &str) -> Self {
         let (syntaxes, theme) = syntaxes_and_theme();
-        let ext = name.rsplit('.').next().unwrap_or("");
-        let syntax = syntaxes
-            .find_syntax_by_extension(ext)
-            .or_else(|| syntaxes.find_syntax_by_extension(name));
+        let syntax = find_syntax(syntaxes, name);
         Self {
             inner: syntax.map(|s| HighlightLines::new(s, theme)),
         }
@@ -179,10 +186,7 @@ pub struct Incremental {
 impl Incremental {
     pub fn new(name: &str) -> Self {
         let (syntaxes, _) = syntaxes_and_theme();
-        let ext = name.rsplit('.').next().unwrap_or("");
-        let syntax = syntaxes
-            .find_syntax_by_extension(ext)
-            .or_else(|| syntaxes.find_syntax_by_extension(name));
+        let syntax = find_syntax(syntaxes, name);
         Self {
             syntax,
             light: crate::ui::is_light(),
@@ -276,6 +280,9 @@ mod tests {
             .any(|s| s.content.contains("fn") && s.style.fg.is_some());
         assert!(colored, "expected a colored keyword span");
         assert_eq!(lines[0].to_string(), "fn main() {}");
+        for name in ["a.mjs", "a.cjs", "a.mts", "a.cts"] {
+            assert!(highlight(name, "const x = 1;\n", 10).is_some(), "{name}");
+        }
     }
 
     #[test]
