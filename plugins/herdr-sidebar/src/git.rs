@@ -513,6 +513,32 @@ impl Git {
         })
     }
 
+    /// `base`, or its upstream when the local branch is behind it
+    /// (see [`prefer_upstream`]). Non-local refs pass through.
+    pub fn upstream_if_behind(&self, base: &str) -> String {
+        let up = run_read_in(
+            &self.root,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "-q",
+                &format!("refs/heads/{base}@{{upstream}}"),
+            ],
+        )
+        .map(|o| o.trim().to_string())
+        .ok();
+        let behind = up.as_deref().map_or(0, |up| {
+            run_read_in(
+                &self.root,
+                &["rev-list", "--count", &format!("{base}..{up}")],
+            )
+            .ok()
+            .and_then(|o| o.trim().parse().ok())
+            .unwrap_or(0)
+        });
+        prefer_upstream(base, up.as_deref(), behind)
+    }
+
     /// The branch `branch` should be reviewed against: see [`resolve_base`].
     pub fn resolve_base(&self, branch: &str, override_base: Option<&str>) -> Option<String> {
         let read = |args: &[&str]| run_read_in(&self.root, args).unwrap_or_default();
@@ -708,6 +734,15 @@ pub fn resolve_base(
 }
 
 /// True when the checked-out branch IS the base (`main` vs `origin/main`).
+/// A local base that is BEHIND its upstream would list commits already merged
+/// upstream: review against the upstream ref instead (`main` → `origin/main`).
+pub fn prefer_upstream(base: &str, upstream: Option<&str>, behind: usize) -> String {
+    match upstream {
+        Some(up) if behind > 0 && !up.is_empty() => up.to_string(),
+        _ => base.to_string(),
+    }
+}
+
 pub fn on_base(branch: &str, base: &str) -> bool {
     branch == base || base.split_once('/').is_some_and(|(_, b)| b == branch)
 }
@@ -1315,6 +1350,16 @@ mod tests {
             .iter()
             .map(|(n, s)| (n.to_string(), s.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn prefer_upstream_when_behind() {
+        assert_eq!(
+            prefer_upstream("main", Some("origin/main"), 2),
+            "origin/main"
+        );
+        assert_eq!(prefer_upstream("main", Some("origin/main"), 0), "main");
+        assert_eq!(prefer_upstream("main", None, 3), "main");
     }
 
     #[test]

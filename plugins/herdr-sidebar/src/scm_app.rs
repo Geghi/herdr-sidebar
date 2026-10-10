@@ -5748,7 +5748,8 @@ fn branch_result(
     let base = match (sidebar::base_override(git.root(), &branch), cache) {
         (Some(base), _) => base,
         (None, Some((cached, base))) if cached == branch => base,
-        (None, _) => git.resolve_base(&branch, None)?,
+        // A behind local base would list commits already merged upstream.
+        (None, _) => git.upstream_if_behind(&git.resolve_base(&branch, None)?),
     };
     let changes = (!on_base(&branch, &base))
         .then(|| git.branch_changes(&base, untracked).ok())

@@ -2887,6 +2887,20 @@ pub fn open_in_pane(
     let target = route_preview(my_pane_id, spawn_cwd, doc_key, payload)?;
     if REVIEW_ZOOM.get() {
         review_zoom(&target, my_pane_id);
+    } else {
+        // A normal open of a reused sidebar-z viewer: viewer `z` must zoom
+        // again, not close (report_metadata merges, so null clears).
+        let viewer = target.pane_id.clone();
+        std::thread::spawn(move || {
+            let _ = ipc::call_text(
+                "pane.report_metadata",
+                serde_json::json!({
+                    "pane_id": viewer,
+                    "source": METADATA_SOURCE,
+                    "tokens": { TOKEN_ZOOM_ORIGIN: null },
+                }),
+            );
+        });
     }
     Ok(target)
 }

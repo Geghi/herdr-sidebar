@@ -901,7 +901,10 @@ HACKING.md — budget time for that before promising a patched build.
   from X to <branch>`, a sha via a local branch pointing there; `remote/x` → local `x`) →
   `branch.<b>.vscode-merge-base` → upstream (`branch.<b>.merge`, unless it is the branch itself)
   → nearest local branch by `rev-list --left-right --count` (strict descendants excluded) →
-  origin/HEAD, main, master. Computed on a worker every ≥3s (`start_branch_job`, polled in
+  origin/HEAD, main, master. A RESOLVED (non-override) local base that is behind its upstream
+  is swapped for the upstream ref (`main` → `origin/main`, label shows it) by
+  `Git::upstream_if_behind` (pure decision: `prefer_upstream`), else Branch Changes lists
+  commits already merged upstream. The cache then keeps the remote name. Computed on a worker every ≥3s (`start_branch_job`, polled in
   tick even when unfocused); the resolved base is cached per (repo, branch) so the reflog scan
   /nearest walk run once. `B` or a click on the base label opens `BranchPicker` in
   `compare_for` mode; the choice writes `base_overrides` (never touches other scm.json keys).
@@ -1183,7 +1186,8 @@ setting are all gone.
   `focus_tab_for_client`. Viewer `z` reads that token from one `pane.list`: present → CLOSE the
   preview via the q/Esc path (`close_own_pane_to`, same inline/dedicated-tab rules) after focusing
   the origin sidebar FIRST (closing our tab can kill the viewer before later IPC); absent → plain
-  zoom toggle on a thread. `z` only reaches the read-only keymap, so no dirty buffer can be lost. SCM Enter on Staged/Changes STAGES, so `z` calls
+  zoom toggle on a thread. A NON-review `open_in_pane` null-clears that token, or a reused
+  sidebar-z viewer later opened with plain Enter would close on `z` instead of zooming. `z` only reaches the read-only keymap, so no dirty buffer can be lost. SCM Enter on Staged/Changes STAGES, so `z` calls
   `open_diff` directly there. Verified live: tokens null-clear, zoom on/off by id, focus by id.
   Test gotcha: `tab.create` without a workspace lands in the SERVER-focused workspace and
   `pane.split` takes no `pane_id` param — a throwaway split once landed in another user tab.
