@@ -1180,9 +1180,10 @@ setting are all gone.
   PR file rows) `z` runs the SAME open path as Enter/click (`viewer::with_review_zoom` sets a
   thread-local that `open_in_pane` reads, so no open site changed), then on a worker thread stamps
   `hs-preview-zoom-origin` = the sidebar pane id on the viewer, `pane.zoom {mode:"on"}` and
-  `focus_tab_for_client`. Viewer `z` (worker thread) reads that token from `pane.list`: present →
-  null it, `pane.zoom {mode:"off"}`, focus the origin pane in its own tab (works for inline and
-  preview-tab placement); absent → plain toggle. SCM Enter on Staged/Changes STAGES, so `z` calls
+  `focus_tab_for_client`. Viewer `z` reads that token from one `pane.list`: present → CLOSE the
+  preview via the q/Esc path (`close_own_pane_to`, same inline/dedicated-tab rules) after focusing
+  the origin sidebar FIRST (closing our tab can kill the viewer before later IPC); absent → plain
+  zoom toggle on a thread. `z` only reaches the read-only keymap, so no dirty buffer can be lost. SCM Enter on Staged/Changes STAGES, so `z` calls
   `open_diff` directly there. Verified live: tokens null-clear, zoom on/off by id, focus by id.
   Test gotcha: `tab.create` without a workspace lands in the SERVER-focused workspace and
   `pane.split` takes no `pane_id` param — a throwaway split once landed in another user tab.

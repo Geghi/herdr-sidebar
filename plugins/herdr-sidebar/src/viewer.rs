@@ -1757,6 +1757,12 @@ fn editor_pane_label(doc_name: &str) -> String {
 /// auto-docked sidebar behind as a convincing but unusable preview husk.
 /// An inline viewer owns nothing but its own pane, so it closes just that.
 fn close_own_pane(control: &Path) -> bool {
+    close_own_pane_to(control, None)
+}
+
+/// [`close_own_pane`], handing focus to `return_pane` (the sidebar that
+/// opened us) first: closing can kill this process before any follow-up IPC.
+fn close_own_pane_to(control: &Path, return_pane: Option<(&str, &str)>) -> bool {
     let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
         return false;
     };
@@ -1764,6 +1770,9 @@ fn close_own_pane(control: &Path) -> bool {
         return false;
     }
     if runs_inline() {
+        if let Some((tab, pane)) = return_pane {
+            focus_tab_for_client(tab, Some(pane));
+        }
         let closed = pane_close_succeeded(ipc::call_text(
             "pane.close",
             serde_json::json!({ "pane_id": pane_id }),
@@ -1788,8 +1797,11 @@ fn close_own_pane(control: &Path) -> bool {
                 .as_deref()
                 .is_some_and(|json| tab_is_plugin_only(json, &preview.tab_id))
     }) {
-        close_preview_tab(&preview);
+        close_preview_tab(&preview, return_pane);
     } else {
+        if let Some((tab, pane)) = return_pane {
+            focus_tab_for_client(tab, Some(pane));
+        }
         let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": pane_id }));
     }
     true
@@ -1826,10 +1838,12 @@ pub(crate) fn focus_tab_for_client(tab_id: &str, pane_id: Option<&str>) {
     }
 }
 
-fn close_preview_tab(preview: &PreviewPane) {
+fn close_preview_tab(preview: &PreviewPane, return_pane: Option<(&str, &str)>) {
     // Focus first: closing our own tab kills this process, so code after a
     // successful tab.close is not guaranteed to run.
-    if !preview.origin_tab_id.is_empty() {
+    if let Some((tab, pane)) = return_pane {
+        focus_tab_for_client(tab, Some(pane));
+    } else if !preview.origin_tab_id.is_empty() {
         focus_tab_for_client(&preview.origin_tab_id, None);
     }
     let _ = ipc::call_text("tab.close", serde_json::json!({ "tab_id": preview.tab_id }));
@@ -2306,7 +2320,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
                                     KeyCode::Char('z') => {
                                         if let Ok(id) = std::env::var("HERDR_PANE_ID") {
-                                            viewer_zoom(id);
+                                            should_close = viewer_zoom(&id, control);
                                         }
                                     }
                                     KeyCode::Char('w') if doc.media.is_none() => {
@@ -2646,10 +2660,10 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom/back  {wrap_hint}  q close")
+        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom/close  {wrap_hint}  q close")
     } else {
         format!(
-            " Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom/back  {wrap_hint}  q close"
+            " Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom/close  {wrap_hint}  q close"
         )
     };
     merge.button = Rect::default();
@@ -2915,33 +2929,22 @@ fn review_zoom(target: &PreviewTarget, origin_pane: &str) {
     });
 }
 
-/// Viewer `z`. Opened by a sidebar `z`: unzoom and hand focus back to that
-/// sidebar pane (across tabs too) so j/k + z reviews the next file. Otherwise
-/// herdr's plain zoom toggle.
-fn viewer_zoom(me: String) {
-    std::thread::spawn(move || {
-        let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
-        let Some(origin) = pane_token(&list, &me, TOKEN_ZOOM_ORIGIN) else {
-            let _ = ipc::call_text("pane.zoom", serde_json::json!({ "pane_id": me }));
-            return;
-        };
-        let _ = ipc::call_text(
-            "pane.report_metadata",
-            serde_json::json!({
-                "pane_id": me,
-                "source": METADATA_SOURCE,
-                "tokens": { TOKEN_ZOOM_ORIGIN: null },
-            }),
-        );
-        let _ = ipc::call_text(
-            "pane.zoom",
-            serde_json::json!({ "pane_id": me, "mode": "off" }),
-        );
+/// Viewer `z`. Opened by a sidebar `z`: close this preview (the q/Esc path)
+/// and hand focus back to that sidebar so j/k + z reviews the next file.
+/// Otherwise herdr's plain zoom toggle, off the UI thread. Returns whether
+/// the viewer closed. One synchronous `pane.list`, as q's close already does.
+fn viewer_zoom(me: &str, control: &Path) -> bool {
+    let list = ipc::call_text("pane.list", serde_json::json!({})).unwrap_or_default();
+    if let Some(origin) = pane_token(&list, me, TOKEN_ZOOM_ORIGIN) {
         let tab = crate::launch::tab_of(&list, &origin);
-        if !tab.is_empty() {
-            focus_tab_for_client(&tab, Some(&origin));
-        }
+        let back = (!tab.is_empty()).then_some((tab.as_str(), origin.as_str()));
+        return close_own_pane_to(control, back);
+    }
+    let me = me.to_string();
+    std::thread::spawn(move || {
+        let _ = ipc::call_text("pane.zoom", serde_json::json!({ "pane_id": me }));
     });
+    false
 }
 
 /// A string metadata token of `pane_id` in a `pane.list` response.
@@ -3205,7 +3208,7 @@ pub fn close_in_tab(my_pane_id: &str) {
                 && (preview.dedicated || preview.resumed)
                 && tab_is_plugin_only(&json, &preview.tab_id)
             {
-                close_preview_tab(&preview);
+                close_preview_tab(&preview, None);
             } else {
                 let _ = ipc::call_text("pane.close", serde_json::json!({ "pane_id": id }));
             }
