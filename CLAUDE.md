@@ -815,8 +815,11 @@ HACKING.md — budget time for that before promising a patched build.
   (`m merge ▾`, and only while mergeable) — approve/checkout/browser live in the sidebar
   menu, so they are not advertised there. Test gotcha: a JSON body containing `"## ` ends an
   `r#"…"#` raw string — use `r###"`.
-  Markdown is also the FALLBACK for markdown FILES when `glow` is missing, because a raw
-  `#`/`**` dump is not a preview.
+  Markdown FILES open as highlighted SOURCE by default (`syntax::highlight`, the Markdown
+  grammar colors fenced blocks in their language, same as edit mode). `p` in the read-only
+  preview toggles rendered (glow, else `markdown.rs`) and persists `md_rendered` in
+  state.json via `update_state`; the footer shows `p preview`/`p source` only on .md files.
+  A line-targeted open (search hit) always stays source so the line maps.
   **Merging from the overview**: a ready open request (`pr::merge_state` reads
   `gh pr view`'s `state`/`mergeStateStatus`; `DIRTY` → the button is withheld as
   `Conflicts`, failing checks `BLOCKED` still keep it — gh surfaces that error live) gets a

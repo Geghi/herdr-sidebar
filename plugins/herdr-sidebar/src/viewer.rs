@@ -1480,6 +1480,15 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
     }
 }
 
+fn is_markdown_name(lower: &str) -> bool {
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+fn is_markdown_request(request: &Request) -> bool {
+    matches!(request, Request::File { path, .. }
+        if is_markdown_name(&path.to_string_lossy().to_lowercase()))
+}
+
 fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     let name = target
         .file_name()
@@ -1492,7 +1501,7 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     if is_video_file(target) {
         return load_media_file(target, name, true);
     }
-    let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
+    let is_markdown = is_markdown_name(&lower);
     let (lines, numbered) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true),
         Ok(bytes) => {
@@ -1504,15 +1513,20 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
             } else {
                 let truncated = bytes.len() > MAX_BYTES;
                 let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; without it the pane's own renderer
-                // takes over (a raw `#`/`**` dump is not a preview).
+                // Markdown opens as highlighted source by default; `p` flips the
+                // persisted `md_rendered` to glow, or the pane's own renderer
+                // when glow is missing.
                 let glow_width = crossterm::terminal::size()
                     .map(|(w, _)| w.saturating_sub(6))
                     .unwrap_or(74);
-                let rendered = (is_markdown && target_line.is_none()).then(|| {
-                    glow_markdown(&text, glow_width)
-                        .unwrap_or_else(|| crate::markdown::render(&text, usize::from(glow_width)))
-                });
+                let rendered = (is_markdown
+                    && target_line.is_none()
+                    && crate::state::load_state().md_rendered)
+                    .then(|| {
+                        glow_markdown(&text, glow_width).unwrap_or_else(|| {
+                            crate::markdown::render(&text, usize::from(glow_width))
+                        })
+                    });
                 // Rendered markdown gets no line numbers (it lays itself out).
                 let numbered = rendered.is_none();
                 let mut lines: Vec<Line<'static>> = if let Some(rendered) = rendered {
@@ -2013,6 +2027,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         .as_ref()
                         .filter(|r| is_git_diff(r))
                         .map(|_| diff_full),
+                    current
+                        .as_ref()
+                        .filter(|r| is_markdown_request(r))
+                        .map(|_| crate::state::load_state().md_rendered),
                     notice.as_deref(),
                     &mut merge_ui,
                     find.as_ref(),
@@ -2336,6 +2354,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         .diff_full;
                                         force_diff_refresh = true;
                                     }
+                                    KeyCode::Char('p')
+                                        if current.as_ref().is_some_and(is_markdown_request) =>
+                                    {
+                                        crate::state::update_state(|s| {
+                                            s.md_rendered = !s.md_rendered
+                                        });
+                                        preview_load = current.clone().map(start_preview_load);
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2554,6 +2580,7 @@ fn draw_doc(
     theme: IconTheme,
     editable: bool,
     diff_full: Option<bool>,
+    md_rendered: Option<bool>,
     notice: Option<&str>,
     merge: &mut MergeUi,
     find: Option<&FindBox>,
@@ -2651,6 +2678,12 @@ fn draw_doc(
         (true, Some(false)) => "f: hunks  w: wrap on",
         (false, Some(false)) => "f: hunks  w: wrap off",
     };
+    let md_hint = match md_rendered {
+        Some(true) => "p source  ",
+        Some(false) => "p preview  ",
+        None => "",
+    };
+    let wrap_hint = format!("{md_hint}{wrap_hint}");
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
     } else if let Some(media) = &doc.media {
@@ -4347,6 +4380,7 @@ mod tests {
                         false,
                         None,
                         None,
+                        None,
                         &mut MergeUi::default(),
                         None,
                     );
@@ -4399,6 +4433,7 @@ mod tests {
                     &mut doc,
                     IconTheme::Emoji,
                     false,
+                    None,
                     None,
                     None,
                     &mut MergeUi::default(),
@@ -5099,6 +5134,28 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn markdown_source_view_is_syntax_highlighted() {
+        // Default (md_rendered=false) goes through syntax::highlight: the
+        // Markdown grammar must actually color something, incl. fenced code.
+        let md = "# Title\n\n```rust\nfn main() {}\n```\n";
+        let lines = crate::syntax::highlight("README.md", md, 100).expect("markdown grammar");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg.is_some())
+        );
+        assert!(is_markdown_request(&Request::File {
+            path: "a/B.MD".into(),
+            line: None
+        }));
+        assert!(!is_markdown_request(&Request::File {
+            path: "a.rs".into(),
+            line: None
+        }));
     }
 
     #[test]
