@@ -555,7 +555,10 @@ HACKING.md — budget time for that before promising a patched build.
   FOLDERS so matches stay treed (barren folders drop out; the walk deliberately ignores the
   expanded set, so ancestors render open). `gi` hides the rows the decorations mark `I`, so it
   needs Git decorations enabled to have anything to hide. ANY field activates the filter; an
-  all-empty form keeps the ordinary tree. Esc closes and restores, Up/Down/PageUp/PageDown and
+  all-empty form keeps the ordinary tree. Esc closes and restores — but a row the user
+  selected/opened in the filtered list (`FilterState::picked`, set by `select()`/`toggle()`, NOT
+  by the filter's auto-select of the first match) is REVEALED: `reveal_path` expands its
+  ancestors, selects and snaps to it, and `select()` persists it once the form is gone, Up/Down/PageUp/PageDown and
   Enter keep working on the filtered rows, and bare digits type into the focused field (only
   Ctrl+1/2/3 still switch views). While the form is open the pane neither persists nor adopts
   shared tree state (`persist_tree`/`sync_shared_tree` early-return), so a sibling sidebar never

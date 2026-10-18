@@ -456,6 +456,9 @@ struct FilterState {
     options: FilterOptions,
     /// Compile error (a bad `.*` pattern), rendered in place of the results.
     error: Option<String>,
+    /// The row the user last selected/opened in the filtered list; Esc
+    /// reveals it in the restored tree.
+    picked: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1218,8 +1221,13 @@ impl App {
             }
             match key.code {
                 KeyCode::Esc => {
-                    self.filter = None;
+                    let picked = self.filter.take().and_then(|state| state.picked);
                     self.rebuild();
+                    if let Some(path) = picked
+                        && let Some(index) = reveal_path(&mut self.tree, &mut self.rows, &path)
+                    {
+                        self.select(index);
+                    }
                     return None;
                 }
                 KeyCode::Tab => {
@@ -3249,8 +3257,12 @@ impl App {
 
     fn select(&mut self, index: usize) {
         if !self.rows.is_empty() {
-            self.selected = Some(index.min(self.rows.len() - 1));
+            let index = index.min(self.rows.len() - 1);
+            self.selected = Some(index);
             self.snap = true;
+            if let Some(state) = self.filter.as_mut() {
+                state.picked = Some(self.rows[index].path.clone());
+            }
             self.persist_tree();
         }
     }
@@ -3364,8 +3376,11 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
-        let path = row.path.clone();
-        if !row.is_dir {
+        let (path, is_dir) = (row.path.clone(), row.is_dir);
+        if let Some(state) = self.filter.as_mut() {
+            state.picked = Some(path.clone());
+        }
+        if !is_dir {
             // Enter on a file opens the zoomed preview, like clicking it.
             self.open_preview(&path);
             return;
@@ -5319,6 +5334,20 @@ fn rebuild_tree_rows(
     *scroll = (*scroll).min(rows.len() - 1);
 }
 
+/// Expand every folder between the root and `path`, rebuild the rows, and
+/// return the index of `path`'s row (None when it is outside the tree or gone).
+fn reveal_path(tree: &mut Tree, rows: &mut Vec<Row>, path: &Path) -> Option<usize> {
+    let root = tree.root_path();
+    if !path.starts_with(&root) {
+        return None;
+    }
+    for ancestor in path.ancestors().skip(1).take_while(|a| *a != root) {
+        tree.expand(ancestor);
+    }
+    *rows = tree.rows();
+    rows.iter().position(|row| row.path == path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5407,6 +5436,30 @@ mod tests {
                 selected: Some(file),
             },
         ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reveal_path_expands_ancestors_and_finds_the_row() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-sidebar-reveal-{}-{}",
+            std::process::id(),
+            sidebar::unix_now()
+        ));
+        let nested = root.join("src").join("bin");
+        let file = nested.join("main.rs");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        std::fs::write(nested.join("other.rs"), "").unwrap();
+
+        let mut tree = Tree::new(root.clone());
+        let mut rows = tree.rows();
+        let index = reveal_path(&mut tree, &mut rows, &file).expect("revealed");
+        assert_eq!(rows[index].path, file);
+        // Siblings are visible because the parent is expanded.
+        assert!(rows.iter().any(|row| row.path == nested.join("other.rs")));
+        assert_eq!(reveal_path(&mut tree, &mut rows, Path::new("/elsewhere")), None);
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5839,6 +5892,7 @@ mod tests {
             focus: FilterFocus::default(),
             options,
             error: None,
+            picked: None,
         }
     }
 
