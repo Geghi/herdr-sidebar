@@ -5459,7 +5459,10 @@ mod tests {
         assert_eq!(rows[index].path, file);
         // Siblings are visible because the parent is expanded.
         assert!(rows.iter().any(|row| row.path == nested.join("other.rs")));
-        assert_eq!(reveal_path(&mut tree, &mut rows, Path::new("/elsewhere")), None);
+        assert_eq!(
+            reveal_path(&mut tree, &mut rows, Path::new("/elsewhere")),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
