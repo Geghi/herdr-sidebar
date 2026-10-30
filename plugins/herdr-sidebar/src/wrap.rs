@@ -120,6 +120,36 @@ fn row_from(cells: &[(char, Style)], line_style: Style) -> Line<'static> {
     row
 }
 
+/// `line` cut or padded to exactly `width` columns, with the line style
+/// folded into every span so its tint survives being placed beside another
+/// line (the split diff's two columns). Tabs expand to their stops.
+pub fn fit(line: &Line<'static>, width: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut x = 0;
+    'spans: for span in &line.spans {
+        let style = line.style.patch(span.style);
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = char_width(c, x);
+            if x + w > width {
+                out.push(Span::styled(text, style));
+                break 'spans;
+            }
+            if c == '\t' {
+                text.extend(std::iter::repeat_n(' ', w));
+            } else {
+                text.push(c);
+            }
+            x += w;
+        }
+        out.push(Span::styled(text, style));
+    }
+    if x < width {
+        out.push(Span::styled(" ".repeat(width - x), line.style));
+    }
+    out
+}
+
 fn char_width(c: char, x: usize) -> usize {
     if c == '\t' {
         TAB_WIDTH - (x % TAB_WIDTH)
@@ -281,5 +311,17 @@ mod tests {
         assert_eq!(texts(&wrap_line(&line, 0)), vec!["abc"]);
         assert_eq!(texts(&wrap_line(&line, 1)), vec!["a", "b", "c"]);
         assert_eq!(texts(&wrap_line(&Line::raw(""), 4)), vec![""]);
+    }
+
+    #[test]
+    fn fit_clips_pads_and_keeps_the_line_tint() {
+        let bg = Style::default().bg(ratatui::style::Color::Red);
+        let line = Line::from(vec![Span::raw("ab\t"), Span::raw("界x")]).style(bg);
+        let text = |spans: &[Span]| spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        // The wide char straddling the edge is dropped, not split.
+        assert_eq!(text(&fit(&line, 5)), "ab   ");
+        let wide = fit(&line, 9);
+        assert_eq!(text(&wide), "ab  界x  ");
+        assert!(wide.iter().all(|s| s.style.bg == bg.bg));
     }
 }

@@ -182,9 +182,32 @@ fn overlay_bg(spans: Vec<Span<'static>>, range: (usize, usize), bg: Color) -> Ve
     out
 }
 
+/// One row of the side-by-side layout. `src` is the unified line the row
+/// came from (unified output is one line per parsed event), so scroll
+/// anchoring and hunk navigation keep working across a layout toggle.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SplitRow {
+    /// Spans both columns: a hunk separator or an unparsed line.
+    Full { src: usize, line: Line<'static> },
+    /// Old side left, new side right; `None` is a blank filler cell.
+    Pair {
+        src: usize,
+        left: Option<Line<'static>>,
+        right: Option<Line<'static>>,
+    },
+}
+
+/// Both layouts of one diff, highlighted once.
+pub struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    pub split: Vec<SplitRow>,
+}
+
 /// Render a unified diff for `rel` (its extension picks the grammar) into
-/// display lines: `old new ±` gutters, tinted rows, highlighted code.
-pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
+/// display lines — `old new ±` gutters, tinted rows, highlighted code — and
+/// into side-by-side rows (each side with its own `no ±` gutter, deletions
+/// paired 1:1 with the additions that follow them, like `word_ranges`).
+pub fn render(rel: &str, diff: &str) -> Rendered {
     let evs = parse_events(diff);
     let ranges = word_ranges(&evs);
 
@@ -199,60 +222,132 @@ pub fn render(rel: &str, diff: &str) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0);
     let w = max_no.to_string().len().max(2);
+    let fmt = |v: Option<usize>| match v {
+        Some(v) => format!("{v:>w$}"),
+        None => " ".repeat(w),
+    };
 
     // Two stateful highlighters approximate the old and new file contexts,
     // so multi-line constructs mostly survive (the delta/bat trick).
     let mut old_hl = LineHighlighter::new(rel);
     let mut new_hl = LineHighlighter::new(rel);
+    let colors = palette();
+    let code: Vec<Vec<Span<'static>>> = evs
+        .iter()
+        .enumerate()
+        .map(|(idx, ev)| match ev {
+            Ev::Ctx(_, _, t) => {
+                old_hl.line(t);
+                new_hl.line(t)
+            }
+            Ev::Del(_, t) => match ranges.get(&idx) {
+                Some(&range) => overlay_bg(old_hl.line(t), range, colors.diff_del_word_bg),
+                None => old_hl.line(t),
+            },
+            Ev::Add(_, t) => match ranges.get(&idx) {
+                Some(&range) => overlay_bg(new_hl.line(t), range, colors.diff_add_word_bg),
+                None => new_hl.line(t),
+            },
+            _ => Vec::new(),
+        })
+        .collect();
 
-    let gutter = |o: Option<usize>, n: Option<usize>, mark: &str, mark_fg: Color| {
-        let fmt = |v: Option<usize>| match v {
-            Some(v) => format!("{v:>w$}"),
-            None => " ".repeat(w),
-        };
-        vec![
-            Span::styled(format!("{} {} ", fmt(o), fmt(n)), Style::default().dim()),
-            Span::styled(format!("{mark} "), Style::default().fg(mark_fg)),
-        ]
+    let mark = |m: &str, fg: Color| Span::styled(format!("{m} "), Style::default().fg(fg));
+    let tint = |line: Line<'static>, bg: Option<Color>| match bg {
+        Some(bg) => line.style(Style::default().bg(bg)),
+        None => line,
+    };
+    // (old no, new no, mark, mark color, row tint) per event.
+    let shape = |ev: &Ev| match ev {
+        Ev::Ctx(o, n, _) => (Some(*o), Some(*n), " ", Color::Reset, None),
+        Ev::Del(o, _) => (
+            Some(*o),
+            None,
+            "-",
+            colors.diff_del_mark,
+            Some(colors.diff_del_bg),
+        ),
+        Ev::Add(n, _) => (
+            None,
+            Some(*n),
+            "+",
+            colors.diff_add_mark,
+            Some(colors.diff_add_bg),
+        ),
+        _ => (None, None, " ", Color::Reset, None),
     };
 
-    let colors = palette();
-    let mut lines = Vec::new();
-    for (idx, ev) in evs.iter().enumerate() {
-        match ev {
-            Ev::Hunk => lines.push(Line::from(Span::styled(
+    let lines: Vec<Line<'static>> = evs
+        .iter()
+        .zip(&code)
+        .map(|(ev, spans)| match ev {
+            Ev::Hunk => Line::from(Span::styled(
                 format!("{}⋯", " ".repeat(w * 2 + 2)),
                 Style::default().dim(),
-            ))),
-            Ev::Plain(t) => lines.push(Line::from(Span::styled(t.clone(), Style::default().dim()))),
-            Ev::Ctx(o, n, t) => {
-                old_hl.line(t);
-                let spans = new_hl.line(t);
-                let mut all = gutter(Some(*o), Some(*n), " ", Color::Reset);
-                all.extend(spans);
-                lines.push(Line::from(all));
+            )),
+            Ev::Plain(t) => Line::from(Span::styled(t.clone(), Style::default().dim())),
+            _ => {
+                let (o, n, m, fg, bg) = shape(ev);
+                let mut all = vec![
+                    Span::styled(format!("{} {} ", fmt(o), fmt(n)), Style::default().dim()),
+                    mark(m, fg),
+                ];
+                all.extend(spans.iter().cloned());
+                tint(Line::from(all), bg)
             }
-            Ev::Del(o, t) => {
-                let mut spans = old_hl.line(t);
-                if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, colors.diff_del_word_bg);
-                }
-                let mut all = gutter(Some(*o), None, "-", colors.diff_del_mark);
-                all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(colors.diff_del_bg)));
+        })
+        .collect();
+
+    // One side of a split row: `no ± code`, carrying the event's tint.
+    let side = |j: usize, old: bool| {
+        let (o, n, m, fg, bg) = shape(&evs[j]);
+        let mut all = vec![
+            Span::styled(
+                format!("{} ", fmt(if old { o } else { n })),
+                Style::default().dim(),
+            ),
+            mark(m, fg),
+        ];
+        all.extend(code[j].iter().cloned());
+        tint(Line::from(all), bg)
+    };
+    let is_del = |j: usize| matches!(evs.get(j), Some(Ev::Del(..)));
+    let is_add = |j: usize| matches!(evs.get(j), Some(Ev::Add(..)));
+    let mut split = Vec::new();
+    let mut i = 0;
+    while i < evs.len() {
+        match &evs[i] {
+            Ev::Hunk | Ev::Plain(_) => {
+                split.push(SplitRow::Full {
+                    src: i,
+                    line: lines[i].clone(),
+                });
+                i += 1;
             }
-            Ev::Add(n, t) => {
-                let mut spans = new_hl.line(t);
-                if let Some(&range) = ranges.get(&idx) {
-                    spans = overlay_bg(spans, range, colors.diff_add_word_bg);
+            Ev::Ctx(..) => {
+                split.push(SplitRow::Pair {
+                    src: i,
+                    left: Some(side(i, true)),
+                    right: Some(side(i, false)),
+                });
+                i += 1;
+            }
+            Ev::Del(..) | Ev::Add(..) => {
+                let dels: Vec<usize> = (i..).take_while(|&j| is_del(j)).collect();
+                let adds: Vec<usize> = (i + dels.len()..).take_while(|&j| is_add(j)).collect();
+                for k in 0..dels.len().max(adds.len()) {
+                    let (d, a) = (dels.get(k).copied(), adds.get(k).copied());
+                    split.push(SplitRow::Pair {
+                        src: d.or(a).unwrap_or(i),
+                        left: d.map(|j| side(j, true)),
+                        right: a.map(|j| side(j, false)),
+                    });
                 }
-                let mut all = gutter(None, Some(*n), "+", colors.diff_add_mark);
-                all.extend(spans);
-                lines.push(Line::from(all).style(Style::default().bg(colors.diff_add_bg)));
+                i += dels.len() + adds.len();
             }
         }
     }
-    lines
+    Rendered { lines, split }
 }
 
 #[cfg(test)]
@@ -277,7 +372,7 @@ mod tests {
     #[test]
     fn diff_parses_gutters_tints_and_word_ranges() {
         let colors = palette();
-        let lines = render("app.ts", DIFF);
+        let lines = render("app.ts", DIFF).lines;
         assert_eq!(lines.len(), 5);
         // Context row: both numbers, no tint.
         assert!(lines[0].to_string().starts_with(" 1  1"));
@@ -315,7 +410,7 @@ mod tests {
             "--- trailing comment\n",
             " SELECT 2;\n",
         );
-        let lines = render("q.sql", diff);
+        let lines = render("q.sql", diff).lines;
         assert_eq!(lines.len(), 3, "the deleted comment line must render");
         assert!(lines[0].to_string().starts_with(" 1  1"));
         assert!(lines[1].to_string().contains("-- trailing comment"));
@@ -326,10 +421,86 @@ mod tests {
     #[test]
     fn hunk_boundaries_and_binary_lines_survive() {
         let two_hunks = "@@ -1,1 +1,1 @@\n ctx\n@@ -9,1 +9,1 @@\n ctx2\n";
-        let lines = render("x.rs", two_hunks);
+        let lines = render("x.rs", two_hunks).lines;
         assert_eq!(lines.len(), 3);
         assert!(lines[1].to_string().contains('⋯'));
-        let bin = render("x.bin", "Binary files a/x.bin and b/x.bin differ\n");
+        let bin = render("x.bin", "Binary files a/x.bin and b/x.bin differ\n").lines;
         assert_eq!(bin.len(), 1);
+    }
+
+    #[test]
+    fn split_pairs_dels_with_adds_and_fills_the_rest() {
+        let colors = palette();
+        let split = render("app.ts", DIFF).split;
+        let text = |l: &Option<Line>| l.as_ref().map(|l| l.to_string());
+        let pair = |r: &SplitRow| match r {
+            SplitRow::Pair { src, left, right } => (*src, text(left), text(right)),
+            SplitRow::Full { .. } => panic!("unexpected full row"),
+        };
+        // ctx, (del|add), (filler|add), ctx — one row per pair.
+        assert_eq!(split.len(), 4);
+        // Context on both sides, each with its own number.
+        let (src, l, r) = pair(&split[0]);
+        assert_eq!(src, 0);
+        assert!(l.unwrap().starts_with(" 1   import"));
+        assert!(r.unwrap().starts_with(" 1   import"));
+        // The deletion sits beside the addition that replaced it, tinted and
+        // word-tinted; src is the deletion's unified line.
+        let (src, l, r) = pair(&split[1]);
+        assert_eq!(src, 1);
+        assert!(l.unwrap().contains("scm-playground up"));
+        assert!(r.unwrap().contains("scm oh yeah"));
+        let SplitRow::Pair {
+            left: Some(left),
+            right: Some(right),
+            ..
+        } = &split[1]
+        else {
+            unreachable!()
+        };
+        assert_eq!(left.style.bg, Some(colors.diff_del_bg));
+        assert_eq!(right.style.bg, Some(colors.diff_add_bg));
+        assert!(
+            left.spans
+                .iter()
+                .any(|s| s.style.bg == Some(colors.diff_del_word_bg))
+        );
+        // The unpaired extra addition gets a blank filler on the left.
+        let (src, l, r) = pair(&split[2]);
+        assert_eq!(src, 3);
+        assert_eq!(l, None);
+        assert!(r.unwrap().contains("TODO"));
+        // Trailing context: old 3 / new 4.
+        let (_, l, r) = pair(&split[3]);
+        assert!(l.unwrap().starts_with(" 3 "));
+        assert!(r.unwrap().starts_with(" 4 "));
+    }
+
+    #[test]
+    fn split_lone_deletions_and_hunk_separators() {
+        let diff = "@@ -1,2 +1,0 @@\n-a\n-b\n@@ -9,1 +7,1 @@\n ctx\n";
+        let split = render("x.rs", diff).split;
+        assert_eq!(split.len(), 4);
+        for row in &split[..2] {
+            assert!(matches!(
+                row,
+                SplitRow::Pair {
+                    left: Some(_),
+                    right: None,
+                    ..
+                }
+            ));
+        }
+        assert!(
+            matches!(&split[2], SplitRow::Full { src: 2, line } if line.to_string().contains('⋯'))
+        );
+        assert!(matches!(
+            &split[3],
+            SplitRow::Pair {
+                src: 3,
+                left: Some(_),
+                right: Some(_)
+            }
+        ));
     }
 }

@@ -322,8 +322,9 @@ struct Doc {
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
-    /// The (width, height, wrap) `rows` was built for; `None` until first draw.
-    rows_key: Option<(u16, u16, bool)>,
+    /// The (width, height, wrap, split view) `rows` was built for; `None`
+    /// until first draw.
+    rows_key: Option<(u16, u16, bool, bool)>,
     /// Source line to scroll back to once `rows` is rebuilt — how a wrap
     /// toggle and a diff refresh keep the reader's place even though the
     /// row index underneath them changed.
@@ -334,6 +335,12 @@ struct Doc {
     /// this.
     pr_target: Option<PrTarget>,
     selection: PreviewSelection,
+    /// The side-by-side layout of a diff doc (empty for everything else —
+    /// which is also how the `s` toggle knows a doc is a diff).
+    split: Vec<crate::diffview::SplitRow>,
+    /// Lay `split` out instead of `lines`: the persisted `diff_split`
+    /// choice, set by the event loop before every draw.
+    split_view: bool,
 }
 
 /// What the overview's footer merge button needs: the repo to run `gh` in,
@@ -375,13 +382,16 @@ impl Doc {
     /// Rebuild [`Doc::rows`] for the viewport when the layout inputs changed,
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
-        if self.rows_key != Some((width, height, self.wrap)) {
+        let key = (width, height, self.wrap, self.split_view);
+        if self.rows_key != Some(key) {
             self.rows = if let Some(media) = &self.media {
                 render_media_rows(media, width, height)
+            } else if self.split_view && !self.split.is_empty() {
+                build_split_rows(&self.split, self.wrap, width)
             } else {
                 build_rows(&self.lines, self.numbered, self.wrap, width)
             };
-            self.rows_key = Some((width, height, self.wrap));
+            self.rows_key = Some(key);
             self.selection = PreviewSelection::default();
         }
         if let Some(src) = self.pending_src.take() {
@@ -831,6 +841,53 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
     rows
 }
 
+/// Lay a side-by-side diff out for a `width`-wide body: old side in the
+/// left half, new side in the right, a dim rule between. With wrap on each
+/// side wraps within its half (the shorter side pads with its tint);
+/// with wrap off each side is clipped to its half — the viewer has no
+/// horizontal scroll, so that is the same edge clip a unified diff gets.
+fn build_split_rows(split: &[crate::diffview::SplitRow], wrap: bool, width: u16) -> Vec<Row> {
+    use crate::diffview::SplitRow;
+    let left_w = usize::from(width).saturating_sub(1) / 2;
+    let right_w = usize::from(width).saturating_sub(1 + left_w);
+    let pieces = |side: &Option<Line<'static>>, w: usize| -> Vec<Vec<Span<'static>>> {
+        let Some(line) = side else { return Vec::new() };
+        let lines = if wrap && w > 0 {
+            crate::wrap::wrap_line(line, w)
+        } else {
+            vec![line.clone()]
+        };
+        lines.iter().map(|l| crate::wrap::fit(l, w)).collect()
+    };
+    let filler = |side: &Option<Line<'static>>, w: usize| {
+        let style = side.as_ref().map_or_else(Style::default, |l| l.style);
+        vec![Span::styled(" ".repeat(w), style)]
+    };
+    let mut rows = Vec::with_capacity(split.len());
+    for row in split {
+        match row {
+            SplitRow::Full { src, line } => rows.extend(
+                build_rows(std::slice::from_ref(line), false, wrap, width)
+                    .into_iter()
+                    .map(|r| Row { src: *src, ..r }),
+            ),
+            SplitRow::Pair { src, left, right } => {
+                let (l, r) = (pieces(left, left_w), pieces(right, right_w));
+                for i in 0..l.len().max(r.len()).max(1) {
+                    let mut spans = l.get(i).cloned().unwrap_or_else(|| filler(left, left_w));
+                    spans.push(Span::styled("│", Style::default().dim()));
+                    spans.extend(r.get(i).cloned().unwrap_or_else(|| filler(right, right_w)));
+                    rows.push(Row {
+                        src: *src,
+                        line: Line::from(spans),
+                    });
+                }
+            }
+        }
+    }
+    rows
+}
+
 fn load(request: &Request) -> Doc {
     match request {
         Request::Close => Doc {
@@ -846,6 +903,8 @@ fn load(request: &Request) -> Doc {
             pending_src: None,
             pr_target: None,
             selection: PreviewSelection::default(),
+            split: Vec::new(),
+            split_view: false,
         },
         Request::File { path, line } => load_file(path, *line),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
@@ -888,6 +947,8 @@ fn load_pr(root: &Path, number: u64) -> Doc {
         pending_src: None,
         pr_target,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     }
 }
 
@@ -926,6 +987,8 @@ fn loading_doc(request: &Request) -> Doc {
         pending_src: None,
         pr_target: None,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     }
 }
 
@@ -947,6 +1010,7 @@ fn apply_diff_refresh(doc: &mut Doc, mut refreshed: Doc) {
         return;
     }
     refreshed.wrap = doc.wrap;
+    refreshed.split_view = doc.split_view;
     refreshed.pending_src = Some(doc.top_src());
     *doc = refreshed;
 }
@@ -1110,6 +1174,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
             ])
             .current_dir(root)
             .output();
+        let mut split = Vec::new();
         let lines = match output {
             Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
             Ok(out) => {
@@ -1122,7 +1187,9 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
                         vec![Line::raw(format!("({})", err.trim()))]
                     }
                 } else {
-                    crate::diffview::render(p, &text)
+                    let rendered = crate::diffview::render(p, &text);
+                    split = rendered.split;
+                    rendered.lines
                 }
             }
         };
@@ -1139,6 +1206,8 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
             pending_src: None,
             pr_target: None,
             selection: PreviewSelection::default(),
+            split,
+            split_view: false,
         };
     }
     let args: Vec<String> = vec![
@@ -1185,6 +1254,8 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         pending_src: None,
         pr_target: None,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     }
 }
 
@@ -1477,6 +1548,8 @@ fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
         pending_src: None,
         pr_target: None,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     }
 }
 
@@ -1562,6 +1635,8 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         pr_target: None,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     }
 }
 
@@ -1591,10 +1666,15 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     // the slice for this file renders through the same renderer as any other
     // diff, so the Changes look carries over.
     if let Some(number) = kind.strip_prefix("pr:").and_then(|n| n.parse::<u64>().ok()) {
+        let mut split = Vec::new();
         let lines = match crate::pr::diff(root, number) {
             Err(e) => vec![Line::raw(format!("({e})"))],
             Ok(patch) => match crate::pr::patch_for_file(&patch, rel) {
-                Some(section) => crate::diffview::render(rel, &section),
+                Some(section) => {
+                    let rendered = crate::diffview::render(rel, &section);
+                    split = rendered.split;
+                    rendered.lines
+                }
                 None => vec![Line::raw("(no changes for this file)")],
             },
         };
@@ -1611,6 +1691,8 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
             pending_src: None,
             pr_target: None,
             selection: PreviewSelection::default(),
+            split,
+            split_view: false,
         };
     }
     // Plain (uncolored) diff: crate::diffview parses it and renders the
@@ -1643,6 +1725,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         .args(&args)
         .current_dir(root)
         .output();
+    let mut split = Vec::new();
     let lines = match output {
         Err(e) => vec![Line::raw(format!("(git failed: {e})"))],
         Ok(out) => {
@@ -1656,7 +1739,9 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
                     vec![Line::raw(format!("({})", err.trim()))]
                 }
             } else {
-                crate::diffview::render(rel, &text)
+                let rendered = crate::diffview::render(rel, &text);
+                split = rendered.split;
+                rendered.lines
             }
         }
     };
@@ -1682,6 +1767,8 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         pending_src: None,
         pr_target: None,
         selection: PreviewSelection::default(),
+        split,
+        split_view: false,
     }
 }
 
@@ -1962,6 +2049,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         pending_src: None,
         pr_target: None,
         selection: PreviewSelection::default(),
+        split: Vec::new(),
+        split_view: false,
     });
     let mut mode = ViewMode::Preview(doc);
     report_identity(
@@ -1994,6 +2083,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
     let mut diff_full = crate::state::load_state().diff_full;
+    let mut diff_split = crate::state::load_state().diff_split;
     let mut force_diff_refresh = false;
     let mut identity_pending = false;
     let result = loop {
@@ -2018,6 +2108,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         let prompt_text = prompt.as_ref().map(Prompt::text);
         let terminal_draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
+                doc.split_view = diff_split;
                 (page, preview_body) = draw_doc(
                     frame,
                     doc,
@@ -2354,6 +2445,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         .diff_full;
                                         force_diff_refresh = true;
                                     }
+                                    // Unified ⇄ side by side; no reload — the
+                                    // diff doc already carries both layouts.
+                                    KeyCode::Char('s') if !doc.split.is_empty() => {
+                                        doc.pending_src = Some(doc.top_src());
+                                        diff_split = crate::state::update_state(|s| {
+                                            s.diff_split = !s.diff_split
+                                        })
+                                        .diff_split;
+                                    }
                                     KeyCode::Char('p')
                                         if current.as_ref().is_some_and(is_markdown_request) =>
                                     {
@@ -2683,7 +2783,12 @@ fn draw_doc(
         Some(false) => "p preview  ",
         None => "",
     };
-    let wrap_hint = format!("{md_hint}{wrap_hint}");
+    let split_hint = match (doc.split.is_empty(), doc.split_view) {
+        (true, _) => "",
+        (false, true) => "s: split  ",
+        (false, false) => "s: unified  ",
+    };
+    let wrap_hint = format!("{md_hint}{split_hint}{wrap_hint}");
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
     } else if let Some(media) = &doc.media {
@@ -4001,6 +4106,8 @@ mod tests {
             pending_src: None,
             pr_target: None,
             selection: PreviewSelection::default(),
+            split: Vec::new(),
+            split_view: false,
         }
     }
 
@@ -4205,7 +4312,7 @@ mod tests {
     fn hunk_starts_finds_hunks_in_rendered_diffs_for_every_theme() {
         let diff =
             "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n a\n-b\n+c\n d\n";
-        let lines = crate::diffview::render("x.rs", diff);
+        let lines = crate::diffview::render("x.rs", diff).lines;
         assert_eq!(hunk_starts(&lines).len(), 1);
         // Every theme must tint changed rows with distinct, concrete colors.
         for t in [
@@ -4218,6 +4325,37 @@ mod tests {
             assert!(!matches!(p.diff_add_bg, Color::Reset));
             assert!(!matches!(p.diff_del_bg, Color::Reset));
         }
+    }
+
+    #[test]
+    fn split_view_lays_both_sides_into_halves_and_keeps_hunk_targets() {
+        let diff = "@@ -1,3 +1,3 @@\n a\n-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n+c\n d\n";
+        let rendered = crate::diffview::render("x.rs", diff);
+        let mut doc = doc_of(rendered.lines, false);
+        doc.split = rendered.split;
+        doc.split_view = true;
+        doc.wrap = false;
+        doc.relayout(31, 20);
+        assert_eq!(doc.rows.len(), 3);
+        for row in &doc.rows {
+            // Clipped and padded to exactly the pane width, rule in the middle.
+            assert_eq!(row.line.width(), 31);
+            assert_eq!(row.line.to_string().chars().nth(15), Some('│'));
+        }
+        // `.`/`,` map hunk starts to rows by source line: still reachable.
+        let start = hunk_starts(&doc.lines)[0];
+        assert!(doc.rows.iter().any(|r| r.src == start));
+        // Wrap on: the long deletion wraps within its half, the short
+        // addition beside it pads, so the change spans several rows.
+        doc.wrap = true;
+        doc.relayout(31, 20);
+        assert!(doc.rows.len() > 3);
+        assert!(doc.rows.iter().all(|r| r.line.width() == 31));
+        // Toggling back restores the unified layout.
+        doc.split_view = false;
+        doc.wrap = false;
+        doc.relayout(31, 20);
+        assert_eq!(doc.rows.len(), 4);
     }
 
     #[test]

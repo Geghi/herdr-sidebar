@@ -331,6 +331,9 @@ pub struct State {
     /// the viewer toggles to hunks only). Remembered so every diff opens in
     /// the last mode.
     pub diff_full: bool,
+    /// Diff previews render side by side (old left, new right) instead of
+    /// unified (`s` in the viewer toggles it). Remembered like `diff_full`.
+    pub diff_split: bool,
     /// Markdown files preview rendered (glow / markdown.rs) instead of as
     /// highlighted source (`p` in the viewer toggles it).
     pub md_rendered: bool,
@@ -358,6 +361,7 @@ impl Default for State {
             custom_editor_on_click: false,
             scm_tree: false,
             diff_full: true,
+            diff_split: false,
             md_rendered: false,
         }
     }
@@ -536,7 +540,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"scm_tree\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"diff_full\":{},\"md_rendered\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"scm_tree\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"diff_full\":{},\"diff_split\":{},\"md_rendered\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -555,6 +559,7 @@ fn write_state(path: &Path, state: State) {
         state.preview_placement.label(),
         state.custom_editor_on_click,
         state.diff_full,
+        state.diff_split,
         state.md_rendered
     );
     // `gh_accounts` is not part of the Copy `State`; carry it through rewrites.
@@ -1056,6 +1061,10 @@ pub fn parse_state(json: &str) -> State {
             .get("diff_full")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.diff_full),
+        diff_split: value
+            .get("diff_split")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.diff_split),
         md_rendered: value
             .get("md_rendered")
             .and_then(|v| v.as_bool())
@@ -1071,6 +1080,8 @@ mod tests {
     fn diff_full_defaults_on_and_round_trips() {
         assert!(parse_state("{}").diff_full);
         assert!(!parse_state(r#"{"diff_full":false}"#).diff_full);
+        assert!(!parse_state("{}").diff_split);
+        assert!(parse_state(r#"{"diff_split":true}"#).diff_split);
         assert!(!parse_state("{}").md_rendered);
         assert!(parse_state(r#"{"md_rendered":true}"#).md_rendered);
     }
@@ -1214,6 +1225,7 @@ mod tests {
             custom_editor_on_click: true,
             scm_tree: true,
             diff_full: true,
+            diff_split: false,
             md_rendered: false,
         };
         let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"scm_tree\":true,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"icons\":\"emoji\"}";
@@ -1343,10 +1355,15 @@ mod tests {
             r#"{"merged":true,"gh_accounts":{"github-mokka":"acct"}}"#,
         )
         .unwrap();
-        write_state(&path, State::default());
-        let json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let state = State {
+            diff_split: true,
+            ..State::default()
+        };
+        write_state(&path, state);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let _ = std::fs::remove_file(&path);
+        assert_eq!(parse_state(&text), state);
         assert_eq!(json["gh_accounts"]["github-mokka"], "acct");
         assert_eq!(json["merged"], true);
     }

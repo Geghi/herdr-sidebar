@@ -1072,6 +1072,19 @@ setting are all gone.
   anchor is approximate across a mode switch, since the line set itself changes). PR file diffs
   (`pr:<n>`) and whole-commit `git show` are excluded (`is_git_diff`): only the patch exists, so
   they always show hunks and the footer omits the `f` hint.
+- `s` toggles unified vs SPLIT (side-by-side) on EVERY `diffview::render` doc — Changes/Staged,
+  Branch Changes, PR file diffs and GRAPH per-file diffs — persisted as `diff_split` (default
+  off). `diffview::render` returns `Rendered { lines, split }`: one highlight pass feeds both
+  layouts, and each `SplitRow` carries `src` = its unified line index (unified emits exactly
+  one line per parsed event), so `hunk_starts` (still read from the unified `lines`), find,
+  `pending_src` re-anchoring and the 2s refresh work unchanged in either layout. The doc's
+  non-empty `split` is also how the key/footer know a doc is a diff (PR diffs included,
+  unlike `is_git_diff`). The toggle never reloads: `Doc::split_view` is set from the loop each
+  frame and is part of `rows_key`, so `relayout` rebuilds via `build_split_rows`. Each side gets
+  half the width minus a `│` rule; `w` wraps each side within its half, otherwise each side is
+  CLIPPED at its half (`wrap::fit`) — there is no horizontal scroll anywhere in the viewer, so
+  that is the same edge clip a unified diff gets. Side tints live on the side Line's style, so
+  `fit` folds the line style into every span before the two sides share one row.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
