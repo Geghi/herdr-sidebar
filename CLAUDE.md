@@ -1070,8 +1070,14 @@ setting are all gone.
   and the graph's per-file `git show` (`context_arg`); the toggle re-runs the load through the
   ~2s refresh channel, so `apply_diff_refresh` keeps wrap and re-anchors by source line (the
   anchor is approximate across a mode switch, since the line set itself changes). PR file diffs
-  (`pr:<n>`) and whole-commit `git show` are excluded (`is_git_diff`): only the patch exists, so
-  they always show hunks and the footer omits the `f` hint.
+  (`pr:<n>`) toggle too: hunks mode keeps `gh pr diff`; full mode (`pr::full_diff`) reads
+  `baseRefOid`/`headRefOid` from `gh pr view`, fetches missing commits BY SHA from each remote
+  (`upstream` first — a fork's origin lacks them; GitHub serves fork PR heads from the base repo),
+  then `git diff -M -U999999 <merge-base> <head>` sliced by `patch_for_file` (so renames match
+  either side). Fetch runs through `git::run_read_in_with_timeout` (30s, null stdin,
+  `GIT_TERMINAL_PROMPT=0` so a credential prompt never lands in the TUI); a failure falls back to
+  the hunks patch with a `full file unavailable (…)` notice in the doc context. Only whole-commit
+  `git show` stays excluded (`is_git_diff`), so its footer omits the `f` hint.
 - The footer is ONE dim line clipped at the pane edge. The mode toggles (`p`/`s`/`f`/`w`) LEAD it,
   before find/copy/scroll/zoom: when `s: split` was appended at the tail, `f: …` fell off a
   ~110-col preview and users read it as "the full-file key is gone" (the key itself still

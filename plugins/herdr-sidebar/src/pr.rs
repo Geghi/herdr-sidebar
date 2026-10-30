@@ -246,6 +246,69 @@ pub fn diff(root: &Path, number: u64) -> Result<String, String> {
     run(root, &["pr".into(), "diff".into(), number.to_string()])
 }
 
+/// The whole patch of a pull request with every file in FULL (`-U999999`),
+/// for the viewer's `f` mode — `gh pr diff` only has hunks. Asks gh for the
+/// base/head commits, fetches whichever is missing locally (by sha, from each
+/// remote until both exist: a fork's origin lacks the upstream PR), then diffs
+/// merge-base → head with rename detection, like GitHub does.
+// ponytail: diffs the whole PR to slice one file, fine until PRs get huge.
+pub fn full_diff(root: &Path, number: u64) -> Result<String, String> {
+    let raw = run(
+        root,
+        &[
+            "pr".into(),
+            "view".into(),
+            number.to_string(),
+            "--json".into(),
+            "baseRefOid,headRefOid".into(),
+        ],
+    )?;
+    let value: Value = serde_json::from_str(&raw).map_err(|e| format!("gh: {e}"))?;
+    let oid = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("gh: no {key}"))
+    };
+    let (base, head) = (oid("baseRefOid")?, oid("headRefOid")?);
+    let timeout = std::time::Duration::from_secs(30);
+    let git = |args: &[&str]| crate::git::run_read_in_with_timeout(root, args, timeout);
+    let present = |sha: &str| git(&["cat-file", "-e", &format!("{sha}^{{commit}}")]).is_ok();
+    if !(present(&base) && present(&head)) {
+        let remotes = git(&["remote"])?;
+        let mut remotes: Vec<&str> = remotes.lines().collect();
+        remotes.sort_by_key(|r| *r != "upstream");
+        let mut last = "no git remote".to_string();
+        for remote in remotes {
+            match git(&[
+                "fetch",
+                "--no-tags",
+                "--no-write-fetch-head",
+                remote,
+                &base,
+                &head,
+            ]) {
+                Ok(_) if present(&base) && present(&head) => break,
+                Ok(_) => {}
+                Err(e) => last = e,
+            }
+        }
+        if !(present(&base) && present(&head)) {
+            return Err(format!("fetch failed: {}", last.trim()));
+        }
+    }
+    let merge_base = git(&["merge-base", &base, &head])?;
+    git(&[
+        "diff",
+        "--no-ext-diff",
+        "-M",
+        "-U999999",
+        merge_base.trim(),
+        &head,
+    ])
+}
+
 /// The section of a unified patch that belongs to `path`. The panel fetches a
 /// pull request's patch ONCE and slices it per file, so opening a file costs
 /// no request.

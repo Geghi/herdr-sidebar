@@ -1650,11 +1650,11 @@ fn context_arg() -> &'static str {
     }
 }
 
-/// Requests the `f` full-file/hunks toggle applies to. PR diffs are
-/// excluded: only the patch exists there, so they always show hunks.
+/// Requests the `f` full-file/hunks toggle applies to: every diff (PR diffs
+/// fetch the PR's commits for full mode) and a `git show` of one file.
 fn is_git_diff(request: &Request) -> bool {
     match request {
-        Request::Diff { kind, .. } => !kind.starts_with("pr:"),
+        Request::Diff { .. } => true,
         Request::Show { path, .. } => path.is_some(),
         _ => false,
     }
@@ -1664,10 +1664,20 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
     let name = rel.rsplit('/').next().unwrap_or(rel).to_string();
     // A file inside a PULL REQUEST: `gh pr diff` prints the whole patch, and
     // the slice for this file renders through the same renderer as any other
-    // diff, so the Changes look carries over.
+    // diff, so the Changes look carries over. Full-file mode diffs the PR's
+    // fetched commits locally instead; if that fails, hunks plus a notice.
     if let Some(number) = kind.strip_prefix("pr:").and_then(|n| n.parse::<u64>().ok()) {
         let mut split = Vec::new();
-        let lines = match crate::pr::diff(root, number) {
+        let mut notice = String::new();
+        let patch = if crate::state::load_state().diff_full {
+            crate::pr::full_diff(root, number).or_else(|e| {
+                notice = format!(" — full file unavailable ({e}), showing hunks");
+                crate::pr::diff(root, number)
+            })
+        } else {
+            crate::pr::diff(root, number)
+        };
+        let lines = match patch {
             Err(e) => vec![Line::raw(format!("({e})"))],
             Ok(patch) => match crate::pr::patch_for_file(&patch, rel) {
                 Some(section) => {
@@ -1680,7 +1690,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         };
         return Doc {
             name,
-            context: format!("PR #{number} — {}", root.join(rel).display()),
+            context: format!("PR #{number} — {}{notice}", root.join(rel).display()),
             lines,
             numbered: false,
             media: None,
@@ -4000,7 +4010,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn full_file_toggle_skips_pr_and_whole_commit_views() {
+    fn full_file_toggle_covers_diffs_but_not_whole_commit_views() {
         let root = PathBuf::from("/r");
         let diff = |kind: &str| Request::Diff {
             root: root.clone(),
@@ -4009,7 +4019,7 @@ mod tests {
         };
         assert!(is_git_diff(&diff("worktree")));
         assert!(is_git_diff(&diff("staged")));
-        assert!(!is_git_diff(&diff("pr:7")));
+        assert!(is_git_diff(&diff("pr:7")));
         let show = |path: Option<&str>| Request::Show {
             root: root.clone(),
             spec: "HEAD".into(),

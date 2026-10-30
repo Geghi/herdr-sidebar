@@ -798,14 +798,18 @@ fn run_read_in(dir: &Path, args: &[&str]) -> Result<String, String> {
     command_result(out.status, out.stdout, out.stderr)
 }
 
-fn run_read_in_with_timeout(
+pub(crate) fn run_read_in_with_timeout(
     dir: &Path,
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
     let mut command = git_command(dir, args);
+    // Background commands never prompt: a credential question would land in
+    // (and hang) the TUI's own terminal.
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     prepare_timed_command(&mut command);
@@ -838,7 +842,8 @@ fn run_read_in_with_timeout(
                 drop(stderr_reader);
             }
             return Err(format!(
-                "ignored-file scan timed out after {}s",
+                "git {} timed out after {}s",
+                args.first().unwrap_or(&""),
                 timeout.as_secs()
             ));
         }
