@@ -1072,6 +1072,10 @@ setting are all gone.
   anchor is approximate across a mode switch, since the line set itself changes). PR file diffs
   (`pr:<n>`) and whole-commit `git show` are excluded (`is_git_diff`): only the patch exists, so
   they always show hunks and the footer omits the `f` hint.
+- The footer is ONE dim line clipped at the pane edge. The mode toggles (`p`/`s`/`f`/`w`) LEAD it,
+  before find/copy/scroll/zoom: when `s: split` was appended at the tail, `f: …` fell off a
+  ~110-col preview and users read it as "the full-file key is gone" (the key itself still
+  worked). Put any new toggle hint in that leading group, never at the tail.
 - `s` toggles unified vs SPLIT (side-by-side) on EVERY `diffview::render` doc — Changes/Staged,
   Branch Changes, PR file diffs and GRAPH per-file diffs — persisted as `diff_split` (default
   off). `diffview::render` returns `Rendered { lines, split }`: one highlight pass feeds both

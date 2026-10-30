@@ -2798,10 +2798,12 @@ fn draw_doc(
             " image preview  q close".into()
         }
     } else if editable {
-        format!(" Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom/close  {wrap_hint}  q close")
+        format!(" {wrap_hint}  Ctrl+F find  Ctrl/Cmd+C copy  e edit  z zoom/close  q close")
     } else {
+        // The mode toggles (p/s/f/w) lead: the footer clips at the pane
+        // edge, and with them at the tail a ~110-col diff pane lost `f`.
         format!(
-            " Ctrl+F find  {hunk_hint}Ctrl/Cmd+C copy  ↑↓ scroll  z zoom/close  {wrap_hint}  q close"
+            " {wrap_hint}  {hunk_hint}Ctrl+F find  Ctrl/Cmd+C copy  ↑↓ scroll  z zoom/close  q close"
         )
     };
     merge.button = Rect::default();
@@ -4551,6 +4553,43 @@ mod tests {
         // …and the clamp keeps a full screen of content in view rather than
         // scrolling off into blank rows.
         assert!(doc.scroll <= doc.rows.len().saturating_sub(4));
+    }
+
+    /// The diff mode toggles must survive a narrow pane: the footer clips at
+    /// the edge, and with `s`/`f` at its tail a split-era diff lost `f`.
+    #[test]
+    fn diff_footer_keeps_the_mode_toggles_in_a_narrow_pane() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let rendered = crate::diffview::render("x.rs", "@@ -1,2 +1,2 @@\n-a\n+b\n c\n");
+        let mut doc = doc_of(rendered.lines, false);
+        doc.split = rendered.split;
+        for split_view in [false, true] {
+            doc.split_view = split_view;
+            let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+            terminal
+                .draw(|f| {
+                    draw_doc(
+                        f,
+                        &mut doc,
+                        IconTheme::Emoji,
+                        false,
+                        Some(false),
+                        None,
+                        None,
+                        &mut MergeUi::default(),
+                        None,
+                    );
+                })
+                .unwrap();
+            let footer: String = terminal.backend().buffer().content()[200..]
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(footer.contains("f: hunks"), "{footer:?}");
+            assert!(footer.contains("s: "), "{footer:?}");
+        }
     }
 
     /// With wrapping off the same doc is one clipped row, and the toggle
