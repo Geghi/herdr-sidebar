@@ -490,11 +490,19 @@ fn render_overview_at(detail: &Value, width: usize, now: SystemTime) -> Vec<Line
     }
     out.extend(meta_grid(left, right, width, state_color));
 
-    // The action bar: only keys the viewer actually answers (it binds `m` for
-    // the merge menu; approve/checkout/browser live in the sidebar's menu).
+    // The action bar: only keys the viewer actually answers (`m` for the
+    // merge menu, `o` for the browser; approve/checkout live in the
+    // sidebar's menu).
+    let mut actions = Vec::new();
     if merge_state(detail) == Mergeability::Ready {
+        actions.push(("m", "merge ▾"));
+    }
+    if !text("url").is_empty() {
+        actions.push(("o", "browser"));
+    }
+    if !actions.is_empty() {
         out.push(Line::default());
-        out.extend(crate::ui::wrap_hints(&[("m", "merge ▾")], width as u16, 0));
+        out.extend(crate::ui::wrap_hints(&actions, width as u16, 0));
     }
 
     if let Some(checks) = checks_summary(detail.get("statusCheckRollup"), width) {
@@ -1296,19 +1304,6 @@ pub fn review(root: &Path, number: u64, verdict: Verdict, body: &str) -> Result<
 /// Mark a draft pull request ready for review.
 pub fn ready(root: &Path, number: u64) -> Result<String, String> {
     run(root, &["pr".into(), "ready".into(), number.to_string()])
-}
-
-/// Open the pull request in the browser.
-pub fn open_in_browser(root: &Path, number: u64) -> Result<String, String> {
-    run(
-        root,
-        &[
-            "pr".into(),
-            "view".into(),
-            number.to_string(),
-            "--web".into(),
-        ],
-    )
 }
 
 /// One review conversation of a pull request.

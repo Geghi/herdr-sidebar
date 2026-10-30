@@ -889,6 +889,15 @@ impl App {
                     Err(e) => (format!("copy failed: {e}"), true),
                 });
             }
+            MenuAction::OpenInBrowser => {
+                let url = self.find_pr(number).map(|pr| pr.url.clone());
+                self.flash = Some(
+                    match herdr_sidebar::actions::open_url(url.as_deref().unwrap_or("")) {
+                        Ok(()) => (format!("opened #{number} in browser"), false),
+                        Err(e) => (format!("browser failed: {e}"), true),
+                    },
+                );
+            }
             MenuAction::ResolveThreads => {
                 self.flash = Some((action.progress(number), false));
                 let root = self.cwd.clone();
@@ -921,7 +930,6 @@ impl App {
                 MenuAction::Ready => pr::ready(&root, number),
                 MenuAction::Review(verdict) => pr::review(&root, number, verdict, &body),
                 MenuAction::Comment => pr::comment(&root, number, &body),
-                MenuAction::OpenInBrowser => pr::open_in_browser(&root, number),
                 _ => Ok(String::new()),
             };
             Job::Command(result)

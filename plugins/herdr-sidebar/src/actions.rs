@@ -314,6 +314,16 @@ pub fn open_external(path: &Path) -> io::Result<()> {
         .map(|_| ())
 }
 
+/// Open a URL in the default browser through the same opener as
+/// [`open_external`] — `gh --web` launches its own, which has no display on a
+/// Linux herdr server started outside the graphical session.
+pub fn open_url(url: &str) -> io::Result<()> {
+    if url.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no url"));
+    }
+    open_external(Path::new(url))
+}
+
 /// Open VS Code on `root` with `file` (root-relative or absolute) also opened,
 /// the equivalent of `code .` plus opening one file. Spawned detached, never
 /// through a shell. On Windows `code` is a `code.cmd` shim, which
@@ -774,6 +784,11 @@ mod tests {
         let root = menu_entries(None, true);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
+    }
+
+    #[test]
+    fn open_url_refuses_an_empty_url() {
+        assert!(open_url("").is_err());
     }
 
     #[test]

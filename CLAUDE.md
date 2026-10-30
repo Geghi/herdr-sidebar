@@ -838,6 +838,17 @@ HACKING.md — budget time for that before promising a patched build.
   menu (sidebar `pr_app::overlay_click`) previously CONFIRMED the merely SELECTED entry, so
   clicking "Squash and Merge" ran "Open Pull Request" — the popup rect now maps the clicked
   row back to its entry (`menu_hit`), and clicks outside dismiss.
+  **Browser opens go through `actions::open_url(pr.url)`, never `gh pr view --web`**: the
+  sidebar menu's Open in Browser and the overview's `o` (advertised as `o browser` in the
+  action bar and footer) both hand the URL to `open_external` → `gui_command` (xdg-open /
+  `open` / explorer). gh launches its own opener with the pane env, and on Linux the live
+  sidebar processes had NO DISPLAY/WAYLAND_DISPLAY (checked `/proc/<pid>/environ`), where
+  `gh --web` exits 0 having opened nothing. Only the spawn is checked (xdg-open is detached),
+  so a handler that runs but shows nothing is invisible to us. **System cause seen on the
+  maintainer's Linux box**: `xdg-settings get default-web-browser` = `crd-url-forwarder.desktop`
+  (Chrome Remote Desktop's `remote-open-url`), which pops a browser-selection prompt and then
+  opens nothing locally — that is the desktop's default handler, not a plugin bug; fix it with
+  `xdg-settings set default-web-browser <browser>.desktop`.
   **`gh` is a NETWORK cli with no timeout of its own**: every call runs on a worker thread
   and lands in the App through a channel polled from `tick()` (`refresh` sends one page per
   drawer, `toggle_files` one file list), so the pane never blocks; `run_prs` in main.rs ticks

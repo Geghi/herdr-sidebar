@@ -2437,6 +2437,18 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     KeyCode::PageDown => doc.scroll = (doc.scroll + page).min(max),
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
+                                    KeyCode::Char('o') if doc.pr_target.is_some() => {
+                                        notice = doc
+                                            .pr_target
+                                            .as_ref()
+                                            .and_then(|t| t.detail.get("url"))
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(crate::actions::open_url)
+                                            .map(|r| match r {
+                                                Ok(()) => "opened in browser".into(),
+                                                Err(e) => format!("browser failed: {e}"),
+                                            });
+                                    }
                                     KeyCode::Char('z') => {
                                         if let Ok(id) = std::env::var("HERDR_PANE_ID") {
                                             should_close = viewer_zoom(&id, control);
@@ -2798,7 +2810,12 @@ fn draw_doc(
         (false, true) => "s: split  ",
         (false, false) => "s: unified  ",
     };
-    let wrap_hint = format!("{md_hint}{split_hint}{wrap_hint}");
+    let pr_hint = if doc.pr_target.is_some() {
+        "o browser  "
+    } else {
+        ""
+    };
+    let wrap_hint = format!("{pr_hint}{md_hint}{split_hint}{wrap_hint}");
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
     } else if let Some(media) = &doc.media {
